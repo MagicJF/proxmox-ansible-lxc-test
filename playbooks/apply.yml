@@ -18,6 +18,15 @@
       loop_var: ct
       index_var: idx
       label: "VMID {{ ct.vmid }}"
+    # Observability: every run appends to a human log (ansible.cfg log_path) and
+    # to a machine-readable journal of the real PVE API traffic.
+    pve_log_dir: "{{ playbook_dir }}/../logs"
+    pve_journal: "{{ playbook_dir }}/../logs/pve-api.jsonl"
+  # Arming the tracer: PYTHONPATH makes CPython import playbooks/tracing/sitecustomize.py
+  # in every module process, which then journals each HTTP call to PVE.
+  environment:
+    PYTHONPATH: "{{ playbook_dir }}/tracing"
+    PVE_HTTP_TRACE: "{{ pve_log_dir }}/pve-api.jsonl"
   pre_tasks:
     - name: Refuse an inaccurate dry-run
       ansible.builtin.fail:
@@ -26,6 +35,29 @@
           mutating task and predicts nothing. Run playbooks/preflight.yml for the read-only diff.
           No changes were made.
       when: ansible_check_mode
+
+    - name: Read the repository revision for the run header
+      ansible.builtin.command:
+        cmd: git rev-parse --short HEAD
+        chdir: "{{ playbook_dir }}/.."
+      register: pve_rev
+      changed_when: false
+      failed_when: false
+
+    - name: Mark the start of this run in the API journal
+      ansible.builtin.lineinfile:
+        path: "{{ pve_journal }}"
+        line: "{{ run_start | to_json }}"
+        create: true
+        mode: "0600"
+      vars:
+        run_start:
+          ts: "{{ '%Y-%m-%dT%H:%M:%S%z' | strftime }}"
+          event: run_start
+          playbook: "{{ ansible_play_name }}"
+          revision: "{{ pve_rev.stdout | default('unknown', true) }}"
+          containers: "{{ pve_containers | map(attribute='vmid') | list }}"
+      changed_when: false
 
   tasks:
     - name: Build the effective spec of every declared container
@@ -226,3 +258,17 @@
         b: "{{ pve_after[ct.vmid | string] }}"
       loop: "{{ pve_cts }}"
       loop_control: *pve_loop
+
+    - name: Mark the end of this run in the API journal
+      ansible.builtin.lineinfile:
+        path: "{{ pve_journal }}"
+        line: "{{ run_end | to_json }}"
+        create: true
+        mode: "0600"
+      vars:
+        run_end:
+          ts: "{{ '%Y-%m-%dT%H:%M:%S%z' | strftime }}"
+          event: run_end
+          playbook: "{{ ansible_play_name }}"
+          verified: "{{ pve_cts | map(attribute='vmid') | list }}"
+      changed_when: false

@@ -15,6 +15,37 @@
       validate_certs: true
     pve_api: "https://{{ lookup('env', 'PROXMOX_HOST') }}:8006/api2/json"
     pve_token_header: "PVEAPIToken={{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+    pve_log_dir: "{{ playbook_dir }}/../logs"
+    pve_journal: "{{ playbook_dir }}/../logs/pve-api.jsonl"
+  # Arming the tracer: PYTHONPATH makes CPython import playbooks/tracing/sitecustomize.py
+  # in every module process, which then journals each HTTP call to PVE.
+  environment:
+    PYTHONPATH: "{{ playbook_dir }}/tracing"
+    PVE_HTTP_TRACE: "{{ pve_log_dir }}/pve-api.jsonl"
+  pre_tasks:
+    - name: Read the repository revision for the run header
+      ansible.builtin.command:
+        cmd: git rev-parse --short HEAD
+        chdir: "{{ playbook_dir }}/.."
+      register: pve_rev
+      changed_when: false
+      failed_when: false
+
+    - name: Mark the start of this run in the API journal
+      ansible.builtin.lineinfile:
+        path: "{{ pve_journal }}"
+        line: "{{ run_start | to_json }}"
+        create: true
+        mode: "0600"
+      vars:
+        run_start:
+          ts: "{{ '%Y-%m-%dT%H:%M:%S%z' | strftime }}"
+          event: run_start
+          playbook: "{{ ansible_play_name }}"
+          revision: "{{ pve_rev.stdout | default('unknown', true) }}"
+          containers: "{{ pve_containers | map(attribute='vmid') | list }}"
+      changed_when: false
+
   tasks:
     - name: Build the effective spec of every declared container
       ansible.builtin.set_fact:
@@ -137,3 +168,16 @@
       loop: "{{ pve_cts }}"
       loop_control: *loop_ct
       when: pve_eval[ct.vmid | string].exists
+
+    - name: Mark the end of this run in the API journal
+      ansible.builtin.lineinfile:
+        path: "{{ pve_journal }}"
+        line: "{{ run_end | to_json }}"
+        create: true
+        mode: "0600"
+      vars:
+        run_end:
+          ts: "{{ '%Y-%m-%dT%H:%M:%S%z' | strftime }}"
+          event: run_end
+          playbook: "{{ ansible_play_name }}"
+      changed_when: false

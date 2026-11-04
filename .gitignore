@@ -7,3 +7,9 @@ vault.yml
 vault.yaml
 *.retry
 __pycache__/
+
+# Run logs and the Proxmox API journal. Never commit these: they describe real
+# infrastructure, and this repository is public. The directory itself is kept
+# because Ansible's log_path cannot create it.
+logs/*
+!logs/.gitkeep

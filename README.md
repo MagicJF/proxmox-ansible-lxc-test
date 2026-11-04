@@ -5,10 +5,12 @@ Declarative IaC for the LXC containers on Proxmox VE, driven entirely over the H
 ## Structure
 
 ```text
-inventory/group_vars/all.yml   # THE desired state — the only file that changes per request
-playbooks/preflight.yml        # read-only: platform checks + declared-vs-live report
-playbooks/apply.yml            # converges every declared container, then verifies via the API
-playbooks/vars/state.yml       # engine: declared-vs-live translation and normalisation
+inventory/group_vars/all.yml          # THE desired state — the only file that changes per request
+playbooks/preflight.yml               # read-only: platform checks + declared-vs-live report
+playbooks/apply.yml                   # converges every declared container, then verifies via the API
+playbooks/vars/state.yml              # engine: declared-vs-live translation and normalisation
+playbooks/tracing/sitecustomize.py    # engine: journals every PVE HTTP call
+logs/                                 # run logs and the API journal (gitignored, kept via .gitkeep)
 ```
 
 The playbooks are a fixed engine with exactly two verbs, both looping over the container list. A change request is an edit to `inventory/group_vars/all.yml` on a new branch — not a new playbook. Adding a playbook per change would scatter the real state across files that overwrite each other.
@@ -115,6 +117,47 @@ Only the drifted keys are sent on the update path: `community.proxmox.proxmox` P
 `community.proxmox.proxmox` declares `supports_check_mode=False`: under `--check` Ansible skips the mutating task and predicts nothing, so `apply.yml` fails early under check mode rather than implying a dry-run. Use `preflight.yml` for the non-mutating view.
 
 `apply.yml` is idempotent: when live state matches the declared state it reports no changes and changes no config `digest`. Each run makes one HTTPS call per task per container against the node, so a full run takes roughly a minute over a remote API.
+
+## Logging and API observability
+
+Every run writes two files under `logs/` (gitignored — it describes real infrastructure and this repository is public):
+
+**`logs/ansible.log`** — the full human-readable play output, appended by Ansible (`log_path` in `ansible.cfg`). Task results coming from the API tasks stay censored because they carry `no_log`.
+
+**`logs/pve-api.jsonl`** — the machine-readable journal of the traffic that actually crossed the wire, one JSON object per line:
+
+```json
+{"ts": "...", "event": "api_call", "method": "PUT", "url": "https://…/nodes/Proxmox/lxc/102/config",
+ "request_body": {"cores": 2, "delete": "net0", "tags": "ansible-managed;lab", "hostname": "test-from-ansible"},
+ "status": 200, "response_body": "{\"data\":null}", "seconds": 0.186, "pid": 2457156}
+```
+
+`event` is `run_start` (timestamp, playbook, git revision, container list), `api_call`, or `run_end`, so a reviewer can group the calls of one run and tie them to a code revision.
+
+How it is armed: the playbooks put `playbooks/tracing` on `PYTHONPATH` and set `PVE_HTTP_TRACE`. CPython imports `sitecustomize` from there at interpreter start-up, so the trace is active in every module process — the modules themselves are untouched. The wrapper sits on `requests.Session.request`, which is what proxmoxer uses.
+
+What it deliberately never records: request headers, so the API token never reaches the file; request-body fields whose name looks like a secret are redacted as well. Verified by grepping the files for the token: zero occurrences.
+
+Reading it:
+
+```bash
+# every call of one run, in order
+python3 -c "
+import json
+for l in open('logs/pve-api.jsonl'):
+    r = json.loads(l)
+    print(r['ts'], r['event'], r.get('method',''), r.get('status',''), r.get('url','').split('/api2/json')[-1], r.get('request_body',''))"
+
+# only the mutations, with PVE's answer
+grep '"method": "PUT"' logs/pve-api.jsonl | python3 -m json.tool --json-lines
+
+# everything PVE rejected
+grep -E '"status": 4[0-9][0-9]|"status": 5[0-9][0-9]' logs/pve-api.jsonl
+```
+
+Both files grow without bound; Ansible never rotates them and neither does the engine. Trim them when they get large — the response bodies of cluster-wide reads are the bulk of it.
+
+The `logs/` directory must exist before Ansible starts (`log_path` cannot create it), which is why `logs/.gitkeep` is committed.
 
 ## Credentials and cleanup
 

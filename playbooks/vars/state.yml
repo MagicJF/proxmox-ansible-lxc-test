@@ -97,8 +97,11 @@ pve_mismatched: >-
 pve_declared_empty: >-
   {{ pve_declared_norm | dict2items | selectattr('value', 'eq', '') | map(attribute='key') | list }}
 
-# Declared with a value and currently different -> write it.
-pve_to_set: "{{ pve_mismatched | difference(pve_declared_empty) | sort | list }}"
+# Declared with a value and currently different -> write it. Keys that are not
+# declared at all (a netX someone added by hand) are not "set", only deleted.
+pve_to_set: >-
+  {{ pve_mismatched | intersect(pve_declared_norm.keys() | list)
+     | difference(pve_declared_empty) | sort | list }}
 
 # Declared as absent (or the network/attachments are declared empty) but still
 # present in the live config -> delete it. A netX/mpX the file does not declare
