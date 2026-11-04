@@ -1,0 +1,70 @@
+---
+- name: Double the vCPU and RAM of the disposable test LXC via the Proxmox API
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pve_node: Proxmox
+    pve_vmid: 102
+    pve_hostname: test-from-ansible
+    pve_cores: 2
+    pve_memory: 2048
+    pve_expected_swap: 512
+    pve_expected_rootfs: "size=8G"
+  pre_tasks:
+    - name: Refuse an inaccurate update dry-run
+      ansible.builtin.fail:
+        msg: "The community.proxmox.proxmox module declares supports_check_mode=False, so --check only skips this task and predicts nothing. Run the playbook for real to apply. No changes were made."
+      when: ansible_check_mode
+  tasks:
+    - name: Double vCPU and RAM of test-from-ansible
+      # Only cores and memory are passed, so the module PUTs only those keys and
+      # leaves swap, rootfs, hostname, unprivileged and onboot untouched.
+      community.proxmox.proxmox:
+        api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
+        api_port: 8006
+        api_user: root@pam
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+        validate_certs: true
+        api_timeout: 300
+        node: "{{ pve_node }}"
+        vmid: "{{ pve_vmid }}"
+        # state=present requires node + hostname; hostname is re-sent unchanged.
+        hostname: "{{ pve_hostname }}"
+        cores: "{{ pve_cores }}"
+        memory: "{{ pve_memory }}"
+        update: true
+        state: present
+      register: resize_result
+      no_log: true
+
+    - name: Verify the container state via the Proxmox API
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_user: root@pam
+        ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+        validate_certs: true
+        vmid: "{{ pve_vmid }}"
+        type: lxc
+        config: current
+      register: updated_lxc
+      no_log: true
+
+    - name: Assert resources doubled and every other property unchanged
+      ansible.builtin.assert:
+        that:
+          - updated_lxc.proxmox_vms | length == 1
+          - updated_lxc.proxmox_vms[0].name == pve_hostname
+          - updated_lxc.proxmox_vms[0].vmid | int == pve_vmid
+          - updated_lxc.proxmox_vms[0].status == 'stopped'
+          - updated_lxc.proxmox_vms[0].config.cores | int == pve_cores
+          - updated_lxc.proxmox_vms[0].config.memory | int == pve_memory
+          - updated_lxc.proxmox_vms[0].config.swap | int == pve_expected_swap
+          - updated_lxc.proxmox_vms[0].config.hostname == pve_hostname
+          - updated_lxc.proxmox_vms[0].config.unprivileged | int == 1
+          - "pve_expected_rootfs in updated_lxc.proxmox_vms[0].config.rootfs"
+        fail_msg: "The API did not return the expected container state after the update."
+        success_msg: "Verified {{ pve_hostname }} (VMID {{ pve_vmid }}) at {{ pve_cores }} vCPU / {{ pve_memory }} MiB RAM with swap and rootfs unchanged."
