@@ -1,7 +1,9 @@
 ---
-- name: Read-only preflight of the containers declared in inventory/group_vars/all.yml
+- name: Read-only preflight of every container declared in inventory/group_vars/all.yml
   hosts: localhost
   gather_facts: false
+  vars_files:
+    - vars/state.yml
   vars:
     pve_auth: &pve_auth
       api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
@@ -69,6 +71,17 @@
       register: pve_templates
       no_log: true
 
+    - name: Analyse every declared container against its live state
+      ansible.builtin.set_fact:
+        pve_eval: "{{ pve_eval | default({}) | combine({ (ct.vmid | string): analysis }) }}"
+      vars:
+        vm: "{{ live_cts.results[idx].proxmox_vms | first | default({}, true) }}"
+        live: "{{ vm.config | default({}, true) }}"
+        live_status: "{{ vm.status | default('', true) }}"
+        analysis: "{{ pve_analysis }}"
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
+
     - name: Assert every container's platform prerequisites are usable
       ansible.builtin.assert:
         that:
@@ -84,52 +97,43 @@
       loop: "{{ pve_cts }}"
       loop_control: *loop_ct
 
-    - name: Report the drift between every live container and the declared state
+    - name: Report the declared-versus-live state of every container
       ansible.builtin.debug:
         msg: >-
-          {{ ct.hostname }} (VMID {{ ct.vmid }}):
-          cores {{ live.cores }}->{{ ct.cores }} |
-          memory {{ live.memory }}->{{ ct.memory }} |
-          swap {{ live.swap }}->{{ ct.swap }} |
-          onboot {{ live.onboot }}->{{ 1 if ct.onboot | bool else 0 }} |
-          hostname {{ live.hostname }}->{{ ct.hostname }}
-          [{{ 'in sync' if aligned else 'DRIFT -> apply.yml converges it' }}]
+          {{ ct.hostname }} (VMID {{ ct.vmid }}) [{{ 'IN SYNC' if a.in_sync else 'DRIFT' }}]
+          | declared={{ a.declared_subset | to_json }} live={{ a.actual_subset | to_json }}
+          | live settings to delete={{ a.to_delete | join(', ') or '-' }}
+          | power {{ a.status }} -> {{ ct.status }}
+          | creation-time drift={{ a.creation_time_drift | join(', ') or '-' }}
       vars:
-        live: "{{ live_cts.results[idx].proxmox_vms[0].config }}"
-        aligned: >-
-          {{ (live.cores | string) == (ct.cores | string)
-             and (live.memory | string) == (ct.memory | string)
-             and (live.swap | string) == (ct.swap | string)
-             and (live.onboot | string) == ((1 if ct.onboot | bool else 0) | string)
-             and live.hostname == ct.hostname }}
+        a: "{{ pve_eval[ct.vmid | string] }}"
       changed_when: false
       loop: "{{ pve_cts }}"
       loop_control: *loop_ct
-      when: live_cts.results[idx].proxmox_vms | length == 1
+      when: a.exists
+
+    - name: Report the containers that do not exist yet
+      ansible.builtin.debug:
+        msg: >-
+          {{ ct.hostname }} (VMID {{ ct.vmid }}) does not exist yet; apply.yml will create it with
+          {{ ct.cores }} vCPU, {{ ct.memory }} MiB RAM, {{ ct.swap }} MiB swap, cpuunits {{ ct.cpuunits }},
+          reporting {{ ct.status }}, rootfs {{ ct.rootfs_size }} GiB on {{ ct.storage }},
+          no network interface.
+      changed_when: false
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
+      when: not pve_eval[ct.vmid | string].exists
 
     - name: Fail when a declared state needs a property PVE cannot change in place
       ansible.builtin.assert:
         that:
-          - live_cts.results[idx].proxmox_vms[0].config.unprivileged | int == (1 if ct.unprivileged | bool else 0)
-          - (ct.storage ~ ':') in live_cts.results[idx].proxmox_vms[0].config.rootfs
-          - live_cts.results[idx].proxmox_vms[0].config.rootfs | regex_replace('^.*size=([0-9]+)G$', '\\1') | int == ct.rootfs_size | int
+          - pve_eval[ct.vmid | string].creation_time_drift | length == 0
         fail_msg: >-
-          Blocking drift on {{ ct.hostname }} (VMID {{ ct.vmid }}): group_vars/all.yml declares a
-          creation-time property (unprivileged, rootfs storage or rootfs size) that differs from the
-          live container and cannot be converged in place, so apply.yml would refuse it. Recreate the
+          Blocking drift on {{ ct.hostname }} (VMID {{ ct.vmid }}):
+          {{ pve_eval[ct.vmid | string].creation_time_drift | join(', ') }} cannot be converged in
+          place (and rootfs growth is irreversible), so apply.yml would refuse it. Recreate the
           container deliberately or revert the value.
-        success_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): creation-time properties match; any remaining drift is in-place changeable."
+        success_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): creation-time properties match."
       loop: "{{ pve_cts }}"
       loop_control: *loop_ct
-      when: live_cts.results[idx].proxmox_vms | length == 1
-
-    - name: Report the containers that will be created
-      ansible.builtin.debug:
-        msg: >-
-          {{ ct.hostname }} (VMID {{ ct.vmid }}) does not exist yet; apply.yml will create it with
-          {{ ct.cores | int }} vCPU, {{ ct.memory | int }} MiB RAM, {{ ct.swap | int }} MiB swap,
-          rootfs {{ ct.rootfs_size }} GiB on {{ ct.storage }}.
-      changed_when: false
-      loop: "{{ pve_cts }}"
-      loop_control: *loop_ct
-      when: live_cts.results[idx].proxmox_vms | length == 0
+      when: pve_eval[ct.vmid | string].exists

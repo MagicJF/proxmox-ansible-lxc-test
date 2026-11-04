@@ -1,7 +1,9 @@
 ---
-- name: Converge the containers declared in inventory/group_vars/all.yml
+- name: Converge every container declared in inventory/group_vars/all.yml
   hosts: localhost
   gather_facts: false
+  vars_files:
+    - vars/state.yml
   vars:
     pve_auth: &pve_auth
       api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
@@ -12,6 +14,10 @@
       ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
       validate_certs: true
       api_timeout: 300
+    pve_loop: &pve_loop
+      loop_var: ct
+      index_var: idx
+      label: "VMID {{ ct.vmid }}"
   pre_tasks:
     - name: Refuse an inaccurate dry-run
       ansible.builtin.fail:
@@ -29,6 +35,15 @@
       loop_control:
         label: "VMID {{ item.vmid }}"
 
+    - name: Reject a power state the module cannot converge to
+      ansible.builtin.assert:
+        that:
+          - ct.status in ['started', 'stopped']
+        fail_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): status must be 'started' or 'stopped', not '{{ ct.status }}'."
+      loop: "{{ pve_cts }}"
+      loop_control: *pve_loop
+      run_once: false
+
     - name: Read every declared container through the API
       community.proxmox.proxmox_vm_info:
         <<: *pve_auth
@@ -36,30 +51,38 @@
         type: lxc
         config: current
       loop: "{{ pve_cts }}"
-      loop_control: &loop_ct
-        loop_var: ct
-        index_var: idx
-        label: "VMID {{ ct.vmid }}"
+      loop_control: *pve_loop
       register: live_cts
       no_log: true
+
+    - name: Analyse every declared container against its live state
+      ansible.builtin.set_fact:
+        pve_eval: "{{ pve_eval | default({}) | combine({ (ct.vmid | string): analysis }) }}"
+      vars:
+        vm: "{{ live_cts.results[idx].proxmox_vms | first | default({}, true) }}"
+        live: "{{ vm.config | default({}, true) }}"
+        live_status: "{{ vm.status | default('', true) }}"
+        analysis: "{{ pve_analysis }}"
+      loop: "{{ pve_cts }}"
+      loop_control: *pve_loop
 
     # Creation-time properties cannot be converged in place. Fail loudly for that
     # container rather than reporting a success the API never applied.
     - name: Refuse to converge properties PVE cannot change on an existing container
       ansible.builtin.assert:
         that:
-          - live_cts.results[idx].proxmox_vms[0].config.unprivileged | int == (1 if ct.unprivileged | bool else 0)
-          - (ct.storage ~ ':') in live_cts.results[idx].proxmox_vms[0].config.rootfs
-          - live_cts.results[idx].proxmox_vms[0].config.rootfs | regex_replace('^.*size=([0-9]+)G$', '\\1') | int == ct.rootfs_size | int
+          - a.creation_time_drift | length == 0
         fail_msg: >-
-          {{ ct.hostname }} (VMID {{ ct.vmid }}): group_vars/all.yml declares a creation-time property
-          (unprivileged, rootfs storage or rootfs size) that differs from the live container. PVE
-          cannot apply it in place and growing a rootfs is irreversible, so this container was left
-          untouched. Recreate it deliberately or revert the value.
-        success_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): creation-time properties match the live container."
+          {{ ct.hostname }} (VMID {{ ct.vmid }}):
+          {{ a.creation_time_drift | join(', ') }} differs from the live container. PVE cannot apply
+          it in place and growing a rootfs is irreversible, so this container is left untouched.
+          Recreate it deliberately or revert the value.
+        success_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): creation-time properties match."
+      vars:
+        a: "{{ pve_eval[ct.vmid | string] }}"
       loop: "{{ pve_cts }}"
-      loop_control: *loop_ct
-      when: live_cts.results[idx].proxmox_vms | length == 1
+      loop_control: *pve_loop
+      when: a.exists
 
     - name: Create the containers that do not exist yet
       community.proxmox.proxmox:
@@ -67,42 +90,95 @@
         node: "{{ pve_node }}"
         vmid: "{{ ct.vmid }}"
         hostname: "{{ ct.hostname }}"
+        ostype: "{{ ct.ostype }}"
         ostemplate: "{{ ct.template }}"
         storage: "{{ ct.storage }}"
         disk: "{{ ct.storage }}:{{ ct.rootfs_size }}"
         cores: "{{ ct.cores }}"
         memory: "{{ ct.memory }}"
         swap: "{{ ct.swap }}"
+        cpuunits: "{{ ct.cpuunits }}"
         unprivileged: "{{ ct.unprivileged | bool }}"
         onboot: "{{ ct.onboot | bool }}"
-        update: true
+        cmode: "{{ ct.cmode | default(omit, true) }}"
+        timezone: "{{ ct.timezone | default(omit, true) }}"
+        description: "{{ ct.description | default(omit, true) }}"
+        tags: "{{ ct.tags | default(omit, true) }}"
+        features: "{{ ct.features if (ct.features | default([], true)) else omit }}"
+        startup: "{{ ct.startup if (ct.startup | default([], true)) else omit }}"
+        nameserver: "{{ ct.nameserver | default(omit, true) }}"
+        searchdomain: "{{ ct.searchdomain | default(omit, true) }}"
+        hookscript: "{{ ct.hookscript | default(omit, true) }}"
+        netif: "{{ ct.netif if (ct.netif | default({}, true)) else omit }}"
+        timeout: 120
         state: present
       loop: "{{ pve_cts }}"
-      loop_control: *loop_ct
+      loop_control: *pve_loop
       register: create_result
       no_log: true
-      when: live_cts.results[idx].proxmox_vms | length == 0
+      when: not (pve_eval[ct.vmid | string].exists)
 
-    # Only in-place-changeable properties are sent here. The module PUTs every
-    # parameter it receives, so passing disk/ostemplate/unprivileged on an update
-    # would write them blindly.
-    - name: Converge the in-place resources of the containers that already exist
+    # Only the keys that actually drifted are sent: the module PUTs every
+    # parameter it receives, not just the ones it found different.
+    - name: Converge the settings that drifted on the existing containers
       community.proxmox.proxmox:
         <<: *pve_auth
         node: "{{ pve_node }}"
         vmid: "{{ ct.vmid }}"
         hostname: "{{ ct.hostname }}"
-        cores: "{{ ct.cores }}"
-        memory: "{{ ct.memory }}"
-        swap: "{{ ct.swap }}"
-        onboot: "{{ ct.onboot | bool }}"
+        cores: "{{ ct.cores if 'cores' in a.to_set else omit }}"
+        memory: "{{ ct.memory if 'memory' in a.to_set else omit }}"
+        swap: "{{ ct.swap if 'swap' in a.to_set else omit }}"
+        cpuunits: "{{ ct.cpuunits if 'cpuunits' in a.to_set else omit }}"
+        onboot: "{{ (ct.onboot | bool) if 'onboot' in a.to_set else omit }}"
+        cmode: "{{ ct.cmode if 'cmode' in a.to_set else omit }}"
+        timezone: "{{ ct.timezone if 'timezone' in a.to_set else omit }}"
+        description: "{{ ct.description if 'description' in a.to_set else omit }}"
+        tags: "{{ ct.tags if 'tags' in a.to_set else omit }}"
+        features: "{{ ct.features if 'features' in a.to_set else omit }}"
+        startup: "{{ ct.startup if 'startup' in a.to_set else omit }}"
+        nameserver: "{{ ct.nameserver if 'nameserver' in a.to_set else omit }}"
+        searchdomain: "{{ ct.searchdomain if 'searchdomain' in a.to_set else omit }}"
+        hookscript: "{{ ct.hookscript if 'hookscript' in a.to_set else omit }}"
+        netif: >-
+          {{ ct.netif if ((ct.netif | default({}, true)).keys() | list | intersect(a.to_set) | length > 0) else omit }}
+        mounts: >-
+          {{ ct.mounts if ((ct.mounts | default({}, true)).keys() | list | intersect(a.to_set) | length > 0) else omit }}
+        delete: "{{ a.to_delete if a.to_delete else omit }}"
         update: true
         state: present
+      vars:
+        a: "{{ pve_eval[ct.vmid | string] }}"
       loop: "{{ pve_cts }}"
-      loop_control: *loop_ct
+      loop_control: *pve_loop
       register: converge_result
       no_log: true
-      when: live_cts.results[idx].proxmox_vms | length == 1
+      when: a.exists and ((a.to_set | length > 0) or (a.to_delete | length > 0))
+
+    - name: Converge the power state of every container
+      community.proxmox.proxmox:
+        <<: *pve_auth
+        node: "{{ pve_node }}"
+        vmid: "{{ ct.vmid }}"
+        timeout: 90
+        state: "{{ ct.status }}"
+      loop: "{{ pve_cts }}"
+      loop_control: *pve_loop
+      register: power_result
+      no_log: true
+      when: pve_eval[ct.vmid | string].power_drift
+
+    - name: Report what this run changed
+      ansible.builtin.debug:
+        msg: >-
+          {{ ct.hostname }} (VMID {{ ct.vmid }}): set {{ a.to_set | join(', ') or '-' }},
+          delete {{ a.to_delete | join(', ') or '-' }},
+          power {{ a.status or '(none)' }} -> {{ ct.status }}
+      vars:
+        a: "{{ pve_eval[ct.vmid | string] }}"
+      changed_when: false
+      loop: "{{ pve_cts }}"
+      loop_control: *pve_loop
 
     - name: Re-read every declared container through the API
       community.proxmox.proxmox_vm_info:
@@ -111,26 +187,42 @@
         type: lxc
         config: current
       loop: "{{ pve_cts }}"
-      loop_control: *loop_ct
+      loop_control: *pve_loop
       register: applied_cts
       no_log: true
 
+    - name: Re-analyse every container from the fresh API read
+      ansible.builtin.set_fact:
+        pve_after: "{{ pve_after | default({}) | combine({ (ct.vmid | string): analysis }) }}"
+      vars:
+        vm: "{{ applied_cts.results[idx].proxmox_vms | first | default({}, true) }}"
+        live: "{{ vm.config | default({}, true) }}"
+        live_status: "{{ vm.status | default('', true) }}"
+        analysis: "{{ pve_analysis }}"
+      loop: "{{ pve_cts }}"
+      loop_control: *pve_loop
+
+    # The verification re-derives everything from a fresh API read: a task exit
+    # status is not proof that PVE stored what was declared.
     - name: Verify every container matches the declared state
       ansible.builtin.assert:
         that:
-          - applied_cts.results[idx].proxmox_vms | length == 1
-          - applied_cts.results[idx].proxmox_vms[0].vmid | int == ct.vmid | int
-          - applied_cts.results[idx].proxmox_vms[0].name == ct.hostname
-          - applied_cts.results[idx].proxmox_vms[0].status == 'stopped'
-          - applied_cts.results[idx].proxmox_vms[0].config.hostname == ct.hostname
-          - applied_cts.results[idx].proxmox_vms[0].config.cores | int == ct.cores | int
-          - applied_cts.results[idx].proxmox_vms[0].config.memory | int == ct.memory | int
-          - applied_cts.results[idx].proxmox_vms[0].config.swap | int == ct.swap | int
-          - applied_cts.results[idx].proxmox_vms[0].config.unprivileged | int == (1 if ct.unprivileged | bool else 0)
-          - (ct.storage ~ ':') in applied_cts.results[idx].proxmox_vms[0].config.rootfs
-        fail_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): the API did not return the declared state."
+          - b.exists
+          - b.mismatched | length == 0
+          - b.forbidden_present | length == 0
+          - b.creation_time_drift | length == 0
+          - not b.power_drift
+        fail_msg: >-
+          {{ ct.hostname }} (VMID {{ ct.vmid }}) does not match inventory/group_vars/all.yml after
+          apply: mismatched={{ b.declared_subset | to_json }} vs live={{ b.actual_subset | to_json }},
+          still present but declared absent={{ b.forbidden_present | join(', ') or '-' }},
+          creation-time drift={{ b.creation_time_drift | join(', ') or '-' }},
+          status {{ b.status }} vs declared {{ ct.status }}.
         success_msg: >-
-          Verified {{ ct.hostname }} (VMID {{ ct.vmid }}): {{ ct.cores | int }} vCPU,
-          {{ ct.memory | int }} MiB RAM, {{ ct.swap | int }} MiB swap, stopped, rootfs on {{ ct.storage }}.
+          Verified {{ ct.hostname }} (VMID {{ ct.vmid }}): {{ ct.cores }} vCPU, {{ ct.memory }} MiB RAM,
+          {{ ct.swap }} MiB swap, cpuunits {{ ct.cpuunits }}, {{ b.status }},
+          rootfs {{ ct.rootfs_size }} GiB on {{ ct.storage }}, and every declared setting matches.
+      vars:
+        b: "{{ pve_after[ct.vmid | string] }}"
       loop: "{{ pve_cts }}"
-      loop_control: *loop_ct
+      loop_control: *pve_loop

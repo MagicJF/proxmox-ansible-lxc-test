@@ -1,39 +1,85 @@
-# Desired state of the containers this repository manages.
+# ============================================================================
+# Desired state of every container this repository manages.
 #
 # This is the only file that changes when a change is requested: edit it, open a
-# branch, run preflight -> apply. The playbooks under playbooks/ are the fixed
-# engine and should not grow one file per request.
+# branch, run preflight -> apply. The playbooks under playbooks/ are a fixed
+# engine (two verbs) and never grow one file per request.
 #
-# It is a group_vars FILE for the group "all", so variables belong at the top
-# level. Nesting them under an "all:" key would define one variable named "all"
-# and leave every real variable undefined.
+# It is a group_vars FILE for the group "all", so variables sit at the top level.
+# Nesting them under an "all:" key would define one variable named "all" and
+# leave every real variable undefined.
+#
+# Everything the provisioning module can set is declared here, including the
+# settings that must NOT exist (null / empty): absence is state too, so the
+# engine deletes anything that appears where the file declares nothing.
+# ============================================================================
 
 pve_node: Proxmox
 
-# Creation-time defaults shared by every container. PVE cannot change any of these
-# on an existing container, so changing one here means "recreate", not "converge".
 pve_defaults:
-  storage: local-zfs
-  rootfs_size: 8
+  # ---- creation-time: PVE cannot change these on an existing container ------
+  # Drift here is refused, not converged: the container would have to be
+  # recreated (and rootfs growth cannot be undone at all).
   template: "local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst"
   template_storage: local
+  storage: local-zfs
+  rootfs_size: 8
   unprivileged: true
-  onboot: false
-  swap: 512
+  ostype: debian
 
-# Every container this repository manages — and nothing else. A container absent
+  # ---- power state ---------------------------------------------------------
+  # started | stopped
+  status: stopped
+
+  # ---- resources (converged in place) -------------------------------------
+  memory: 2048
+  swap: 512
+  cores: 2
+  # cpuunits only: the module's `cpus` parameter means cpuunits on creation but
+  # cpulimit on update, so it cannot be declared coherently. Use cpuunits.
+  cpuunits: 1024
+
+  # ---- behaviour (converged in place) -------------------------------------
+  onboot: false
+  description: "Managed by proxmox-ansible-lxc-test. Declare changes in inventory/group_vars/all.yml."
+  tags: [ansible-managed, lab]
+  # PVE accepts the literal "host" to follow the node's timezone.
+  timezone: host
+  # tty | console | shell
+  cmode: shell
+  # List form, joined by the module. Empty list = must not exist.
+  features: []
+  startup: []
+
+  # ---- network (converged in place; empty = no interface at all) ----------
+  netif: {}
+  nameserver: null
+  searchdomain: null
+
+  # ---- attachments (converged in place; empty = must not exist) -----------
+  hookscript: null
+  mounts: {}
+  mount_devices: []
+
+  # ---- creation-time only: not forwarded on update, never automated -------
+  # pubkey: applied only when the container is created; declared absent.
+  # password: creation-time secret, which would have to live in Git — not
+  #           declared; inject it from a vault at creation time if ever needed.
+  # clone / clone_type: alternative creation path, unused here.
+  # pool: no pool exists on this node.
+  # force / purge / destroy_unreferenced_disks: destructive control flags, never
+  #           automated by the engine.
+  pubkey: null
+
+# The containers this repository manages — and nothing else. A container absent
 # from this list is never read, created or modified.
-#
-# vmid + hostname are identity (changing them means "recreate").
-# cores / memory / swap / onboot are converged in place by apply.yml and may be
-# set per container to override the defaults above.
+# vmid + hostname are identity; changing them means "recreate".
+# Any key of pve_defaults may be overridden per container.
 pve_containers:
   - vmid: 102
     hostname: test-from-ansible
     cores: 2
-    memory: 2048
 
   - vmid: 103
     hostname: 3cores
     cores: 3
-    memory: 2048

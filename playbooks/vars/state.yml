@@ -1,0 +1,155 @@
+# ---------------------------------------------------------------------------
+# Shared translation layer between the declared state (loop var `ct`) and the
+# live PVE state (`live` = the container's config dict, `live_status` = the
+# runtime status). Loaded by apply.yml and preflight.yml through vars_files so
+# the two verbs can never disagree about what "in sync" means.
+#
+# PVE does not store every value verbatim:
+#   tags        -> reordered alphabetically, ';' separated  ("probe;manual" -> "manual;probe")
+#   features    -> ',' separated
+#   startup     -> ',' separated
+#   description -> a trailing newline is appended
+# Both sides are canonicalised below before comparison. Comparing raw strings
+# would report permanent phantom drift and destroy idempotency.
+#
+# Every value is forced through `| string` on BOTH sides: a bare `{{ expr }}`
+# returning a number is handed back by Ansible as an int, which would never
+# compare equal to the string the API returns ("0" != 0).
+#
+# Declared keys map 1:1 onto the module's parameter names, so a mismatch can be
+# passed straight through on the update path.
+# ---------------------------------------------------------------------------
+
+# ---- canonical declared form ('' means "this setting must not exist") ------
+pve_declared_flat:
+  hostname: "{{ ct.hostname | string }}"
+  ostype: "{{ ct.ostype | string }}"
+  cores: "{{ ct.cores | string }}"
+  memory: "{{ ct.memory | string }}"
+  swap: "{{ ct.swap | string }}"
+  cpuunits: "{{ ct.cpuunits | string }}"
+  onboot: "{{ (1 if ct.onboot | bool else 0) | string }}"
+  cmode: "{{ ct.cmode | default('', true) | string }}"
+  timezone: "{{ ct.timezone | default('', true) | string }}"
+  description: "{{ ct.description | default('', true) | trim }}"
+  tags: "{{ ct.tags | default([], true) | sort | join(';') }}"
+  features: "{{ ct.features | default([], true) | sort | join(',') }}"
+  startup: "{{ ct.startup | default([], true) | sort | join(',') }}"
+  nameserver: "{{ ct.nameserver | default('', true) | string }}"
+  searchdomain: "{{ ct.searchdomain | default('', true) | string }}"
+  hookscript: "{{ ct.hookscript | default('', true) | string }}"
+
+# ---- canonical live form (same key order) ---------------------------------
+pve_actual_flat:
+  hostname: "{{ live.hostname | default('') | string }}"
+  ostype: "{{ live.ostype | default('') | string }}"
+  cores: "{{ live.cores | default('') | string }}"
+  memory: "{{ live.memory | default('') | string }}"
+  swap: "{{ live.swap | default('') | string }}"
+  cpuunits: "{{ live.cpuunits | default('') | string }}"
+  onboot: "{{ live.onboot | default('') | string }}"
+  cmode: "{{ live.cmode | default('') | string }}"
+  timezone: "{{ live.timezone | default('') | string }}"
+  description: "{{ live.description | default('') | trim }}"
+  tags: "{{ live.tags | default('') | split(';') | sort | join(';') }}"
+  features: "{{ live.features | default('') | split(',') | sort | join(',') }}"
+  startup: "{{ live.startup | default('') | split(',') | sort | join(',') }}"
+  nameserver: "{{ live.nameserver | default('') | string }}"
+  searchdomain: "{{ live.searchdomain | default('') | string }}"
+  hookscript: "{{ live.hookscript | default('') | string }}"
+
+# ---- network interfaces and mount points are part of the state too --------
+# PVE rewrites the property order inside a netX/mpX value, so both sides are
+# canonicalised to the sorted set of properties (same treatment as tags).
+# PVE also ADDS its own properties to a netX value: `hwaddr` (generated per
+# container) and `type=veth` (its default). Both are dropped from both sides;
+# without that, every run would report phantom drift and PUT forever.
+pve_netif_canon: >-
+  {{ dict((ct.netif | default({}, true)).keys() | list
+          | zip((ct.netif | default({}, true)).values()
+                | map('split', ',') | map('reject', 'match', '^hwaddr=')
+                | map('reject', 'match', '^type=veth$')
+                | map('sort') | map('join', ',') | list)) }}
+
+pve_mounts_canon: >-
+  {{ dict((ct.mounts | default({}, true)).keys() | list
+          | zip((ct.mounts | default({}, true)).values() | map('split', ',') | map('sort') | map('join', ',') | list)) }}
+
+pve_live_netmp_keys: "{{ live.keys() | select('match', '^(net|mp)[0-9]+$') | list }}"
+
+pve_live_netmp_canon: >-
+  {{ dict(pve_live_netmp_keys
+          | zip(pve_live_netmp_keys | map('extract', live)
+                | map('split', ',') | map('reject', 'match', '^hwaddr=')
+                | map('reject', 'match', '^type=veth$')
+                | map('sort') | map('join', ',') | list)) }}
+
+pve_declared_norm: "{{ pve_declared_flat | combine(pve_netif_canon) | combine(pve_mounts_canon) }}"
+pve_actual_norm: "{{ pve_actual_flat | combine(pve_live_netmp_canon) }}"
+
+# ---- what differs ---------------------------------------------------------
+# symmetric_difference on dict2items cancels every key whose declared and live
+# items are identical; `unique` collapses the two entries a differing key leaves.
+pve_mismatched: >-
+  {{ ((pve_declared_norm | dict2items) | symmetric_difference(pve_actual_norm | dict2items))
+     | map(attribute='key') | unique | sort | list }}
+
+pve_declared_empty: >-
+  {{ pve_declared_norm | dict2items | selectattr('value', 'eq', '') | map(attribute='key') | list }}
+
+# Declared with a value and currently different -> write it.
+pve_to_set: "{{ pve_mismatched | difference(pve_declared_empty) | sort | list }}"
+
+# Declared as absent (or the network/attachments are declared empty) but still
+# present in the live config -> delete it. A netX/mpX the file does not declare
+# is not declared at all, so it is removed too.
+pve_to_delete: >-
+  {{ ((pve_mismatched | intersect(pve_declared_empty))
+      + (live.keys() | select('match', '^net[0-9]+$') | list | difference((ct.netif | default({}, true)).keys() | list))
+      + (live.keys() | select('match', '^mp[0-9]+$') | list | difference((ct.mounts | default({}, true)).keys() | list)))
+     | unique | sort | list }}
+
+pve_forbidden_present: "{{ pve_to_delete | intersect(live.keys() | list) | sort | list }}"
+
+# ---- creation-time properties PVE cannot change in place ------------------
+# Split rather than regex: a regex backreference inside a YAML folded block is
+# not unescaped the way it is in a double-quoted scalar, so '\1' silently
+# becomes a literal and the size reads back as 0.
+pve_rootfs_size_live: >-
+  {{ live.rootfs | default('') | split('size=') | last | split('G') | first | int }}
+
+pve_creation_time_drift: >-
+  {{ ([]
+      + (['unprivileged'] if (live.unprivileged | default(-1) | int) != (1 if ct.unprivileged | bool else 0) else [])
+      + (['ostype'] if (live.ostype | default('') | string) != (ct.ostype | string) else [])
+      + (['rootfs storage'] if (ct.storage ~ ':') not in (live.rootfs | default('')) else [])
+      + (['rootfs size'] if pve_rootfs_size_live != (ct.rootfs_size | int) else []))
+     | sort | list }}
+
+# ---- power state ----------------------------------------------------------
+pve_power_drift: "{{ (live_status | default('') | string) != (ct.status | string) }}"
+
+# ---- the differing keys as two small dicts, for a readable report ----------
+# Built with dict2items/selectattr, not map('extract'): a key declared as absent
+# is not in the dict at all, and extract raises instead of returning undefined.
+pve_declared_subset: >-
+  {{ pve_declared_norm | dict2items | selectattr('key', 'in', pve_mismatched) | items2dict }}
+pve_actual_subset: >-
+  {{ pve_actual_norm | dict2items | selectattr('key', 'in', pve_mismatched) | items2dict }}
+
+# ---- one summary the playbooks can act on and report ----------------------
+pve_analysis:
+  exists: "{{ live | length > 0 }}"
+  status: "{{ live_status | default('') }}"
+  mismatched: "{{ pve_mismatched }}"
+  declared_subset: "{{ pve_declared_subset }}"
+  actual_subset: "{{ pve_actual_subset }}"
+  to_set: "{{ pve_to_set }}"
+  to_delete: "{{ pve_to_delete }}"
+  forbidden_present: "{{ pve_forbidden_present }}"
+  creation_time_drift: "{{ pve_creation_time_drift }}"
+  power_drift: "{{ pve_power_drift }}"
+  in_sync: >-
+    {{ (pve_mismatched | length == 0)
+       and (pve_creation_time_drift | length == 0)
+       and not pve_power_drift }}
