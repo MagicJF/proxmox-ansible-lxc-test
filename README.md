@@ -1,6 +1,18 @@
 # Proxmox LXC via Ansible
 
-Disposable MVP that provisions `test-from-ansible` as an LXC on Proxmox VE using the HTTPS API only. No playbook connects to the Proxmox host over SSH.
+Declarative IaC for the disposable LXC `test-from-ansible` on Proxmox VE, driven entirely over the HTTPS API. No playbook connects to the Proxmox host over SSH.
+
+## Structure
+
+```text
+inventory/group_vars/all.yml   # THE desired state — the only file that changes per request
+playbooks/preflight.yml        # read-only: platform checks + drift report (no mutation)
+playbooks/apply.yml            # converges to the declared state, then verifies via the API
+```
+
+The playbooks are a fixed engine with exactly two verbs. A change request is an edit to `inventory/group_vars/all.yml` on a new branch — not a new playbook. Adding a playbook per change would scatter the real state across files that overwrite each other.
+
+`group_vars/all.yml` is a group_vars *file*, so its variables sit at the top level; nesting them under an `all:` key just defines one variable named `all` and breaks every reference.
 
 ## Requirements
 
@@ -29,27 +41,43 @@ For this lab, the certificate includes the PVE public IP as a SAN; the LAN addre
 python3 -m pip install -r requirements.txt
 ansible-galaxy collection install -r requirements.yml
 ansible-playbook --syntax-check playbooks/preflight.yml
-ansible-playbook --syntax-check playbooks/create_lxc.yml
-ansible-playbook --syntax-check playbooks/double_resources.yml
-ansible-playbook playbooks/preflight.yml
-ansible-playbook playbooks/create_lxc.yml
-ansible-playbook playbooks/double_resources.yml
+ansible-playbook --syntax-check playbooks/apply.yml
+ansible-playbook playbooks/preflight.yml   # read-only: checks + what would change
+ansible-playbook playbooks/apply.yml       # converge + verify
 ```
 
-`preflight.yml` is the non-mutating dry-run: it reads node, VMID/name, storage, and template state through Ansible/API tasks and asserts the selected values are usable. The creation module explicitly does **not** support Ansible check mode (`--check`), so check mode cannot predict a create; it must not be treated as a successful dry-run. Apply only after preflight passes.
+## Declared state
 
-The playbook uses VMID `102`, node `Proxmox`, template `local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst`, rootfs on `local-zfs` at 8 GiB, 1 vCPU, 1 GiB RAM and 512 MiB swap. It creates the container stopped and without a network interface; change those parameters if the test needs connectivity or an automatically started container.
+`inventory/group_vars/all.yml` declares:
 
-## Changing resources of an existing container
+| Property | Value | Converged in place by `apply.yml` |
+| --- | --- | --- |
+| `pve_node` / `pve_vmid` / `pve_hostname` | `Proxmox` / `102` / `test-from-ansible` | no (identity) |
+| `pve_cores` | 2 | yes |
+| `pve_memory` | 2048 MiB | yes |
+| `pve_swap` | 512 MiB | yes |
+| `pve_onboot` | false | yes |
+| `pve_unprivileged` | true | no (creation-time) |
+| `pve_storage` | `local-zfs` | no (creation-time) |
+| `pve_rootfs_size` | 8 GiB | no (creation-time, growth is irreversible) |
+| `pve_template` | `local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst` | no (creation-time) |
 
-`double_resources.yml` doubles the container's vCPU and RAM (1 → 2 cores, 1024 → 2048 MiB) against VMID `102`, reusing `community.proxmox.proxmox` with `update: true` and `state: present`. Because the module PUTs every parameter it receives, the play sends only `cores` and `memory` (plus the identity fields `node`/`vmid`/`hostname`, which `state=present` requires and which are re-sent unchanged), so swap, rootfs, `unprivileged` and `onboot` are left untouched. Its final task re-reads the container through the API and asserts the doubled values together with the unchanged swap, hostname, unprivileged flag and rootfs. The update is idempotent: a second run reports no changes.
+The container is created stopped and without a network interface; change those parameters if the test needs connectivity or an automatically started container.
 
-This module also declares `supports_check_mode=False`, so `--check` skips the task rather than simulating it; the playbook fails early under check mode to say so. Read the container state back through the API after applying — a task exit status alone is not proof.
+## How the engine behaves
 
-The container now runs at 2 vCPU / 2 GiB RAM; swap stays at 512 MiB and rootfs at 8 GiB. Growing an LXC rootfs is not reversible, so no disk change is made by this playbook.
+**preflight.yml** (read-only): asserts the node is online, the declared rootfs storage is active and the declared template is present; then prints live-vs-declared for each in-place property and marks the drift. If the container does not exist yet, it says so instead.
+
+**apply.yml**: reads the live container, then either creates it (absent) or converges it (present). It passes only in-place-changeable properties to `community.proxmox.proxmox` on the update path, because that module PUTs every parameter it receives — sending `disk`/`ostemplate`/`unprivileged` on an update would write them blindly. `state=present` also requires `node` and `hostname`, so those are always sent (hostname unchanged). The final task re-reads the container through the API and asserts the declared values; a task exit status alone is not proof.
+
+Blocking drift — `unprivileged`, rootfs storage or rootfs size differing from the live container — is refused with an explicit message instead of reported as success, since PVE cannot change those in place and rootfs growth cannot be undone.
+
+`community.proxmox.proxmox` declares `supports_check_mode=False`: under `--check` Ansible skips the mutating task and predicts nothing, so both playbooks fail early under check mode rather than implying a dry-run. Use `preflight.yml` for the non-mutating view.
+
+`apply.yml` is idempotent: when live state matches the declared state it reports no changes. To change anything, edit `group_vars/all.yml` (or override for a one-off with `-e`) and run preflight then apply.
 
 ## Credentials and cleanup
 
 The initial lab token was created for `root@pam` with privilege separation disabled and no expiry, so it has full root-equivalent API privileges. This is intentionally overprivileged for a disposable MVP: revoke it and create a scoped token before any ongoing use. The SSH key was only for initial discovery/bootstrap; no infrastructure playbook uses SSH.
 
-To remove the disposable LXC later, use the same API credentials with `community.proxmox.proxmox` and `state: absent` for VMID `102`; verify the VMID first. Do not remove resources by SSH commands.
+To remove the disposable LXC later, set the VMID explicitly and use `community.proxmox.proxmox` with `state: absent`; verify the VMID first. Do not remove resources by SSH commands.
