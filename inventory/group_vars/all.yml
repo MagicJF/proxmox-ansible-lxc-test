@@ -107,3 +107,52 @@ pve_containers:
       net0: "name=eth0,bridge=vmbr0,ip=dhcp"
     mounts:
       mp0: "local:5,mp=/mnt/data"
+
+# ============================================================================
+# QEMU VMs — same declarative rules as the containers, with one important
+# difference: proxmox_kvm refuses to update net/scsi/ide/sata/virtio (updating
+# them can regenerate a MAC or recreate a disk), so for a VM those, plus
+# bios/machine/scsihw/ostype, are creation-time: drift in them is REFUSED by
+# apply.yml instead of converged.
+# ============================================================================
+pve_vm_defaults:
+  # ---- creation-time: PVE cannot change these on an existing VM --------
+  bios: seabios
+  machine: q35
+  scsihw: virtio-scsi-single
+  ostype: l26
+
+  # ---- power state ----------------------------------------------------
+  # started | stopped
+  status: stopped
+
+  # ---- resources and behaviour (converged in place) --------------------
+  sockets: 1
+  cpu: host
+  vga: std
+  onboot: false
+  boot: "order=ide2;scsi0"
+  description: "Nested Proxmox VE managed by proxmox-ansible-lxc-test. The installation itself is finished by hand from the noVNC console."
+  tags: [nested, pve, ansible-managed]
+
+  # ---- attachments (creation-time; empty = must not exist) -------------
+  net: {}
+  scsi: {}
+  sata: {}
+  ide: {}
+  virtio: {}
+
+# The VMs this repository manages — and nothing else.
+pve_vms:
+  - vmid: 120
+    name: pve-nested
+    cores: 4
+    memory: 4096
+    # Boots the Proxmox VE installer from the ISO already on the node.
+    status: started
+    net:
+      net0: "virtio,bridge=vmbr0"
+    scsi:
+      scsi0: "local-zfs:32"
+    ide:
+      ide2: "local:iso/proxmox-ve_9.2-1.iso,media=cdrom"

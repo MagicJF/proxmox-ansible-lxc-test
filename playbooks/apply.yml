@@ -116,6 +116,11 @@
         live: "{{ vm.config | default({}, true) }}"
         live_status: "{{ vm.status | default('', true) }}"
         analysis: "{{ pve_analysis }}"
+        # feed the shared difference engine with the container mapping
+        declared_norm: "{{ pve_lxc_declared_norm }}"
+        actual_norm: "{{ pve_lxc_actual_norm }}"
+        pve_undeclared_child_keys: "{{ pve_lxc_undeclared_child_keys }}"
+        pve_creation_time_drift: "{{ pve_lxc_creation_time_drift }}"
       loop: "{{ pve_cts }}"
       loop_control: *pve_loop
 
@@ -254,6 +259,11 @@
         live: "{{ vm.config | default({}, true) }}"
         live_status: "{{ vm.status | default('', true) }}"
         analysis: "{{ pve_analysis }}"
+        # feed the shared difference engine with the container mapping
+        declared_norm: "{{ pve_lxc_declared_norm }}"
+        actual_norm: "{{ pve_lxc_actual_norm }}"
+        pve_undeclared_child_keys: "{{ pve_lxc_undeclared_child_keys }}"
+        pve_creation_time_drift: "{{ pve_lxc_creation_time_drift }}"
       loop: "{{ pve_cts }}"
       loop_control: *pve_loop
 
@@ -282,6 +292,194 @@
       loop: "{{ pve_cts }}"
       loop_control: *pve_loop
 
+    # =======================================================================
+    # QEMU VMs — same two verbs as for containers, with the VM mapping from
+    # playbooks/vars/state.yml. The module refuses to update net/scsi/ide/sata/
+    # virtio, so those are creation-time here: drift in them is refused.
+    # =======================================================================
+
+    - name: Build the effective spec of every declared VM
+      ansible.builtin.set_fact:
+        pve_vm_specs: "{{ (pve_vm_specs | default([])) + [pve_vm_defaults | combine(item)] }}"
+      loop: "{{ pve_vms }}"
+      loop_control:
+        label: "VMID {{ item.vmid }}"
+
+    - name: Read every declared VM through the API
+      community.proxmox.proxmox_vm_info:
+        <<: *pve_auth
+        vmid: "{{ ct.vmid }}"
+        type: qemu
+        config: current
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *pve_loop
+      register: live_vms
+      no_log: true
+
+    - name: Analyse every declared VM against its live state
+      ansible.builtin.set_fact:
+        pve_vm_eval: "{{ pve_vm_eval | default({}) | combine({ (ct.vmid | string): analysis }) }}"
+      vars:
+        ga: "{{ live_vms.results[idx].proxmox_vms | first | default({}, true) }}"
+        live: "{{ ga.config | default({}, true) }}"
+        live_status: "{{ ga.status | default('', true) }}"
+        analysis: "{{ pve_analysis }}"
+        # feed the shared difference engine with the VM mapping
+        declared_norm: "{{ pve_vm_declared_norm }}"
+        actual_norm: "{{ pve_vm_actual_norm }}"
+        pve_undeclared_child_keys: "{{ pve_vm_undeclared_child_keys }}"
+        pve_creation_time_drift: "{{ pve_vm_creation_time_drift }}"
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *pve_loop
+
+    - name: Refuse to converge VM properties PVE cannot change on a running VM definition
+      ansible.builtin.assert:
+        that:
+          - a.creation_time_drift | length == 0
+        fail_msg: >-
+          {{ ct.name }} (VMID {{ ct.vmid }}): {{ a.creation_time_drift | join(', ') }} differs from
+          the live VM. proxmox_kvm refuses to update net/scsi/ide/sata/virtio (it can regenerate a
+          MAC or recreate a disk) and bios/machine/scsihw/ostype are creation-time, so this VM is
+          left untouched. Recreate it deliberately or revert the value.
+        success_msg: "{{ ct.name }} (VMID {{ ct.vmid }}): creation-time properties match."
+      vars:
+        a: "{{ pve_vm_eval[ct.vmid | string] }}"
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *pve_loop
+      when: a.exists
+
+    - name: Create the VMs that do not exist yet
+      community.proxmox.proxmox_kvm:
+        <<: *pve_auth
+        node: "{{ pve_node }}"
+        vmid: "{{ ct.vmid }}"
+        name: "{{ ct.name }}"
+        cores: "{{ ct.cores }}"
+        sockets: "{{ ct.sockets }}"
+        memory: "{{ ct.memory }}"
+        cpu: "{{ ct.cpu }}"
+        ostype: "{{ ct.ostype }}"
+        bios: "{{ ct.bios }}"
+        machine: "{{ ct.machine }}"
+        scsihw: "{{ ct.scsihw }}"
+        vga: "{{ ct.vga }}"
+        onboot: "{{ ct.onboot | bool }}"
+        boot: "{{ ct.boot }}"
+        description: "{{ ct.description | default(omit, true) }}"
+        tags: "{{ ct.tags | default(omit, true) }}"
+        kvm: true
+        net: "{{ ct.net }}"
+        scsi: "{{ ct.scsi }}"
+        ide: "{{ ct.ide }}"
+        timeout: 300
+        state: present
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *pve_loop
+      register: vm_create
+      no_log: true
+      when: not (pve_vm_eval[ct.vmid | string].exists)
+
+    # Only the properties proxmox_kvm is willing to update, and only the ones
+    # that actually drifted.
+    - name: Converge the settings that drifted on the existing VMs
+      community.proxmox.proxmox_kvm:
+        <<: *pve_auth
+        node: "{{ pve_node }}"
+        vmid: "{{ ct.vmid }}"
+        name: "{{ ct.name }}"
+        cores: "{{ ct.cores if 'cores' in a.to_set else omit }}"
+        sockets: "{{ ct.sockets if 'sockets' in a.to_set else omit }}"
+        memory: "{{ ct.memory if 'memory' in a.to_set else omit }}"
+        cpu: "{{ ct.cpu if 'cpu' in a.to_set else omit }}"
+        vga: "{{ ct.vga if 'vga' in a.to_set else omit }}"
+        boot: "{{ ct.boot if 'boot' in a.to_set else omit }}"
+        onboot: "{{ (ct.onboot | bool) if 'onboot' in a.to_set else omit }}"
+        description: "{{ ct.description if 'description' in a.to_set else omit }}"
+        tags: "{{ ct.tags if 'tags' in a.to_set else omit }}"
+        update: true
+        timeout: 300
+        state: present
+      vars:
+        a: "{{ pve_vm_eval[ct.vmid | string] }}"
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *pve_loop
+      register: vm_converge
+      no_log: true
+      when: a.exists and (a.to_set | length > 0)
+
+    - name: Converge the power state of every declared VM
+      community.proxmox.proxmox_kvm:
+        <<: *pve_auth
+        node: "{{ pve_node }}"
+        vmid: "{{ ct.vmid }}"
+        timeout: 300
+        state: "{{ ct.status }}"
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *pve_loop
+      register: vm_power
+      no_log: true
+      when: pve_vm_eval[ct.vmid | string].power_drift
+
+    - name: Report what this run changed on the VMs
+      ansible.builtin.debug:
+        msg: >-
+          {{ ct.name }} (VMID {{ ct.vmid }}): set {{ a.to_set | join(', ') or '-' }},
+          delete {{ a.to_delete | join(', ') or '-' }},
+          power {{ a.status or '(none)' }} -> {{ a.status_expected }}
+      vars:
+        a: "{{ pve_vm_eval[ct.vmid | string] }}"
+      changed_when: false
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *pve_loop
+
+    - name: Re-read every declared VM through the API
+      community.proxmox.proxmox_vm_info:
+        <<: *pve_auth
+        vmid: "{{ ct.vmid }}"
+        type: qemu
+        config: current
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *pve_loop
+      register: applied_vms
+      no_log: true
+
+    - name: Re-analyse every VM from the fresh API read
+      ansible.builtin.set_fact:
+        pve_vm_after: "{{ pve_vm_after | default({}) | combine({ (ct.vmid | string): analysis }) }}"
+      vars:
+        ga: "{{ applied_vms.results[idx].proxmox_vms | first | default({}, true) }}"
+        live: "{{ ga.config | default({}, true) }}"
+        live_status: "{{ ga.status | default('', true) }}"
+        analysis: "{{ pve_analysis }}"
+        declared_norm: "{{ pve_vm_declared_norm }}"
+        actual_norm: "{{ pve_vm_actual_norm }}"
+        pve_undeclared_child_keys: "{{ pve_vm_undeclared_child_keys }}"
+        pve_creation_time_drift: "{{ pve_vm_creation_time_drift }}"
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *pve_loop
+
+    - name: Verify every VM matches the declared state
+      ansible.builtin.assert:
+        that:
+          - b.exists
+          - b.mismatched | length == 0
+          - b.forbidden_present | length == 0
+          - b.creation_time_drift | length == 0
+          - not b.power_drift
+        fail_msg: >-
+          {{ ct.name }} (VMID {{ ct.vmid }}) does not match inventory/group_vars/all.yml after apply:
+          mismatched={{ b.declared_subset | to_json }} vs live={{ b.actual_subset | to_json }},
+          still present but declared absent={{ b.forbidden_present | join(', ') or '-' }},
+          creation-time drift={{ b.creation_time_drift | join(', ') or '-' }},
+          status {{ b.status }} vs declared {{ b.status_expected }}.
+        success_msg: >-
+          Verified {{ ct.name }} (VMID {{ ct.vmid }}): {{ ct.cores }} vCPU x {{ ct.sockets }} socket,
+          {{ ct.memory }} MiB RAM, {{ b.status }}, boot {{ ct.boot }}, and every declared setting matches.
+      vars:
+        b: "{{ pve_vm_after[ct.vmid | string] }}"
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *pve_loop
+
     - name: Mark the end of this run in the API journal
       ansible.builtin.lineinfile:
         path: "{{ pve_journal }}"
@@ -293,7 +491,7 @@
           ts: "{{ '%Y-%m-%dT%H:%M:%S%z' | strftime }}"
           event: run_end
           playbook: "{{ ansible_play_name }}"
-          verified: "{{ pve_cts | map(attribute='vmid') | list }}"
+          verified: "{{ (pve_cts | map(attribute='vmid') | list) + (pve_vm_specs | map(attribute='vmid') | list) }}"
       changed_when: false
 
     # Observability is only real if it is checked: a trace that quietly stopped

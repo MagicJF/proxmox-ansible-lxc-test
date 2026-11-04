@@ -1,6 +1,6 @@
 # Proxmox LXC via Ansible
 
-Declarative IaC for the LXC containers on Proxmox VE, driven entirely over the HTTPS API. No playbook connects to the Proxmox host over SSH.
+Declarative IaC for the LXC containers and QEMU VMs on Proxmox VE, driven entirely over the HTTPS API. No playbook connects to the Proxmox host over SSH.
 
 ## Structure
 
@@ -102,6 +102,20 @@ These are deliberately out of the file, not forgotten:
 - raw `lxc.*` config keys (cgroup limits, bind mounts) — not exposed by the collection's module.
 - `cpus` (CPU limit) — the module maps it to `cpuunits` on creation but to `cpulimit` on update, so it cannot hold one meaning; declare `cpuunits` instead.
 
+## QEMU VMs
+
+`pve_vm_defaults` + `pve_vms` declare VMs the same way, with one structural difference: **`proxmox_kvm` refuses to update `net`, `scsi`, `ide`, `sata`, `virtio`, `efidisk0` and `tpmstate0`** — updating them can regenerate a MAC or recreate a disk and lose data. So for a VM the network, the disks and the CD-ROM are *creation-time* properties, exactly like `bios`, `machine`, `scsihw` and `ostype`: drift in any of them makes `apply.yml` fail for that VM with an explicit message instead of converging.
+
+Converged in place for VMs: `cores`, `sockets`, `memory`, `cpu`, `vga`, `boot`, `onboot`, `description`, `tags`, and the power state.
+
+| VM | vmid | shape | role |
+| --- | --- | --- | --- |
+| `pve-nested` | 120 | 4 vCPU x 1 socket, 4096 MiB, 32 GiB disk on `local-zfs`, `q35`/SeaBIOS, one virtio NIC on `vmbr0`, CD-ROM on `proxmox-ve_9.2-1.iso` | a nested Proxmox VE |
+
+`preflight.yml` additionally asserts that every ISO a VM declares is actually present on the node before anything is created.
+
+The nested PVE installation is **not** automated: `preflight`/`apply` leave the VM booting the installer from the CD-ROM (declared `boot: order=ide2;scsi0`), and the installation is finished by hand from the noVNC console in the PVE UI. Nothing in this repository claims the guest is installed.
+
 ## How the engine behaves
 
 Both playbooks build an effective spec per container as `pve_defaults | combine(entry)`, analyse each container against a fresh API read, and loop with `loop_control.index_var` to correlate every task with its own API result.
@@ -119,6 +133,8 @@ Normalisation is the subtle part (`playbooks/vars/state.yml`), because PVE does 
 | reorders the properties inside a `netX`/`mpX` value | canonicalised by `pve_canon_attachments` |
 | adds `hwaddr=…` and `type=veth` to a `netX` value | drops both, or every run would PUT forever |
 | resolves a mount's volume shorthand (`local:5` → `local:167/vm-167-disk-0.raw` + `size=5G`) | compares the storage, the size and the mount path instead |
+| adds a CD-ROM `size=` (the media file size, e.g. `size=1666190K` for a 1.6 GB ISO) | ignored for ISO-backed attachments |
+| puts a VM NIC's generated MAC inside the model property (`virtio=BC:24:…`) | compares `model=virtio`, MAC ignored |
 | reports a running container as `running`, while the module's power vocabulary is `started` | power compared in the API's vocabulary |
 | returns numbers where a template produced an int | forces `string` on both sides |
 

@@ -1,27 +1,38 @@
 # ---------------------------------------------------------------------------
-# Shared translation layer between the declared state (loop var `ct`) and the
-# live PVE state (`live` = the container's config dict, `live_status` = the
-# runtime status). Loaded by apply.yml and preflight.yml through vars_files so
-# the two verbs can never disagree about what "in sync" means.
+# Shared translation layer between the declared state and the live PVE state.
+# Loaded by apply.yml and preflight.yml through vars_files so the two verbs can
+# never disagree about what "in sync" means.
+#
+# Inputs, provided per task by the playbooks:
+#   ct           the declared item, a container OR a VM (loop variable)
+#   live         the live config dict of that guest
+#   live_status  its runtime status ("running"/"stopped")
+#
+# Everything below has two halves: the type-specific mapping (`pve_lxc_*` for
+# containers, `pve_vm_*` for QEMU VMs) and ONE shared difference engine that the
+# playbook feeds by aliasing `declared_norm`, `actual_norm`,
+# `pve_undeclared_child_keys` and `pve_creation_time_drift`.
 #
 # PVE does not store every value verbatim:
 #   tags        -> reordered alphabetically, ';' separated  ("probe;manual" -> "manual;probe")
 #   features    -> ',' separated
 #   startup     -> ',' separated
 #   description -> a trailing newline is appended
-# Both sides are canonicalised below before comparison. Comparing raw strings
-# would report permanent phantom drift and destroy idempotency.
+#   netX/mpX/scsiX -> property order, generated ids and MACs rewritten
+# Both sides are canonicalised before comparison. Comparing raw strings would
+# report permanent phantom drift and destroy idempotency.
 #
 # Every value is forced through `| string` on BOTH sides: a bare `{{ expr }}`
 # returning a number is handed back by Ansible as an int, which would never
 # compare equal to the string the API returns ("0" != 0).
-#
-# Declared keys map 1:1 onto the module's parameter names, so a mismatch can be
-# passed straight through on the update path.
 # ---------------------------------------------------------------------------
 
+# ===========================================================================
+# LXC (containers)
+# ===========================================================================
+
 # ---- canonical declared form ('' means "this setting must not exist") ------
-pve_declared_flat:
+pve_lxc_declared_flat:
   hostname: "{{ ct.hostname | string }}"
   ostype: "{{ ct.ostype | string }}"
   cores: "{{ ct.cores | string }}"
@@ -40,7 +51,7 @@ pve_declared_flat:
   hookscript: "{{ ct.hookscript | default('', true) | string }}"
 
 # ---- canonical live form (same key order) ---------------------------------
-pve_actual_flat:
+pve_lxc_actual_flat:
   hostname: "{{ live.hostname | default('') | string }}"
   ostype: "{{ live.ostype | default('') | string }}"
   cores: "{{ live.cores | default('') | string }}"
@@ -58,65 +69,136 @@ pve_actual_flat:
   searchdomain: "{{ live.searchdomain | default('') | string }}"
   hookscript: "{{ live.hookscript | default('') | string }}"
 
-# ---- network interfaces and mount points are part of the state too --------
-# PVE rewrites these values beyond recognition: it reorders the properties, adds
-# its own (hwaddr, type=veth) and resolves a mount's volume shorthand into a real
-# volume id. Both sides therefore go through pve_canon_attachments
-# (playbooks/filter_plugins/pve.py), which reduces them to a comparable form.
-pve_declared_attachments: >-
+# ---- interfaces and mount points: PVE rewrites these beyond recognition -----
+pve_lxc_declared_attachments: >-
   {{ (ct.netif | default({}, true)) | combine(ct.mounts | default({}, true)) | pve_canon_attachments }}
 
-pve_live_attachments: "{{ live | pve_attachments | pve_canon_attachments }}"
+pve_lxc_live_attachments: "{{ live | pve_attachments | pve_canon_attachments }}"
 
-pve_declared_norm: "{{ pve_declared_flat | combine(pve_declared_attachments) }}"
-pve_actual_norm: "{{ pve_actual_flat | combine(pve_live_attachments) }}"
+pve_lxc_declared_norm: "{{ pve_lxc_declared_flat | combine(pve_lxc_declared_attachments) }}"
+pve_lxc_actual_norm: "{{ pve_lxc_actual_flat | combine(pve_lxc_live_attachments) }}"
 
-# ---- what differs ---------------------------------------------------------
-# symmetric_difference on dict2items cancels every key whose declared and live
-# items are identical; `unique` collapses the two entries a differing key leaves.
-pve_mismatched: >-
-  {{ ((pve_declared_norm | dict2items) | symmetric_difference(pve_actual_norm | dict2items))
-     | map(attribute='key') | unique | sort | list }}
-
-pve_declared_empty: >-
-  {{ pve_declared_norm | dict2items | selectattr('value', 'eq', '') | map(attribute='key') | list }}
-
-# Declared with a value and currently different -> write it. Keys that are not
-# declared at all (a netX someone added by hand) are not "set", only deleted.
-pve_to_set: >-
-  {{ pve_mismatched | intersect(pve_declared_norm.keys() | list)
-     | difference(pve_declared_empty) | sort | list }}
-
-# Declared as absent (or the network/attachments are declared empty) but still
-# present in the live config -> delete it. A netX/mpX the file does not declare
-# is not declared at all, so it is removed too.
-pve_to_delete: >-
-  {{ ((pve_mismatched | intersect(pve_declared_empty))
-      + (live.keys() | select('match', '^net[0-9]+$') | list | difference((ct.netif | default({}, true)).keys() | list))
-      + (live.keys() | select('match', '^mp[0-9]+$') | list | difference((ct.mounts | default({}, true)).keys() | list)))
-     | unique | sort | list }}
-
-pve_forbidden_present: "{{ pve_to_delete | intersect(live.keys() | list) | sort | list }}"
+# A netX/mpX present live but declared nowhere has to go.
+pve_lxc_undeclared_child_keys: >-
+  {{ (live.keys() | select('match', '^net[0-9]+$') | list | difference((ct.netif | default({}, true)).keys() | list))
+     + (live.keys() | select('match', '^mp[0-9]+$') | list | difference((ct.mounts | default({}, true)).keys() | list)) }}
 
 # ---- creation-time properties PVE cannot change in place ------------------
 # Split rather than regex: a regex backreference inside a YAML folded block is
 # not unescaped the way it is in a double-quoted scalar, so '\1' silently
 # becomes a literal and the size reads back as 0.
-pve_rootfs_size_live: >-
+pve_lxc_rootfs_size_live: >-
   {{ live.rootfs | default('') | split('size=') | last | split('G') | first | int }}
 
-pve_creation_time_drift: >-
+pve_lxc_creation_time_drift: >-
   {{ ([]
       + (['unprivileged'] if (live.unprivileged | default(-1) | int) != (1 if ct.unprivileged | bool else 0) else [])
       + (['ostype'] if (live.ostype | default('') | string) != (ct.ostype | string) else [])
       + (['rootfs storage'] if (ct.storage ~ ':') not in (live.rootfs | default('')) else [])
-      + (['rootfs size'] if pve_rootfs_size_live != (ct.rootfs_size | int) else []))
+      + (['rootfs size'] if pve_lxc_rootfs_size_live != (ct.rootfs_size | int) else []))
      | sort | list }}
+
+# ===========================================================================
+# QEMU VMs
+# ===========================================================================
+# proxmox_kvm refuses to update net/scsi/ide/sata/virtio/efidisk0/tpmstate0
+# (updating them can regenerate a MAC or recreate a disk), so for a VM those are
+# creation-time properties: drift in them is refused, never converged.
+
+# ---- canonical declared form ----------------------------------------------
+pve_vm_declared_flat:
+  name: "{{ ct.name | string }}"
+  cores: "{{ ct.cores | string }}"
+  sockets: "{{ ct.sockets | string }}"
+  memory: "{{ ct.memory | string }}"
+  cpu: "{{ ct.cpu | string }}"
+  ostype: "{{ ct.ostype | string }}"
+  bios: "{{ ct.bios | default('', true) | string }}"
+  machine: "{{ ct.machine | default('', true) | string }}"
+  scsihw: "{{ ct.scsihw | default('', true) | string }}"
+  vga: "{{ ct.vga | default('', true) | string }}"
+  onboot: "{{ (1 if ct.onboot | bool else 0) | string }}"
+  boot: "{{ ct.boot | default('', true) | string }}"
+  description: "{{ ct.description | default('', true) | trim }}"
+  tags: "{{ ct.tags | default([], true) | sort | join(';') }}"
+
+# ---- canonical live form (same key order) ---------------------------------
+pve_vm_actual_flat:
+  name: "{{ live.name | default('') | string }}"
+  cores: "{{ live.cores | default('') | string }}"
+  sockets: "{{ live.sockets | default('') | string }}"
+  memory: "{{ live.memory | default('') | string }}"
+  cpu: "{{ live.cpu | default('') | string }}"
+  ostype: "{{ live.ostype | default('') | string }}"
+  bios: "{{ live.bios | default('') | string }}"
+  machine: "{{ live.machine | default('') | string }}"
+  scsihw: "{{ live.scsihw | default('') | string }}"
+  vga: "{{ live.vga | default('') | string }}"
+  onboot: "{{ live.onboot | default('') | string }}"
+  boot: "{{ live.boot | default('') | string }}"
+  description: "{{ live.description | default('') | trim }}"
+  tags: "{{ live.tags | default('') | split(';') | sort | join(';') }}"
+
+# ---- disks, CD-ROM and interfaces -----------------------------------------
+pve_vm_declared_attachments: >-
+  {{ (ct.net | default({}, true)) | combine(ct.scsi | default({}, true)) | combine(ct.sata | default({}, true))
+     | combine(ct.ide | default({}, true)) | combine(ct.virtio | default({}, true)) | pve_canon_attachments }}
+
+pve_vm_live_attachments: "{{ live | pve_attachments | pve_canon_attachments }}"
+
+pve_vm_declared_norm: "{{ pve_vm_declared_flat | combine(pve_vm_declared_attachments) }}"
+pve_vm_actual_norm: "{{ pve_vm_actual_flat | combine(pve_vm_live_attachments) }}"
+
+pve_vm_undeclared_child_keys: >-
+  {{ (live.keys() | select('match', '^(net|scsi|sata|ide|virtio)[0-9]+$') | list)
+     | difference((ct.net | default({}, true)).keys() | list)
+     | difference((ct.scsi | default({}, true)).keys() | list)
+     | difference((ct.sata | default({}, true)).keys() | list)
+     | difference((ct.ide | default({}, true)).keys() | list)
+     | difference((ct.virtio | default({}, true)).keys() | list) }}
+
+pve_vm_creation_time_drift: >-
+  {{ ([]
+      + (['bios'] if (live.bios | default('') | string) != (ct.bios | default('', true) | string) else [])
+      + (['machine'] if (live.machine | default('') | string) != (ct.machine | default('', true) | string) else [])
+      + (['scsihw'] if (live.scsihw | default('') | string) != (ct.scsihw | default('', true) | string) else [])
+      + (['ostype'] if (live.ostype | default('') | string) != (ct.ostype | string) else [])
+      + (pve_mismatched | intersect(
+           (pve_vm_declared_attachments.keys() | list) + (pve_vm_live_attachments.keys() | list))))
+     | unique | sort | list }}
+
+# ===========================================================================
+# Shared difference engine
+# ===========================================================================
+# The playbook feeds it by aliasing declared_norm, actual_norm,
+# pve_undeclared_child_keys and pve_creation_time_drift in the task's vars.
+
+# symmetric_difference on dict2items cancels every key whose declared and live
+# items are identical; `unique` collapses the two entries a differing key leaves.
+pve_mismatched: >-
+  {{ ((declared_norm | dict2items) | symmetric_difference(actual_norm | dict2items))
+     | map(attribute='key') | unique | sort | list }}
+
+pve_declared_empty: >-
+  {{ declared_norm | dict2items | selectattr('value', 'eq', '') | map(attribute='key') | list }}
+
+# Declared with a value and currently different -> write it. Keys that are not
+# declared at all (a netX someone added by hand) are not "set", only deleted.
+pve_to_set: >-
+  {{ pve_mismatched | intersect(declared_norm.keys() | list)
+     | difference(pve_declared_empty) | sort | list }}
+
+# Declared as absent, or present but declared nowhere -> delete it.
+pve_to_delete: >-
+  {{ ((pve_mismatched | intersect(pve_declared_empty)) + pve_undeclared_child_keys)
+     | unique | sort | list }}
+
+pve_forbidden_present: "{{ pve_to_delete | intersect(live.keys() | list) | sort | list }}"
 
 # ---- power state ----------------------------------------------------------
 # The module's power vocabulary is started/stopped, but the API reports the
-# running state as "running". Compare in the API's vocabulary or a started
-# container looks like permanent drift.
+# running state as "running". Compare in the API's vocabulary or a started guest
+# looks like permanent drift.
 pve_status_expected: "{{ 'running' if (ct.status | string) == 'started' else (ct.status | string) }}"
 pve_power_drift: "{{ (live_status | default('') | string) != pve_status_expected }}"
 
@@ -124,9 +206,9 @@ pve_power_drift: "{{ (live_status | default('') | string) != pve_status_expected
 # Built with dict2items/selectattr, not map('extract'): a key declared as absent
 # is not in the dict at all, and extract raises instead of returning undefined.
 pve_declared_subset: >-
-  {{ pve_declared_norm | dict2items | selectattr('key', 'in', pve_mismatched) | items2dict }}
+  {{ declared_norm | dict2items | selectattr('key', 'in', pve_mismatched) | items2dict }}
 pve_actual_subset: >-
-  {{ pve_actual_norm | dict2items | selectattr('key', 'in', pve_mismatched) | items2dict }}
+  {{ actual_norm | dict2items | selectattr('key', 'in', pve_mismatched) | items2dict }}
 
 # ---- one summary the playbooks can act on and report ----------------------
 pve_analysis:

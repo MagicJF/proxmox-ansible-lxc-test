@@ -131,6 +131,11 @@
         live: "{{ vm.config | default({}, true) }}"
         live_status: "{{ vm.status | default('', true) }}"
         analysis: "{{ pve_analysis }}"
+        # feed the shared difference engine with the container mapping
+        declared_norm: "{{ pve_lxc_declared_norm }}"
+        actual_norm: "{{ pve_lxc_actual_norm }}"
+        pve_undeclared_child_keys: "{{ pve_lxc_undeclared_child_keys }}"
+        pve_creation_time_drift: "{{ pve_lxc_creation_time_drift }}"
       loop: "{{ pve_cts }}"
       loop_control: *loop_ct
 
@@ -190,6 +195,115 @@
       loop: "{{ pve_cts }}"
       loop_control: *loop_ct
       when: pve_eval[ct.vmid | string].exists
+
+    # =======================================================================
+    # QEMU VMs (read-only)
+    # =======================================================================
+    - name: Build the effective spec of every declared VM
+      ansible.builtin.set_fact:
+        pve_vm_specs: "{{ (pve_vm_specs | default([])) + [pve_vm_defaults | combine(item)] }}"
+      loop: "{{ pve_vms }}"
+      loop_control:
+        label: "VMID {{ item.vmid }}"
+
+    - name: Read the ISO images available for VMs
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/storage/local/content?content=iso"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token_header }}"
+        validate_certs: true
+        ca_path: "{{ pve_api_ca_path }}"
+        status_code: 200
+        return_content: true
+      register: pve_isos
+      no_log: true
+
+    - name: Read every declared VM through the API
+      community.proxmox.proxmox_vm_info:
+        <<: *pve_auth
+        vmid: "{{ ct.vmid }}"
+        type: qemu
+        config: current
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *loop_ct
+      register: live_vms
+      no_log: true
+
+    - name: Analyse every declared VM against its live state
+      ansible.builtin.set_fact:
+        pve_vm_eval: "{{ pve_vm_eval | default({}) | combine({ (ct.vmid | string): analysis }) }}"
+      vars:
+        ga: "{{ live_vms.results[idx].proxmox_vms | first | default({}, true) }}"
+        live: "{{ ga.config | default({}, true) }}"
+        live_status: "{{ ga.status | default('', true) }}"
+        analysis: "{{ pve_analysis }}"
+        declared_norm: "{{ pve_vm_declared_norm }}"
+        actual_norm: "{{ pve_vm_actual_norm }}"
+        pve_undeclared_child_keys: "{{ pve_vm_undeclared_child_keys }}"
+        pve_creation_time_drift: "{{ pve_vm_creation_time_drift }}"
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *loop_ct
+
+    - name: Assert every VM's declared ISO images exist on the node
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((ct.ide | default({}, true)).values() | map('join', ',')
+             | map('regex_findall', '[^:,]+:iso/[^,]+') | flatten | list)
+            | difference(pve_isos.json.data | map(attribute='volid') | list) | length == 0
+        fail_msg: >-
+          {{ ct.name }} (VMID {{ ct.vmid }}): a declared ISO is not present on this node:
+          {{ ((ct.ide | default({}, true)).values() | map('join', ',') | map('regex_findall', '[^:,]+:iso/[^,]+')
+              | flatten | list) | difference(pve_isos.json.data | map(attribute='volid') | list) | join(', ') }}.
+          Nothing was changed.
+        success_msg: "{{ ct.name }} (VMID {{ ct.vmid }}): every declared ISO is present on the node."
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *loop_ct
+
+    - name: Report the declared-versus-live state of every VM
+      ansible.builtin.debug:
+        msg: >-
+          {{ ct.name }} (VMID {{ ct.vmid }}) [{{ 'IN SYNC' if a.in_sync else 'DRIFT' }}]
+          | declared={{ a.declared_subset | to_json }} live={{ a.actual_subset | to_json }}
+          | live settings to delete={{ a.to_delete | join(', ') or '-' }}
+          | power {{ a.status or '(none)' }} -> {{ a.status_expected }}
+          | creation-time drift={{ a.creation_time_drift | join(', ') or '-' }}
+      vars:
+        a: "{{ pve_vm_eval[ct.vmid | string] }}"
+      changed_when: false
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *loop_ct
+      when: a.exists
+
+    - name: Report the VMs that do not exist yet
+      ansible.builtin.debug:
+        msg: >-
+          {{ ct.name }} (VMID {{ ct.vmid }}) does not exist yet; apply.yml will create it with
+          {{ ct.cores }} vCPU x {{ ct.sockets }} socket, {{ ct.memory }} MiB RAM, {{ ct.bios }}/{{ ct.machine }},
+          reporting {{ ct.status }}, boot {{ ct.boot }},
+          interfaces {{ (ct.net | default({}, true)).keys() | join(', ') or '(none)' }},
+          disks {{ (ct.scsi | default({}, true)).keys() | join(', ') or '(none)' }},
+          CD-ROM {{ (ct.ide | default({}, true)).keys() | join(', ') or '(none)' }}.
+      changed_when: false
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *loop_ct
+      when: not pve_vm_eval[ct.vmid | string].exists
+
+    - name: Fail when a declared VM needs a property proxmox_kvm cannot change
+      ansible.builtin.assert:
+        that:
+          - pve_vm_eval[ct.vmid | string].creation_time_drift | length == 0
+        fail_msg: >-
+          Blocking drift on {{ ct.name }} (VMID {{ ct.vmid }}):
+          {{ pve_vm_eval[ct.vmid | string].creation_time_drift | join(', ') }} differs and
+          proxmox_kvm refuses to update net/scsi/ide/sata/virtio (it can regenerate a MAC or
+          recreate a disk) while bios/machine/scsihw/ostype are creation-time. apply.yml would
+          refuse it. Recreate the VM deliberately or revert the value.
+        success_msg: "{{ ct.name }} (VMID {{ ct.vmid }}): creation-time properties match."
+      loop: "{{ pve_vm_specs }}"
+      loop_control: *loop_ct
+      when: pve_vm_eval[ct.vmid | string].exists
 
     - name: Mark the end of this run in the API journal
       ansible.builtin.lineinfile:
