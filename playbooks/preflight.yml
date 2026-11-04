@@ -46,6 +46,11 @@
           containers: "{{ pve_containers | map(attribute='vmid') | list }}"
       changed_when: false
 
+    - name: Remember the journal size so this run can prove it was traced
+      ansible.builtin.stat:
+        path: "{{ pve_journal }}"
+      register: pve_journal_start
+
   tasks:
     - name: Build the effective spec of every declared container
       ansible.builtin.set_fact:
@@ -134,7 +139,7 @@
           {{ ct.hostname }} (VMID {{ ct.vmid }}) [{{ 'IN SYNC' if a.in_sync else 'DRIFT' }}]
           | declared={{ a.declared_subset | to_json }} live={{ a.actual_subset | to_json }}
           | live settings to delete={{ a.to_delete | join(', ') or '-' }}
-          | power {{ a.status }} -> {{ ct.status }}
+          | power {{ a.status or '(none)' }} -> {{ a.status_expected }}
           | creation-time drift={{ a.creation_time_drift | join(', ') or '-' }}
       vars:
         a: "{{ pve_eval[ct.vmid | string] }}"
@@ -149,7 +154,8 @@
           {{ ct.hostname }} (VMID {{ ct.vmid }}) does not exist yet; apply.yml will create it with
           {{ ct.cores }} vCPU, {{ ct.memory }} MiB RAM, {{ ct.swap }} MiB swap, cpuunits {{ ct.cpuunits }},
           reporting {{ ct.status }}, rootfs {{ ct.rootfs_size }} GiB on {{ ct.storage }},
-          no network interface.
+          interfaces {{ (ct.netif | default({}, true)).keys() | join(', ') or '(none)' }},
+          mounts {{ (ct.mounts | default({}, true)).keys() | join(', ') or '(none)' }}.
       changed_when: false
       loop: "{{ pve_cts }}"
       loop_control: *loop_ct
@@ -181,3 +187,22 @@
           event: run_end
           playbook: "{{ ansible_play_name }}"
       changed_when: false
+
+    # Observability is only real if it is checked: a trace that quietly stopped
+    # working must fail the run, not produce empty logs.
+    - name: Fail loudly if this run left no API trace
+      ansible.builtin.stat:
+        path: "{{ pve_journal }}"
+      register: pve_journal_end
+
+    - name: Assert this run was traced to the journal
+      ansible.builtin.assert:
+        that:
+          - pve_journal_end.stat.size | int > pve_journal_start.stat.size | int
+        fail_msg: >-
+          {{ pve_journal }} did not grow during this run, so its PVE API traffic was NOT traced.
+          Check that playbooks/tracing/sitecustomize.py exists and that PYTHONPATH points at it
+          (play-level environment), then look for `tracer_error` lines in the journal.
+        success_msg: >-
+          API trace OK: the journal grew by
+          {{ (pve_journal_end.stat.size | int) - (pve_journal_start.stat.size | int) }} bytes.

@@ -9,6 +9,7 @@ inventory/group_vars/all.yml          # THE desired state — the only file that
 playbooks/preflight.yml               # read-only: platform checks + declared-vs-live report
 playbooks/apply.yml                   # converges every declared container, then verifies via the API
 playbooks/vars/state.yml              # engine: declared-vs-live translation and normalisation
+playbooks/filter_plugins/pve.py       # engine: canonicalises netX/mpX values PVE rewrites
 playbooks/tracing/sitecustomize.py    # engine: journals every PVE HTTP call
 logs/                                 # run logs and the API journal (gitignored, kept via .gitkeep)
 ```
@@ -106,8 +107,10 @@ Normalisation is the subtle part (`playbooks/vars/state.yml`), because PVE does 
 | --- | --- |
 | reorders `tags` (`probe;manual` → `manual;probe`) | compares tags as a sorted set |
 | appends a newline to `description` | compares trimmed |
-| reorders the properties inside a `netX`/`mpX` value | compares the sorted set of properties |
-| adds `hwaddr=…` and `type=veth` to a `netX` value | ignores both, or every run would PUT forever |
+| reorders the properties inside a `netX`/`mpX` value | canonicalised by `pve_canon_attachments` |
+| adds `hwaddr=…` and `type=veth` to a `netX` value | drops both, or every run would PUT forever |
+| resolves a mount's volume shorthand (`local:5` → `local:167/vm-167-disk-0.raw` + `size=5G`) | compares the storage, the size and the mount path instead |
+| reports a running container as `running`, while the module's power vocabulary is `started` | power compared in the API's vocabulary |
 | returns numbers where a template produced an int | forces `string` on both sides |
 
 Without that normalisation the engine reports phantom drift and stops being idempotent.
@@ -132,7 +135,9 @@ Every run writes two files under `logs/` (gitignored — it describes real infra
  "status": 200, "response_body": "{\"data\":null}", "seconds": 0.186, "pid": 2457156}
 ```
 
-`event` is `run_start` (timestamp, playbook, git revision, container list), `api_call`, or `run_end`, so a reviewer can group the calls of one run and tie them to a code revision.
+`event` is `run_start` (timestamp, playbook, git revision, container list), `tracer_armed` (written once per module process — the per-process proof the trace is alive), `api_call`, `tracer_error` (a failure inside the tracer, with the exception), or `run_end`, so a reviewer can group the calls of one run and tie them to a code revision.
+
+**The trace is checked, not trusted.** The tracer never fails silently: a write failure falls back to a module warning and an arming failure is recorded as `tracer_error`. On top of that, both playbooks compare the journal size at the start and end of the run and **fail the run** if it did not grow, so a trace that quietly stopped working cannot leave you with empty logs. `grep tracer_error logs/pve-api.jsonl` returning nothing is what "observability is working" looks like.
 
 How it is armed: the playbooks put `playbooks/tracing` on `PYTHONPATH` and set `PVE_HTTP_TRACE`. CPython imports `sitecustomize` from there at interpreter start-up, so the trace is active in every module process — the modules themselves are untouched. The wrapper sits on `requests.Session.request`, which is what proxmoxer uses.
 

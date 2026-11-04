@@ -59,6 +59,11 @@
           containers: "{{ pve_containers | map(attribute='vmid') | list }}"
       changed_when: false
 
+    - name: Remember the journal size so this run can prove it was traced
+      ansible.builtin.stat:
+        path: "{{ pve_journal }}"
+      register: pve_journal_start
+
   tasks:
     - name: Build the effective spec of every declared container
       ansible.builtin.set_fact:
@@ -142,6 +147,8 @@
         searchdomain: "{{ ct.searchdomain | default(omit, true) }}"
         hookscript: "{{ ct.hookscript | default(omit, true) }}"
         netif: "{{ ct.netif if (ct.netif | default({}, true)) else omit }}"
+        mounts: "{{ ct.mounts if (ct.mounts | default({}, true)) else omit }}"
+        mount_devices: "{{ ct.mount_devices if (ct.mount_devices | default([], true)) else omit }}"
         timeout: 120
         state: present
       loop: "{{ pve_cts }}"
@@ -205,7 +212,7 @@
         msg: >-
           {{ ct.hostname }} (VMID {{ ct.vmid }}): set {{ a.to_set | join(', ') or '-' }},
           delete {{ a.to_delete | join(', ') or '-' }},
-          power {{ a.status or '(none)' }} -> {{ ct.status }}
+          power {{ a.status or '(none)' }} -> {{ a.status_expected }}
       vars:
         a: "{{ pve_eval[ct.vmid | string] }}"
       changed_when: false
@@ -249,7 +256,7 @@
           apply: mismatched={{ b.declared_subset | to_json }} vs live={{ b.actual_subset | to_json }},
           still present but declared absent={{ b.forbidden_present | join(', ') or '-' }},
           creation-time drift={{ b.creation_time_drift | join(', ') or '-' }},
-          status {{ b.status }} vs declared {{ ct.status }}.
+          status {{ b.status }} vs declared {{ b.status_expected }}.
         success_msg: >-
           Verified {{ ct.hostname }} (VMID {{ ct.vmid }}): {{ ct.cores }} vCPU, {{ ct.memory }} MiB RAM,
           {{ ct.swap }} MiB swap, cpuunits {{ ct.cpuunits }}, {{ b.status }},
@@ -272,3 +279,22 @@
           playbook: "{{ ansible_play_name }}"
           verified: "{{ pve_cts | map(attribute='vmid') | list }}"
       changed_when: false
+
+    # Observability is only real if it is checked: a trace that quietly stopped
+    # working must fail the run, not produce empty logs.
+    - name: Fail loudly if this run left no API trace
+      ansible.builtin.stat:
+        path: "{{ pve_journal }}"
+      register: pve_journal_end
+
+    - name: Assert this run was traced to the journal
+      ansible.builtin.assert:
+        that:
+          - pve_journal_end.stat.size | int > pve_journal_start.stat.size | int
+        fail_msg: >-
+          {{ pve_journal }} did not grow during this run, so its PVE API traffic was NOT traced.
+          Check that playbooks/tracing/sitecustomize.py exists and that PYTHONPATH points at it
+          (play-level environment), then look for `tracer_error` lines in the journal.
+        success_msg: >-
+          API trace OK: the journal grew by
+          {{ (pve_journal_end.stat.size | int) - (pve_journal_start.stat.size | int) }} bytes.

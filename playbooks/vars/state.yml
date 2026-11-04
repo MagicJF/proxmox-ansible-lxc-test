@@ -59,33 +59,17 @@ pve_actual_flat:
   hookscript: "{{ live.hookscript | default('') | string }}"
 
 # ---- network interfaces and mount points are part of the state too --------
-# PVE rewrites the property order inside a netX/mpX value, so both sides are
-# canonicalised to the sorted set of properties (same treatment as tags).
-# PVE also ADDS its own properties to a netX value: `hwaddr` (generated per
-# container) and `type=veth` (its default). Both are dropped from both sides;
-# without that, every run would report phantom drift and PUT forever.
-pve_netif_canon: >-
-  {{ dict((ct.netif | default({}, true)).keys() | list
-          | zip((ct.netif | default({}, true)).values()
-                | map('split', ',') | map('reject', 'match', '^hwaddr=')
-                | map('reject', 'match', '^type=veth$')
-                | map('sort') | map('join', ',') | list)) }}
+# PVE rewrites these values beyond recognition: it reorders the properties, adds
+# its own (hwaddr, type=veth) and resolves a mount's volume shorthand into a real
+# volume id. Both sides therefore go through pve_canon_attachments
+# (playbooks/filter_plugins/pve.py), which reduces them to a comparable form.
+pve_declared_attachments: >-
+  {{ (ct.netif | default({}, true)) | combine(ct.mounts | default({}, true)) | pve_canon_attachments }}
 
-pve_mounts_canon: >-
-  {{ dict((ct.mounts | default({}, true)).keys() | list
-          | zip((ct.mounts | default({}, true)).values() | map('split', ',') | map('sort') | map('join', ',') | list)) }}
+pve_live_attachments: "{{ live | pve_attachments | pve_canon_attachments }}"
 
-pve_live_netmp_keys: "{{ live.keys() | select('match', '^(net|mp)[0-9]+$') | list }}"
-
-pve_live_netmp_canon: >-
-  {{ dict(pve_live_netmp_keys
-          | zip(pve_live_netmp_keys | map('extract', live)
-                | map('split', ',') | map('reject', 'match', '^hwaddr=')
-                | map('reject', 'match', '^type=veth$')
-                | map('sort') | map('join', ',') | list)) }}
-
-pve_declared_norm: "{{ pve_declared_flat | combine(pve_netif_canon) | combine(pve_mounts_canon) }}"
-pve_actual_norm: "{{ pve_actual_flat | combine(pve_live_netmp_canon) }}"
+pve_declared_norm: "{{ pve_declared_flat | combine(pve_declared_attachments) }}"
+pve_actual_norm: "{{ pve_actual_flat | combine(pve_live_attachments) }}"
 
 # ---- what differs ---------------------------------------------------------
 # symmetric_difference on dict2items cancels every key whose declared and live
@@ -130,7 +114,11 @@ pve_creation_time_drift: >-
      | sort | list }}
 
 # ---- power state ----------------------------------------------------------
-pve_power_drift: "{{ (live_status | default('') | string) != (ct.status | string) }}"
+# The module's power vocabulary is started/stopped, but the API reports the
+# running state as "running". Compare in the API's vocabulary or a started
+# container looks like permanent drift.
+pve_status_expected: "{{ 'running' if (ct.status | string) == 'started' else (ct.status | string) }}"
+pve_power_drift: "{{ (live_status | default('') | string) != pve_status_expected }}"
 
 # ---- the differing keys as two small dicts, for a readable report ----------
 # Built with dict2items/selectattr, not map('extract'): a key declared as absent
@@ -152,6 +140,7 @@ pve_analysis:
   forbidden_present: "{{ pve_forbidden_present }}"
   creation_time_drift: "{{ pve_creation_time_drift }}"
   power_drift: "{{ pve_power_drift }}"
+  status_expected: "{{ pve_status_expected }}"
   in_sync: >-
     {{ (pve_mismatched | length == 0)
        and (pve_creation_time_drift | length == 0)
