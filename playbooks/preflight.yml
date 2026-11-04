@@ -1,0 +1,87 @@
+---
+- name: Read-only preflight for the disposable LXC
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pve_api: "https://{{ lookup('env', 'PROXMOX_HOST') }}:8006/api2/json"
+    pve_token_header: "PVEAPIToken={{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+    pve_node: Proxmox
+    pve_template_storage: local
+    pve_rootfs_storage: local-zfs
+    pve_template: "local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst"
+    pve_vmid: 102
+    pve_hostname: test-from-ansible
+  tasks:
+    - name: Read Proxmox node status through the API
+      community.proxmox.proxmox_node_info:
+        api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_user: root@pam
+        ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+        validate_certs: true
+      register: pve_nodes
+      no_log: true
+
+    - name: Read the candidate VMID through the API
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_user: root@pam
+        ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+        validate_certs: true
+        vmid: "{{ pve_vmid }}"
+        type: lxc
+      register: pve_vmid_info
+      no_log: true
+
+    - name: Read the requested name through the API
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_user: root@pam
+        ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+        validate_certs: true
+        name: "{{ pve_hostname }}"
+        type: lxc
+      register: pve_name_info
+      no_log: true
+
+    - name: Read storage configuration through the API
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/storage"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token_header }}"
+        validate_certs: true
+        ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+        status_code: 200
+        return_content: true
+      register: pve_storages
+      no_log: true
+
+    - name: Read available container templates through the API
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/storage/{{ pve_template_storage }}/content?content=vztmpl"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token_header }}"
+        validate_certs: true
+        ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+        status_code: 200
+        return_content: true
+      register: pve_templates
+      no_log: true
+
+    - name: Assert the chosen node, VMID, name, storage, and template are usable
+      ansible.builtin.assert:
+        that:
+          - pve_nodes.proxmox_nodes | selectattr('node', 'equalto', pve_node) | selectattr('status', 'equalto', 'online') | list | length == 1
+          - pve_vmid_info.proxmox_vms | length == 0
+          - pve_name_info.proxmox_vms | length == 0
+          - pve_storages.json.data | selectattr('storage', 'equalto', pve_rootfs_storage) | selectattr('active', 'equalto', 1) | list | length == 1
+          - pve_templates.json.data | selectattr('volid', 'equalto', pve_template) | list | length == 1
+        fail_msg: "Preflight failed: a requested resource is absent or its selected PVE resource is unavailable. No changes were made."
+        success_msg: "Preflight passed: node is online, VMID/name are unused, local-zfs is active, and the Debian 13 template exists."
