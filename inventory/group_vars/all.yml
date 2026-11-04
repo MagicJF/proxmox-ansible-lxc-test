@@ -1,29 +1,39 @@
-# Desired state of the disposable test LXC.
+# Desired state of the containers this repository manages.
 #
 # This is the only file that changes when a change is requested: edit it, open a
 # branch, run preflight -> apply. The playbooks under playbooks/ are the fixed
 # engine and should not grow one file per request.
 #
-# Note: this is a group_vars FILE for the group "all", so variables sit at the top
-# level — they must NOT be nested under an "all:" key (that would just define one
-# variable named "all").
+# It is a group_vars FILE for the group "all", so variables belong at the top
+# level. Nesting them under an "all:" key would define one variable named "all"
+# and leave every real variable undefined.
 
-# Identity (fixed for the life of the container; PVE cannot change either, so a
-# change here means "recreate", not "converge").
 pve_node: Proxmox
-pve_vmid: 102
-pve_hostname: test-from-ansible
 
-# Resources (converged in place by playbooks/apply.yml).
-pve_cores: 2
-pve_memory: 2048
-pve_swap: 512
-pve_onboot: false
+# Creation-time defaults shared by every container. PVE cannot change any of these
+# on an existing container, so changing one here means "recreate", not "converge".
+pve_defaults:
+  storage: local-zfs
+  rootfs_size: 8
+  template: "local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst"
+  template_storage: local
+  unprivileged: true
+  onboot: false
+  swap: 512
 
-# Creation-time properties. PVE cannot change these on an existing container;
-# preflight reports them as blocking drift instead of pretending to converge.
-pve_unprivileged: true
-pve_storage: local-zfs
-pve_rootfs_size: 8
-pve_template: "local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst"
-pve_template_storage: local
+# Every container this repository manages — and nothing else. A container absent
+# from this list is never read, created or modified.
+#
+# vmid + hostname are identity (changing them means "recreate").
+# cores / memory / swap / onboot are converged in place by apply.yml and may be
+# set per container to override the defaults above.
+pve_containers:
+  - vmid: 102
+    hostname: test-from-ansible
+    cores: 2
+    memory: 2048
+
+  - vmid: 103
+    hostname: 3cores
+    cores: 3
+    memory: 2048

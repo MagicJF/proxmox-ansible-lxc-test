@@ -1,5 +1,5 @@
 ---
-- name: Read-only preflight against group_vars/all.yml (no mutation)
+- name: Read-only preflight of the containers declared in inventory/group_vars/all.yml
   hosts: localhost
   gather_facts: false
   vars:
@@ -14,22 +14,34 @@
     pve_api: "https://{{ lookup('env', 'PROXMOX_HOST') }}:8006/api2/json"
     pve_token_header: "PVEAPIToken={{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
   tasks:
+    - name: Build the effective spec of every declared container
+      ansible.builtin.set_fact:
+        pve_cts: "{{ (pve_cts | default([])) + [pve_defaults | combine(item)] }}"
+      loop: "{{ pve_containers }}"
+      loop_control:
+        label: "VMID {{ item.vmid }}"
+
     - name: Read the node status through the API
       community.proxmox.proxmox_node_info:
         <<: *pve_auth
       register: pve_nodes
       no_log: true
 
-    - name: Read the declared container through the API
+    - name: Read every declared container through the API
       community.proxmox.proxmox_vm_info:
         <<: *pve_auth
-        vmid: "{{ pve_vmid }}"
+        vmid: "{{ ct.vmid }}"
         type: lxc
         config: current
-      register: live_lxc
+      loop: "{{ pve_cts }}"
+      loop_control: &loop_ct
+        loop_var: ct
+        index_var: idx
+        label: "VMID {{ ct.vmid }}"
+      register: live_cts
       no_log: true
 
-    - name: Read the storage list through the API
+    - name: Read the node storage list through the API
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ pve_node }}/storage"
         method: GET
@@ -42,9 +54,9 @@
       register: pve_storages
       no_log: true
 
-    - name: Read the available container templates through the API
+    - name: Read the available container templates per template storage
       ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ pve_node }}/storage/{{ pve_template_storage }}/content?content=vztmpl"
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/storage/{{ ct.template_storage }}/content?content=vztmpl"
         method: GET
         headers:
           Authorization: "{{ pve_token_header }}"
@@ -52,64 +64,72 @@
         ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
         status_code: 200
         return_content: true
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
       register: pve_templates
       no_log: true
 
-    - name: Record whether the container already exists
-      ansible.builtin.set_fact:
-        pve_exists: "{{ live_lxc.proxmox_vms | length == 1 }}"
-
-    - name: Assert the platform prerequisites are usable
+    - name: Assert every container's platform prerequisites are usable
       ansible.builtin.assert:
         that:
           - pve_nodes.proxmox_nodes | selectattr('node', 'equalto', pve_node) | selectattr('status', 'equalto', 'online') | list | length == 1
-          - pve_storages.json.data | selectattr('storage', 'equalto', pve_storage) | selectattr('active', 'equalto', 1) | list | length == 1
-          - pve_templates.json.data | selectattr('volid', 'equalto', pve_template) | list | length == 1
-        fail_msg: "Preflight failed: the declared node is offline, the rootfs storage is inactive, or the declared template is missing. No changes were made."
-        success_msg: "Preflight: node {{ pve_node }} online, {{ pve_storage }} active, template {{ pve_template }} present."
+          - pve_storages.json.data | selectattr('storage', 'equalto', ct.storage) | selectattr('active', 'equalto', 1) | list | length == 1
+          - pve_templates.results[idx].json.data | selectattr('volid', 'equalto', ct.template) | list | length == 1
+        fail_msg: >-
+          {{ ct.hostname }} (VMID {{ ct.vmid }}): the declared node is offline, storage
+          {{ ct.storage }} is inactive, or template {{ ct.template }} is missing. No changes were made.
+        success_msg: >-
+          {{ ct.hostname }} (VMID {{ ct.vmid }}): node {{ pve_node }} online,
+          {{ ct.storage }} active, template {{ ct.template }} present.
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
 
-    - name: Report the drift between the live container and the declared state
+    - name: Report the drift between every live container and the declared state
       ansible.builtin.debug:
         msg: >-
-          {{ item.name }}: live={{ item.live }} declared={{ item.declared }}
-          [{{ 'ok' if (item.live | string) == (item.declared | string) else 'DRIFT -> apply.yml converges it' }}]
+          {{ ct.hostname }} (VMID {{ ct.vmid }}):
+          cores {{ live.cores }}->{{ ct.cores }} |
+          memory {{ live.memory }}->{{ ct.memory }} |
+          swap {{ live.swap }}->{{ ct.swap }} |
+          onboot {{ live.onboot }}->{{ 1 if ct.onboot | bool else 0 }} |
+          hostname {{ live.hostname }}->{{ ct.hostname }}
+          [{{ 'in sync' if aligned else 'DRIFT -> apply.yml converges it' }}]
+      vars:
+        live: "{{ live_cts.results[idx].proxmox_vms[0].config }}"
+        aligned: >-
+          {{ (live.cores | string) == (ct.cores | string)
+             and (live.memory | string) == (ct.memory | string)
+             and (live.swap | string) == (ct.swap | string)
+             and (live.onboot | string) == ((1 if ct.onboot | bool else 0) | string)
+             and live.hostname == ct.hostname }}
       changed_when: false
-      loop:
-        - name: "cores   "
-          live: "{{ live_lxc.proxmox_vms[0].config.cores }}"
-          declared: "{{ pve_cores | int }}"
-        - name: "memory  "
-          live: "{{ live_lxc.proxmox_vms[0].config.memory }}"
-          declared: "{{ pve_memory | int }}"
-        - name: "swap    "
-          live: "{{ live_lxc.proxmox_vms[0].config.swap }}"
-          declared: "{{ pve_swap | int }}"
-        - name: "onboot  "
-          live: "{{ live_lxc.proxmox_vms[0].config.onboot }}"
-          declared: "{{ 1 if pve_onboot | bool else 0 }}"
-        - name: "hostname"
-          live: "{{ live_lxc.proxmox_vms[0].config.hostname }}"
-          declared: "{{ pve_hostname }}"
-      when: pve_exists
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
+      when: live_cts.results[idx].proxmox_vms | length == 1
 
-    - name: Fail when the declared state needs a property PVE cannot change in place
+    - name: Fail when a declared state needs a property PVE cannot change in place
       ansible.builtin.assert:
         that:
-          - live_lxc.proxmox_vms[0].config.unprivileged | int == (1 if pve_unprivileged | bool else 0)
-          - (pve_storage ~ ':') in live_lxc.proxmox_vms[0].config.rootfs
-          - live_lxc.proxmox_vms[0].config.rootfs | regex_replace('^.*size=([0-9]+)G$', '\\1') | int == pve_rootfs_size | int
+          - live_cts.results[idx].proxmox_vms[0].config.unprivileged | int == (1 if ct.unprivileged | bool else 0)
+          - (ct.storage ~ ':') in live_cts.results[idx].proxmox_vms[0].config.rootfs
+          - live_cts.results[idx].proxmox_vms[0].config.rootfs | regex_replace('^.*size=([0-9]+)G$', '\\1') | int == ct.rootfs_size | int
         fail_msg: >-
-          Blocking drift: group_vars/all.yml declares a creation-time property (unprivileged, rootfs
-          storage or rootfs size) that differs from the live container and cannot be converged in
-          place, so apply.yml would refuse it. Recreate the container deliberately or revert the value.
-        success_msg: "Preflight: creation-time properties match; any remaining drift is in-place changeable."
-      when: pve_exists
+          Blocking drift on {{ ct.hostname }} (VMID {{ ct.vmid }}): group_vars/all.yml declares a
+          creation-time property (unprivileged, rootfs storage or rootfs size) that differs from the
+          live container and cannot be converged in place, so apply.yml would refuse it. Recreate the
+          container deliberately or revert the value.
+        success_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): creation-time properties match; any remaining drift is in-place changeable."
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
+      when: live_cts.results[idx].proxmox_vms | length == 1
 
-    - name: Report that the container will be created
+    - name: Report the containers that will be created
       ansible.builtin.debug:
         msg: >-
-          VMID {{ pve_vmid }} ({{ pve_hostname }}) does not exist yet; apply.yml will create it with
-          {{ pve_cores | int }} vCPU, {{ pve_memory | int }} MiB RAM, {{ pve_swap | int }} MiB swap,
-          rootfs {{ pve_rootfs_size }} GiB on {{ pve_storage }}.
+          {{ ct.hostname }} (VMID {{ ct.vmid }}) does not exist yet; apply.yml will create it with
+          {{ ct.cores | int }} vCPU, {{ ct.memory | int }} MiB RAM, {{ ct.swap | int }} MiB swap,
+          rootfs {{ ct.rootfs_size }} GiB on {{ ct.storage }}.
       changed_when: false
-      when: not pve_exists
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
+      when: live_cts.results[idx].proxmox_vms | length == 0

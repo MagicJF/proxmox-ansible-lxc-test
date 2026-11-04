@@ -1,5 +1,5 @@
 ---
-- name: Converge the disposable test LXC to the state declared in group_vars/all.yml
+- name: Converge the containers declared in inventory/group_vars/all.yml
   hosts: localhost
   gather_facts: false
   vars:
@@ -22,97 +22,115 @@
       when: ansible_check_mode
 
   tasks:
-    - name: Read the live container through the API
+    - name: Build the effective spec of every declared container
+      ansible.builtin.set_fact:
+        pve_cts: "{{ (pve_cts | default([])) + [pve_defaults | combine(item)] }}"
+      loop: "{{ pve_containers }}"
+      loop_control:
+        label: "VMID {{ item.vmid }}"
+
+    - name: Read every declared container through the API
       community.proxmox.proxmox_vm_info:
         <<: *pve_auth
-        vmid: "{{ pve_vmid }}"
+        vmid: "{{ ct.vmid }}"
         type: lxc
         config: current
-      register: live_lxc
+      loop: "{{ pve_cts }}"
+      loop_control: &loop_ct
+        loop_var: ct
+        index_var: idx
+        label: "VMID {{ ct.vmid }}"
+      register: live_cts
       no_log: true
 
-    - name: Record whether the container already exists
-      ansible.builtin.set_fact:
-        pve_exists: "{{ live_lxc.proxmox_vms | length == 1 }}"
-
-    # Creation-time properties cannot be converged in place. Fail loudly instead of
-    # reporting a success the API never applied.
+    # Creation-time properties cannot be converged in place. Fail loudly for that
+    # container rather than reporting a success the API never applied.
     - name: Refuse to converge properties PVE cannot change on an existing container
       ansible.builtin.assert:
         that:
-          - live_lxc.proxmox_vms[0].config.unprivileged | int == (1 if pve_unprivileged | bool else 0)
-          - (pve_storage ~ ':') in live_lxc.proxmox_vms[0].config.rootfs
-          - live_lxc.proxmox_vms[0].config.rootfs | regex_replace('^.*size=([0-9]+)G$', '\\1') | int == pve_rootfs_size | int
+          - live_cts.results[idx].proxmox_vms[0].config.unprivileged | int == (1 if ct.unprivileged | bool else 0)
+          - (ct.storage ~ ':') in live_cts.results[idx].proxmox_vms[0].config.rootfs
+          - live_cts.results[idx].proxmox_vms[0].config.rootfs | regex_replace('^.*size=([0-9]+)G$', '\\1') | int == ct.rootfs_size | int
         fail_msg: >-
-          group_vars/all.yml declares a creation-time property (unprivileged, rootfs storage or rootfs
-          size) that differs from the live container. PVE cannot apply it in place, and growing the
-          rootfs is irreversible, so nothing was changed. Recreate the container deliberately
-          (state: absent, then apply) or revert that value.
-        success_msg: "Creation-time properties match the live container."
-      when: pve_exists
+          {{ ct.hostname }} (VMID {{ ct.vmid }}): group_vars/all.yml declares a creation-time property
+          (unprivileged, rootfs storage or rootfs size) that differs from the live container. PVE
+          cannot apply it in place and growing a rootfs is irreversible, so this container was left
+          untouched. Recreate it deliberately or revert the value.
+        success_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): creation-time properties match the live container."
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
+      when: live_cts.results[idx].proxmox_vms | length == 1
 
-    - name: Create the container at the declared state
+    - name: Create the containers that do not exist yet
       community.proxmox.proxmox:
         <<: *pve_auth
         node: "{{ pve_node }}"
-        vmid: "{{ pve_vmid }}"
-        hostname: "{{ pve_hostname }}"
-        ostemplate: "{{ pve_template }}"
-        storage: "{{ pve_storage }}"
-        disk: "{{ pve_storage }}:{{ pve_rootfs_size }}"
-        cores: "{{ pve_cores }}"
-        memory: "{{ pve_memory }}"
-        swap: "{{ pve_swap }}"
-        unprivileged: "{{ pve_unprivileged | bool }}"
-        onboot: "{{ pve_onboot | bool }}"
+        vmid: "{{ ct.vmid }}"
+        hostname: "{{ ct.hostname }}"
+        ostemplate: "{{ ct.template }}"
+        storage: "{{ ct.storage }}"
+        disk: "{{ ct.storage }}:{{ ct.rootfs_size }}"
+        cores: "{{ ct.cores }}"
+        memory: "{{ ct.memory }}"
+        swap: "{{ ct.swap }}"
+        unprivileged: "{{ ct.unprivileged | bool }}"
+        onboot: "{{ ct.onboot | bool }}"
         update: true
         state: present
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
       register: create_result
       no_log: true
-      when: not pve_exists
+      when: live_cts.results[idx].proxmox_vms | length == 0
 
     # Only in-place-changeable properties are sent here. The module PUTs every
-    # parameter it receives, so anything else would be written blindly.
-    - name: Converge the in-place resources of the existing container
+    # parameter it receives, so passing disk/ostemplate/unprivileged on an update
+    # would write them blindly.
+    - name: Converge the in-place resources of the containers that already exist
       community.proxmox.proxmox:
         <<: *pve_auth
         node: "{{ pve_node }}"
-        vmid: "{{ pve_vmid }}"
-        hostname: "{{ pve_hostname }}"
-        cores: "{{ pve_cores }}"
-        memory: "{{ pve_memory }}"
-        swap: "{{ pve_swap }}"
-        onboot: "{{ pve_onboot | bool }}"
+        vmid: "{{ ct.vmid }}"
+        hostname: "{{ ct.hostname }}"
+        cores: "{{ ct.cores }}"
+        memory: "{{ ct.memory }}"
+        swap: "{{ ct.swap }}"
+        onboot: "{{ ct.onboot | bool }}"
         update: true
         state: present
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
       register: converge_result
       no_log: true
-      when: pve_exists
+      when: live_cts.results[idx].proxmox_vms | length == 1
 
-    - name: Re-read the container through the API
+    - name: Re-read every declared container through the API
       community.proxmox.proxmox_vm_info:
         <<: *pve_auth
-        vmid: "{{ pve_vmid }}"
+        vmid: "{{ ct.vmid }}"
         type: lxc
         config: current
-      register: applied_lxc
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
+      register: applied_cts
       no_log: true
 
-    - name: Verify the applied state matches group_vars/all.yml
+    - name: Verify every container matches the declared state
       ansible.builtin.assert:
         that:
-          - applied_lxc.proxmox_vms | length == 1
-          - applied_lxc.proxmox_vms[0].vmid | int == pve_vmid
-          - applied_lxc.proxmox_vms[0].name == pve_hostname
-          - applied_lxc.proxmox_vms[0].status == 'stopped'
-          - applied_lxc.proxmox_vms[0].config.hostname == pve_hostname
-          - applied_lxc.proxmox_vms[0].config.cores | int == pve_cores | int
-          - applied_lxc.proxmox_vms[0].config.memory | int == pve_memory | int
-          - applied_lxc.proxmox_vms[0].config.swap | int == pve_swap | int
-          - applied_lxc.proxmox_vms[0].config.unprivileged | int == (1 if pve_unprivileged | bool else 0)
-          - (pve_storage ~ ':') in applied_lxc.proxmox_vms[0].config.rootfs
-        fail_msg: "The API did not return the state declared in group_vars/all.yml."
+          - applied_cts.results[idx].proxmox_vms | length == 1
+          - applied_cts.results[idx].proxmox_vms[0].vmid | int == ct.vmid | int
+          - applied_cts.results[idx].proxmox_vms[0].name == ct.hostname
+          - applied_cts.results[idx].proxmox_vms[0].status == 'stopped'
+          - applied_cts.results[idx].proxmox_vms[0].config.hostname == ct.hostname
+          - applied_cts.results[idx].proxmox_vms[0].config.cores | int == ct.cores | int
+          - applied_cts.results[idx].proxmox_vms[0].config.memory | int == ct.memory | int
+          - applied_cts.results[idx].proxmox_vms[0].config.swap | int == ct.swap | int
+          - applied_cts.results[idx].proxmox_vms[0].config.unprivileged | int == (1 if ct.unprivileged | bool else 0)
+          - (ct.storage ~ ':') in applied_cts.results[idx].proxmox_vms[0].config.rootfs
+        fail_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): the API did not return the declared state."
         success_msg: >-
-          Verified {{ pve_hostname }} (VMID {{ pve_vmid }}): {{ pve_cores | int }} vCPU,
-          {{ pve_memory | int }} MiB RAM, {{ pve_swap | int }} MiB swap, stopped,
-          rootfs on {{ pve_storage }}.
+          Verified {{ ct.hostname }} (VMID {{ ct.vmid }}): {{ ct.cores | int }} vCPU,
+          {{ ct.memory | int }} MiB RAM, {{ ct.swap | int }} MiB swap, stopped, rootfs on {{ ct.storage }}.
+      loop: "{{ pve_cts }}"
+      loop_control: *loop_ct
