@@ -5,16 +5,22 @@
   vars_files:
     - vars/state.yml
   vars:
+    # Credentials. When playbooks/vars/secrets.yml exists its hardcoded values
+    # win (load_vars in pre_tasks); otherwise these environment fallbacks apply.
+    pve_api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
+    pve_api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+    pve_api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+    pve_api_ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
     pve_auth: &pve_auth
-      api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
+      api_host: "{{ pve_api_host }}"
       api_port: 8006
       api_user: root@pam
-      api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
-      api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
-      ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+      api_token_id: "{{ pve_api_token_id }}"
+      api_token_secret: "{{ pve_api_token_secret }}"
+      ca_path: "{{ pve_api_ca_path }}"
       validate_certs: true
-    pve_api: "https://{{ lookup('env', 'PROXMOX_HOST') }}:8006/api2/json"
-    pve_token_header: "PVEAPIToken={{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+    pve_api: "https://{{ pve_api_host }}:8006/api2/json"
+    pve_token_header: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
     pve_log_dir: "{{ playbook_dir }}/../logs"
     pve_journal: "{{ playbook_dir }}/../logs/pve-api.jsonl"
   # Arming the tracer: PYTHONPATH makes CPython import playbooks/tracing/sitecustomize.py
@@ -23,6 +29,16 @@
     PYTHONPATH: "{{ playbook_dir }}/tracing"
     PVE_HTTP_TRACE: "{{ pve_log_dir }}/pve-api.jsonl"
   pre_tasks:
+    - name: Look for the local credentials file
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/vars/secrets.yml"
+      register: pve_secrets_file
+
+    - name: Load the hardcoded local credentials when present (gitignored)
+      ansible.builtin.include_vars:
+        file: vars/secrets.yml
+      when: pve_secrets_file.stat.exists
+
     - name: Read the repository revision for the run header
       ansible.builtin.command:
         cmd: git rev-parse --short HEAD
@@ -86,7 +102,7 @@
         headers:
           Authorization: "{{ pve_token_header }}"
         validate_certs: true
-        ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+        ca_path: "{{ pve_api_ca_path }}"
         status_code: 200
         return_content: true
       register: pve_storages
@@ -99,7 +115,7 @@
         headers:
           Authorization: "{{ pve_token_header }}"
         validate_certs: true
-        ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+        ca_path: "{{ pve_api_ca_path }}"
         status_code: 200
         return_content: true
       loop: "{{ pve_cts }}"

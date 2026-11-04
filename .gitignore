@@ -13,3 +13,8 @@ __pycache__/
 # because Ansible's log_path cannot create it.
 logs/*
 !logs/.gitkeep
+
+# Hardcoded local credentials (playbooks/vars/secrets.yml). The playbooks load it
+# when it exists, but it must never be committed: the PVE token is
+# root-equivalent and this repository is public.
+playbooks/vars/secrets.yml

@@ -26,9 +26,18 @@ The playbooks are a fixed engine with exactly two verbs, both looping over the c
 - A Proxmox API token, available only in the local environment or Ansible Vault; never commit it.
 - A trusted certificate/CA file for the PVE API. Set `PROXMOX_CA_PATH` to that local file and `PROXMOX_HOST` to a host/IP present in the certificate SAN.
 
-## Local environment
+## Credentials
 
-Export these variables before running Ansible:
+Two sources, in this order of precedence:
+
+1. **`playbooks/vars/secrets.yml`** — hardcoded values. Both playbooks load it in `pre_tasks` when the file exists, so no environment set-up is needed at all. **It is gitignored on purpose**: this repository is public and the PVE token is root-equivalent with no expiry. The file is created mode `0600`. Do not commit it, and do not copy its contents into any tracked file, issue or commit message.
+2. **`PROXMOX_*` environment variables** — the fallback, used when the file is absent. This is the path to prefer once the temporary hardcoding is removed.
+
+To go back to environment-only credentials, delete `playbooks/vars/secrets.yml`; nothing else needs changing.
+
+Never commit these values. If the token ever reaches a tracked file or the remote, rotate it immediately (the engine reads whatever is in `secrets.yml`, so rotating is a one-line edit).
+
+### Environment variables (fallback path)
 
 ```text
 PROXMOX_HOST=<PVE API hostname or SAN-matching IP>
@@ -37,7 +46,7 @@ PROXMOX_TOKEN_SECRET=<token secret>
 PROXMOX_CA_PATH=<path to trusted PVE certificate/CA>
 ```
 
-For this lab, the certificate includes the PVE public IP as a SAN; the LAN address `10.10.10.1` is not in that certificate, so use a SAN-matching name/IP or replace the certificate with one covering the LAN name. Keep the environment file outside the repository and mode `0600`.
+For this lab, the certificate includes the PVE public IP as a SAN; the LAN address `10.10.10.1` is not in that certificate, so use a SAN-matching name/IP or replace the certificate with one covering the LAN name.
 
 ## Run
 
