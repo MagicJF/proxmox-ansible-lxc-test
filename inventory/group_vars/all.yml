@@ -151,7 +151,10 @@ pve_vms:
     # Boots the Proxmox VE installer from the ISO already on the node.
     status: started
     net:
-      net0: "virtio,bridge=vmbr0"
+      # vmbr1 is the internal LAN (10.10.10.0/24) where every other lab guest
+      # lives. vmbr0 is the PUBLIC bridge (54.36.168.83/24 on eno3): do not put
+      # a lab guest there unless you mean to expose it to the internet.
+      net0: "virtio,bridge=vmbr1"
     scsi:
       scsi0: "local-zfs:32"
     ide:

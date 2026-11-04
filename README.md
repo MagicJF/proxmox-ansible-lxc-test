@@ -110,7 +110,9 @@ Converged in place for VMs: `cores`, `sockets`, `memory`, `cpu`, `vga`, `boot`, 
 
 | VM | vmid | shape | role |
 | --- | --- | --- | --- |
-| `pve-nested` | 120 | 4 vCPU x 1 socket, 4096 MiB, 32 GiB disk on `local-zfs`, `q35`/SeaBIOS, one virtio NIC on `vmbr0`, CD-ROM on `proxmox-ve_9.2-1.iso` | a nested Proxmox VE |
+| `pve-nested` | 120 | 4 vCPU x 1 socket, 4096 MiB, 32 GiB disk on `local-zfs`, `q35`/SeaBIOS, one virtio NIC on `vmbr1`, CD-ROM on `proxmox-ve_9.2-1.iso` | a nested Proxmox VE |
+
+Note the bridge: `vmbr1` is the internal LAN (`10.10.10.0/24`) shared with every other lab guest, while `vmbr0` is the **public** bridge (`54.36.168.83/24` on `eno3`). Attaching a lab guest to `vmbr0` exposes it to the internet.
 
 `preflight.yml` additionally asserts that every ISO a VM declares is actually present on the node before anything is created.
 
