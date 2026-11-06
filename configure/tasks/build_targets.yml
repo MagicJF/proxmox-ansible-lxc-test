@@ -1,0 +1,108 @@
+# ---------------------------------------------------------------------------
+# Shared by configure/site.yml and configure/audit.yml: turn the declared state
+# into an inventory of SSH targets, so the address and the guest identity are
+# declared exactly once (in inventory/group_vars/all.yml) and never duplicated
+# in a second file.
+#
+# Runs as a task file inside a play on localhost.
+# ---------------------------------------------------------------------------
+
+- name: Look for the local secrets file
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/../playbooks/vars/secrets.yml"
+  register: l2_secrets
+
+- name: Load the local secrets when present (gitignored)
+  ansible.builtin.include_vars:
+    file: ../playbooks/vars/secrets.yml
+  when: l2_secrets.stat.exists
+
+- name: Assert the automation private key exists
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.fileglob', pve_ssh_key_path) | length > 0
+    fail_msg: >-
+      No automation key at {{ pve_ssh_key_path }}. Create one with
+      `ssh-keygen -t ed25519 -f {{ pve_ssh_key_path }} -N "" -C hermes-ansible-automation`,
+      then have layer 1 inject it at birth (pubkey in pve_defaults) or grant it once
+      by hand, and point pve_ssh_key_path at it in playbooks/vars/secrets.yml.
+    success_msg: "Automation key found at {{ pve_ssh_key_path }}."
+
+# Targets come from two places, and each guest is declared in exactly one:
+#   pve_config_targets  guests whose PVE shape layer 1 does NOT manage (partial
+#                       adoption, stated explicitly)
+#   pve_containers      guests layer 1 creates; any of them may carry a `config:`
+#                       block, in which case layer 2 owns the inside
+- name: Assemble the configuration targets from the declared state
+  ansible.builtin.set_fact:
+    l2_targets: "{{ (l2_targets | default([])) + [entry] }}"
+  vars:
+    src: "{{ item }}"
+    # The SSH address is derived from the interface declaration (pve_declared_ipv4)
+    # so there is no second copy of it to drift.
+    derived: "{{ (src.netif | default({}, true)) | pve_declared_ipv4 }}"
+    entry:
+      vmid: "{{ src.vmid }}"
+      hostname: "{{ src.hostname }}"
+      address: "{{ derived if derived is not none else (src.address | default('')) }}"
+      manage: "{{ src.manage | default(false) | bool }}"
+      config: "{{ src.config | default({}) }}"
+  loop: "{{ (pve_config_targets | default([])) + (pve_containers | selectattr('config', 'defined') | list) }}"
+  loop_control:
+    label: "{{ item.hostname }} (VMID {{ item.vmid }})"
+
+- name: Assert every target declares a reachable address
+  ansible.builtin.assert:
+    that:
+      - item.address | length > 0
+    fail_msg: >-
+      {{ item.hostname }} (VMID {{ item.vmid }}) declares no SSH address. Declare a
+      static IPv4 in its net0 (ip=10.10.10.x/24) so it can be derived, or set an
+      explicit `address:` on the entry. Layer 2 cannot reach a DHCP-only guest.
+    success_msg: "{{ item.hostname }} -> {{ item.address }}"
+  loop: "{{ l2_targets }}"
+  loop_control:
+    label: "{{ item.hostname }}"
+
+- name: Add every target to the inventory
+  ansible.builtin.add_host:
+    name: "{{ item.hostname }}"
+    groups: pve_config_targets
+    ansible_host: "{{ item.address }}"
+    ansible_user: "{{ pve_ssh_user }}"
+    ansible_ssh_private_key_file: "{{ pve_ssh_key_path }}"
+    ansible_ssh_common_args: >-
+      -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
+    pve_vmid: "{{ item.vmid }}"
+    l2_manage: "{{ item.manage }}"
+    # The key path is resolved once (secrets file or default) and handed to the
+    # guest play as a host var, so it is never re-declared per play.
+    l2_ssh_key_path: "{{ pve_ssh_key_path }}"
+    l2_config: "{{ item.config }}"
+  loop: "{{ l2_targets }}"
+  loop_control:
+    label: "{{ item.hostname }}"
+  # inventory bookkeeping, not infrastructure state: keep the changed count
+  # meaningful for the guests themselves.
+  changed_when: false
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.hostname }} (VMID {{ item.vmid }}) at {{ item.address }} as {{ pve_ssh_user }}
+      -> {{ 'CONVERGED (manage: true)' if item.manage else 'audit only (manage: false)' }}
+  loop: "{{ l2_targets }}"
+  loop_control:
+    label: "{{ item.hostname }}"
+
+- name: Build the external probe list (one entry per declared site)
+  ansible.builtin.set_fact:
+    l2_probes: >-
+      {{ (l2_probes | default([]))
+         + (item.config.caddy.sites | default([]) | map('combine', {'_target': item.address}) | list) }}
+  loop: "{{ l2_targets }}"
+  loop_control:
+    label: "{{ item.hostname }}"
+  # `manage` is templated into a string by set_fact, so selectattr('manage') would
+  # treat "False" as truthy. Always go through the bool filter.
+  when: item.manage | bool

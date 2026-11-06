@@ -158,6 +158,9 @@
         cpuunits: "{{ ct.cpuunits }}"
         unprivileged: "{{ ct.unprivileged | bool }}"
         onboot: "{{ ct.onboot | bool }}"
+        # Birth-time only: PVE injects this into /root/.ssh/authorized_keys at
+        # creation and the module never forwards it on update.
+        pubkey: "{{ ct.pubkey | default(omit, true) }}"
         cmode: "{{ ct.cmode | default(omit, true) }}"
         timezone: "{{ ct.timezone | default(omit, true) }}"
         description: "{{ ct.description | default(omit, true) }}"

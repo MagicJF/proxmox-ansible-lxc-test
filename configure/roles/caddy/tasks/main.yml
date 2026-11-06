@@ -1,0 +1,177 @@
+---
+# ===========================================================================
+# Layer 2, Caddy role. Converges the INSIDE of a guest: the package, the
+# Caddyfile rendered from the declared sites, the service and any declared
+# systemd timers. Idempotent, and it verifies what it declares instead of
+# trusting the exit status.
+# ===========================================================================
+
+- name: Ensure the packages the repository needs are present
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - gnupg
+      - debian-keyring
+      - debian-archive-keyring
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Fetch the Caddy repository signing key
+  ansible.builtin.get_url:
+    url: "{{ caddy_apt_key }}"
+    dest: "{{ caddy_keyring }}.asc"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Dearmor the signing key
+  # gpg exists after the prerequisites task. Guarded by creates, so a rerun is a
+  # no-op; rotate the key by deleting the keyring and running again.
+  ansible.builtin.shell:
+    cmd: "gpg --dearmor --yes -o {{ caddy_keyring }} < {{ caddy_keyring }}.asc"
+    creates: "{{ caddy_keyring }}"
+
+- name: Declare the Caddy apt repository
+  ansible.builtin.copy:
+    dest: "{{ caddy_sources }}"
+    content: |
+      Types: deb
+      URIs: {{ caddy_apt_uri }}
+      Suites: any-version
+      Components: main
+      Signed-By: {{ caddy_keyring }}
+    owner: root
+    group: root
+    mode: "0644"
+  register: caddy_sources_file
+
+- name: Refresh the apt cache when the repository was just added
+  ansible.builtin.apt:
+    update_cache: true
+  when: caddy_sources_file is changed
+
+- name: Install Caddy
+  ansible.builtin.apt:
+    name: caddy
+    state: present
+
+- name: Ensure the Caddy service is enabled and running
+  ansible.builtin.systemd_service:
+    name: "{{ caddy_service }}"
+    state: started
+    enabled: true
+
+- name: Ensure the declared document roots exist
+  ansible.builtin.file:
+    path: "{{ item.root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ caddy_sites | selectattr('root', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.address }} -> {{ item.root }}"
+
+- name: Deploy the declared index content for file-serving sites
+  ansible.builtin.copy:
+    dest: "{{ item.root }}/index.html"
+    content: "{{ item.index_html }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ caddy_sites | selectattr('index_html', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.address }} -> {{ item.root }}/index.html"
+
+- name: Deploy the Caddyfile from the declared sites
+  # `validate` runs `caddy validate` against the candidate file before it is put
+  # in place, so a broken declaration can never reach the running service.
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ caddy_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "caddy validate --adapter caddyfile --config %s"
+  notify: reload caddy
+
+# ---- declared periodic jobs, as systemd timers rather than crontabs -------
+- name: Declare the timer units
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}.timer"
+    content: |
+      [Unit]
+      Description={{ item.description | default('Declared by layer 2 (configure/)') }}
+
+      [Timer]
+      OnCalendar={{ item.on_calendar }}
+      Persistent=true
+      Unit={{ item.name }}.service
+
+      [Install]
+      WantedBy=timers.target
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ caddy_timers }}"
+  loop_control:
+    label: "{{ item.name }}"
+  notify: reload systemd
+
+- name: Declare the timer services
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}.service"
+    content: |
+      [Unit]
+      Description={{ item.description | default('Declared by layer 2 (configure/)') }}
+
+      [Service]
+      Type=oneshot
+      ExecStart={{ item.exec_start }}
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ caddy_timers }}"
+  loop_control:
+    label: "{{ item.name }}"
+  notify: reload systemd
+
+- name: Enable and start the declared timers
+  ansible.builtin.systemd_service:
+    name: "{{ item.name }}.timer"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: "{{ caddy_timers }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# ---- verification: inside the guest --------------------------------------
+- name: Verify the service is active
+  ansible.builtin.command: "systemctl is-active {{ caddy_service }}"
+  register: caddy_active
+  changed_when: false
+  failed_when: caddy_active.stdout | trim != 'active'
+
+- name: Verify the deployed Caddyfile parses
+  ansible.builtin.command: "caddy validate --config {{ caddy_config_path }}"
+  register: caddy_validate
+  changed_when: false
+  failed_when: caddy_validate.rc != 0
+
+- name: Verify every declared timer is active
+  ansible.builtin.command: "systemctl is-active {{ item.name }}.timer"
+  register: caddy_timer_state
+  changed_when: false
+  failed_when: caddy_timer_state.stdout | trim != 'active'
+  loop: "{{ caddy_timers }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Report the converged state
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: caddy {{ caddy_validate.stdout_lines[-1] | default('validated') }},
+      service active, {{ caddy_sites | length }} declared site(s),
+      {{ caddy_timers | length }} declared timer(s).

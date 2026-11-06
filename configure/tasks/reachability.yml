@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# Shared by configure/site.yml and configure/audit.yml.
+#
+# Reachability has two different meanings depending on the declaration:
+#   manage: true   the operator asked for convergence, so being unable to reach
+#                  the guest is a hard failure with the exact fix.
+#   manage: false  the guest is only audited, so being unable to reach it is a
+#                  warning and the host is skipped — a permanent red run for a
+#                  guest nobody asked to manage would train people to ignore it.
+# ---------------------------------------------------------------------------
+
+- name: Can we reach the guest over SSH?
+  ansible.builtin.ping:
+  register: l2_reach
+  # A failed connection is a *result* we handle below, not something that should
+  # drop the host out of the play (which, with serial, would also abort the
+  # guests queued behind it).
+  ignore_errors: true
+  ignore_unreachable: true
+
+- name: Record whether the guest answered at all
+  # `is failed` is FALSE for a host Ansible could not connect to (that result is
+  # `unreachable`, not `failed`), so test both explicitly or the branches below
+  # silently do nothing and the next task tries the connection again.
+  ansible.builtin.set_fact:
+    l2_reachable: >-
+      {{ not (l2_reach.unreachable | default(false)) and not (l2_reach.failed | default(false)) }}
+
+- name: Assemble the exact steps to grant the automation key
+  ansible.builtin.set_fact:
+    l2_grant_help: >-
+      No SSH access to {{ inventory_hostname }} ({{ ansible_host }}) as {{ ansible_user }}.
+
+      Nothing was changed. Either let layer 1 create the guest (it injects the key at
+      birth through `pubkey` in pve_defaults), or grant the key ONCE from the PVE
+      console (noVNC -> this guest -> Console) or with `pct exec {{ pve_vmid }}`:
+
+          mkdir -p /root/.ssh && chmod 700 /root/.ssh
+          printf '%s\n' '<PUBKEY>' >> /root/.ssh/authorized_keys
+          chmod 600 /root/.ssh/authorized_keys
+
+      <PUBKEY> is this line (public keys are not secret):
+
+          {{ lookup('ansible.builtin.file', l2_ssh_key_path ~ '.pub') | trim }}
+
+- name: A guest declared manage true must be reachable
+  ansible.builtin.fail:
+    msg: "{{ l2_grant_help }}"
+  when: not (l2_reachable | bool) and (l2_manage | bool)
+
+- name: A guest that is only audited may be unreachable
+  ansible.builtin.debug:
+    msg: >-
+      {{ l2_grant_help }}
+
+      Its declaration says manage false, so this is only a warning: this guest is
+      skipped and nothing was changed. Set manage true once the key is granted.
+  when: not (l2_reachable | bool) and not (l2_manage | bool)
+
+- name: Skip the rest of this play for the unreachable guest
+  ansible.builtin.meta: end_host
+  when: not (l2_reachable | bool)

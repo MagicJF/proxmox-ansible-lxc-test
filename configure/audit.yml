@@ -1,0 +1,64 @@
+---
+# ===========================================================================
+# Layer 2 — READ ONLY. Inspects what is inside every declared configuration
+# target and changes nothing at all.
+#
+# This exists because the first thing a configuration layer does is overwrite a
+# file, and overwriting a config you have not read is how you break a running
+# service. Run this before declaring manage: true on a guest that already exists.
+#
+# Run from the repository root:
+#     ansible-playbook configure/audit.yml
+# ===========================================================================
+- name: Layer 2 - build the target inventory from the declared state
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pve_ssh_user: root
+    pve_ssh_key_path: "/home/hermes/.hermes/profiles/hermione/secrets/pve-automation_ed25519"
+  tasks:
+    - name: Build the configuration targets
+      ansible.builtin.include_tasks: tasks/build_targets.yml
+
+- name: Layer 2 - inspect every target, changing nothing
+  hosts: pve_config_targets
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Reachability and access policy for this guest
+      ansible.builtin.include_tasks: tasks/reachability.yml
+
+    - name: Read-only inventory of the guest
+      ansible.builtin.shell:
+        cmd: |
+          set +e
+          echo "### os";             head -2 /etc/os-release
+          echo "### kernel";         uname -r
+          echo "### caddy in PATH";  command -v caddy || echo "(not installed)"
+          echo "### caddy version";  caddy version 2>&1 | head -1
+          echo "### package";        dpkg-query -W -f='${Package} ${Version} ${Status}\n' caddy 2>&1
+          echo "### unit";           systemctl is-enabled caddy 2>&1; systemctl is-active caddy 2>&1
+          echo "### unit path";      systemctl show -p FragmentPath caddy 2>/dev/null | cut -d= -f2
+          echo "### /etc/caddy";     ls -la /etc/caddy 2>&1
+          echo "### Caddyfile";      cat /etc/caddy/Caddyfile 2>&1
+          echo "### caddy timers";   systemctl list-timers --all --no-pager 2>/dev/null | grep -i caddy || echo "(none)"
+          echo "### /etc/cron.d";    ls /etc/cron.d 2>&1
+          echo "### root crontab";   crontab -l 2>&1 | head -20
+          echo "### listeners";      ss -lntp 2>/dev/null | tail -n +2
+          echo "### apt sources";    grep -rl caddy /etc/apt/sources.list.d/ 2>/dev/null || echo "(no caddy repo configured)"
+          echo "### disk";           df -h / | tail -1
+        executable: /bin/bash
+      register: l2_audit
+      changed_when: false
+
+    - name: Report what is inside the guest
+      ansible.builtin.debug:
+        msg: "{{ l2_audit.stdout_lines }}"
+
+    - name: State the boundary
+      ansible.builtin.debug:
+        msg: >-
+          Audit of {{ inventory_hostname }} finished: nothing was changed. The output
+          may contain secrets (a token inside a Caddyfile) — do not paste it into a
+          tracked file. Converging this guest is configure/site.yml, and only happens
+          when its declaration says manage true.

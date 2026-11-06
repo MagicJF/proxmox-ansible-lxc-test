@@ -108,9 +108,29 @@ def pve_canon_attachments(mapping):
     return canonical
 
 
+def pve_declared_ipv4(netif):
+    """Return the first static IPv4 declared in a container's netif mapping.
+
+    Layer 2 (configuration) needs a reachable address, and the address is already
+    declared inside net0 (`ip=10.10.10.21/24`). Deriving it here keeps one source
+    of truth instead of repeating the address in a second field. Returns None when
+    the interface is DHCP-only or absent.
+    """
+    if not isinstance(netif, dict):
+        raise AnsibleFilterError("pve_declared_ipv4 expects a dict")
+    for value in netif.values():
+        for part in str(value).split(","):
+            if part.strip().startswith("ip="):
+                address = part.split("=", 1)[1].strip()
+                if address and address != "dhcp":
+                    return address.split("/")[0]
+    return None
+
+
 class FilterModule(object):
     def filters(self):
         return {
             "pve_attachments": pve_attachments,
             "pve_canon_attachments": pve_canon_attachments,
+            "pve_declared_ipv4": pve_declared_ipv4,
         }

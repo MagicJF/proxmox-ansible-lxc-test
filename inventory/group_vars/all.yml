@@ -62,14 +62,18 @@ pve_defaults:
   mount_devices: []
 
   # ---- creation-time only: not forwarded on update, never automated -------
-  # pubkey: applied only when the container is created; declared absent.
+  # pubkey: the automation public key. PVE writes it into the container's
+  # /root/.ssh/authorized_keys AT CREATION, and it is not forwarded on update,
+  # so layer 1 can only set it at birth and cannot verify it afterwards. Layer 2
+  # (configure/) is what verifies it from the inside. That asymmetry is the
+  # clearest example of why there are two layers.
+  pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAP7yfAtQg77BdekmSLuPjAZCXRZTFZRBW1LZdv9DXK9 hermes-ansible-automation"
   # password: creation-time secret, which would have to live in Git — not
   #           declared; inject it from a vault at creation time if ever needed.
   # clone / clone_type: alternative creation path, unused here.
   # pool: no pool exists on this node.
   # force / purge / destroy_unreferenced_disks: destructive control flags, never
   #           automated by the engine.
-  pubkey: null
 
 # The containers this repository manages — and nothing else. A container absent
 # from this list is never read, created or modified.
@@ -107,6 +111,50 @@ pve_containers:
       net0: "name=eth0,bridge=vmbr0,ip=dhcp"
     mounts:
       mp0: "local:5,mp=/mnt/data"
+
+  # Layer 2 demonstration target: the same shape the community-scripts Caddy
+  # script would give you (1 vCPU / 512 MiB / 6 GiB), but created by layer 1 with
+  # the automation key injected at birth — so layer 2 (configure/) has real SSH
+  # access with no manual step anywhere.
+  - vmid: 121
+    hostname: caddy-lab
+    cores: 1
+    memory: 512
+    rootfs_size: 6
+    swap: 512
+    status: started
+    tags: [caddy, lab]
+    description: "Caddy host: shape owned by layer 1, configuration owned by layer 2 (configure/)."
+    netif:
+      # The address lives here and only here: configure/ derives the SSH target
+      # from it with the pve_declared_ipv4 filter.
+      net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.21/24,ip6=auto"
+
+    # ---- layer 2 (configure/). Layer 1 ignores both keys. ------------------
+    # manage: true is the deliberate switch that lets layer 2 CONVERGE this guest
+    # instead of merely auditing it.
+    manage: true
+    config:
+      caddy:
+        sites:
+          # The declared body is what the external verification asserts: the
+          # proof is an HTTP response, not a task exit status.
+          - address: ":80"
+            respond: "hola desde la capa 2 - caddy-lab"
+            expect_body: "hola desde la capa 2 - caddy-lab"
+          - address: ":8080"
+            root: /srv/www
+            file_server: true
+            encode: [gzip, zstd]
+            index_html: "contenido declarado en group_vars para /srv/www"
+            expect_body: "contenido declarado en group_vars"
+
+        timers:
+          - name: caddy-validate
+            description: Parse /etc/caddy/Caddyfile daily and fail loudly if it does not
+            on_calendar: "daily"
+            exec_start: "/usr/bin/caddy validate --config /etc/caddy/Caddyfile"
+
 
 # ============================================================================
 # QEMU VMs — same declarative rules as the containers, with one important
@@ -159,3 +207,23 @@ pve_vms:
       scsi0: "local-zfs:32"
     ide:
       ide2: "local:iso/proxmox-ve_9.2-1.iso,media=cdrom"
+
+# ============================================================================
+# Layer 2 — configuration targets (guest-side, over SSH).
+#
+# Layer 1 NEVER reads this list. These guests are configured from the inside by
+# configure/*.yml while their PVE shape stays unmanaged by this repository:
+# partial adoption, stated explicitly rather than implied.
+#
+# `manage: false` means "read only": configure/audit.yml inspects the guest and
+# changes nothing. Converging it is a separate, deliberate step, and the flag is
+# the switch — a guest is never configured by accident.
+#
+# When you decide to adopt a guest fully, move its entry into pve_containers with
+# its shape declared faithfully; do not keep it in both lists.
+# ============================================================================
+pve_config_targets:
+  - vmid: 101
+    hostname: caddy
+    address: 10.10.10.2
+    manage: false

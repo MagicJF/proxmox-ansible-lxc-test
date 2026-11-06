@@ -9,8 +9,13 @@ inventory/group_vars/all.yml          # THE desired state — the only file that
 playbooks/preflight.yml               # read-only: platform checks + declared-vs-live report
 playbooks/apply.yml                   # converges every declared container, then verifies via the API
 playbooks/vars/state.yml              # engine: declared-vs-live translation and normalisation
-playbooks/filter_plugins/pve.py       # engine: canonicalises netX/mpX values PVE rewrites
 playbooks/tracing/sitecustomize.py    # engine: journals every PVE HTTP call
+filter_plugins/pve.py                 # engine: filters shared by both layers (wired in ansible.cfg)
+configure/audit.yml                   # layer 2: read-only inspection of a guest, changes nothing
+configure/site.yml                    # layer 2: converges the inside of managed guests over SSH
+configure/tasks/                      # layer 2: shared target building + access policy
+configure/roles/<app>/                # layer 2: one role per application
+filter_plugins/pve.py                 # engine: filters shared by both layers (via ansible.cfg)
 logs/                                 # run logs and the API journal (gitignored, kept via .gitkeep)
 ```
 
@@ -117,6 +122,58 @@ Note the bridge: `vmbr1` is the internal LAN (`10.10.10.0/24`) shared with every
 `preflight.yml` additionally asserts that every ISO a VM declares is actually present on the node before anything is created.
 
 The nested PVE installation is **not** automated: `preflight`/`apply` leave the VM booting the installer from the CD-ROM (declared `boot: order=ide2;scsi0`), and the installation is finished by hand from the noVNC console in the PVE UI. Nothing in this repository claims the guest is installed.
+
+## Layer 2 — configuring the INSIDE of a guest
+
+Layer 1 provisions a guest through the Proxmox API. That API cannot run anything inside a guest: `POST /nodes/{node}/lxc/{vmid}/exec` answers **501 Method not implemented**. So a Caddyfile, a systemd unit or a cron job is out of layer 1's reach by construction, and layer 2 exists for exactly that boundary: it reaches the guest over SSH and converges what runs inside it.
+
+The methodology, in one line per rule:
+
+- **One declared state, two layers.** `inventory/group_vars/all.yml` stays the single source of truth: layer 1 reads the guest's shape, layer 2 reads the guest's `config:` block. Addresses are never duplicated — layer 2 derives the SSH target from the interface declaration with the `pve_declared_ipv4` filter.
+- **Read before you write.** `configure/audit.yml` inspects a guest and changes nothing. Run it before declaring `manage: true` on a guest that already exists.
+- **Convergence is opt-in per guest.** A `config:` block plus `manage: true` means layer 2 owns the inside; `manage: false` (or absent) means audit only. A guest is never configured by accident.
+- **Each layer verifies what it declares.** Layer 1 re-reads through the API. Layer 2 validates inside the guest (`caddy validate`, `systemctl is-active`, the timers) *and* from outside (an HTTP request asserting the declared status and body).
+- **Access has a home.** Layer 1 injects the automation key **at birth** (`pubkey` in `pve_defaults` — PVE writes it into `/root/.ssh/authorized_keys` at creation and never forwards it on update). For a guest that already exists, the key is granted once from the PVE console and the run tells you the exact command, with the public key in the message.
+
+```bash
+ansible-playbook configure/audit.yml   # read-only: what is inside every target
+ansible-playbook configure/site.yml    # converge every guest declared manage: true
+```
+
+What the second verb does, per guest, is decided by the declaration:
+
+```yaml
+  - vmid: 121
+    hostname: caddy-lab
+    cores: 1
+    memory: 512
+    netif:
+      net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.21/24,ip6=auto"
+    manage: true                      # layer 2 may converge this guest
+    config:
+      caddy:
+        sites:
+          - address: ":80"
+            respond: "hola desde la capa 2 - caddy-lab"
+            expect_body: "hola desde la capa 2 - caddy-lab"
+          - address: ":8080"
+            root: /srv/www
+            file_server: true
+            index_html: "contenido declarado en group_vars"
+            expect_body: "contenido declarado"
+        timers:
+          - name: caddy-validate
+            on_calendar: "daily"
+            exec_start: "/usr/bin/caddy validate --config /etc/caddy/Caddyfile"
+```
+
+The role installs Caddy from the official apt repository (key + deb822 source, no `curl | bash`), renders the Caddyfile from those sites with `validate:` so a broken file can never reach the running service, writes declared index content, declares periodic jobs as **systemd timers** rather than crontabs, and then proves it: `caddy validate`, `systemctl is-active`, every declared timer active, and an HTTP probe from the control node asserting the declared status and body.
+
+Adding another application means another role under `configure/roles/` and another block under `config:` — not another repository, and not a `curl | bash` script nobody can diff.
+
+### Why not the community-scripts installers
+
+Scripts like `community-scripts.org`'s run on the **PVE host as root**, drive `pct create` and then `pct exec` into the guest, and their "update" path is `apt upgrade` plus a GitHub release fetch. They are imperatives with no declared state: nothing to diff, nothing to verify, and they need the host shell this repository deliberately avoids. If one is ever used, run it once by hand and let layer 2 take over the inside afterwards — never both at once, or they fight over the same files.
 
 ## How the engine behaves
 
