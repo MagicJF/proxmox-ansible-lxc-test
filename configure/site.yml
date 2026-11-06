@@ -31,13 +31,31 @@
     - name: Reachability and access policy for this guest
       ansible.builtin.include_tasks: tasks/reachability.yml
 
-    - name: Converge the declared configuration for this guest
+    # Each role is opt-in through ITS declared key: a guest that declares no
+    # `caddy` block must not get Caddy installed just because it is managed.
+    - name: Converge the declared Caddy instances
       ansible.builtin.include_role:
         name: caddy
       vars:
         caddy_sites: "{{ (l2_config.caddy | default({})).sites | default([]) }}"
         caddy_timers: "{{ (l2_config.caddy | default({})).timers | default([]) }}"
-      when: l2_manage | bool
+      when:
+        - l2_manage | bool
+        - l2_config.caddy is defined
+
+    - name: Converge the declared TiddlyWiki instances
+      ansible.builtin.include_role:
+        name: tiddlywiki
+      vars:
+        tw: "{{ l2_config.tiddlywiki | default({}) }}"
+        tiddlywiki_wiki_dir: "{{ tw.wiki_dir | default('/srv/tiddlywiki') }}"
+        tiddlywiki_port: "{{ tw.port | default(8080) }}"
+        tiddlywiki_version: "{{ tw.version | default('5.4.1') }}"
+        tiddlywiki_service_user: "{{ tw.service_user | default('tiddlywiki') }}"
+        tiddlywiki_listen_host: "{{ tw.listen_host | default('0.0.0.0') }}"
+      when:
+        - l2_manage | bool
+        - l2_config.tiddlywiki is defined
 
     - name: "Nothing to converge: the declaration is read-only for this guest"
       ansible.builtin.debug:
@@ -64,6 +82,11 @@
       loop: "{{ l2_probes | default([]) }}"
       loop_control:
         label: "{{ item._target }} {{ item.address }}"
+      # -1 means "could not even connect". After a converged run that is usually a
+      # service still coming up, so retry before calling it a failure.
+      retries: 6
+      delay: 5
+      until: (l2_probe.status | default(0) | int) == (item.expect_status | default(200) | int)
       failed_when: false
 
     - name: Report what came back

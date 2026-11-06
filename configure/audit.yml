@@ -46,6 +46,11 @@
           echo "### root crontab";   crontab -l 2>&1 | head -20
           echo "### listeners";      ss -lntp 2>/dev/null | tail -n +2
           echo "### apt sources";    grep -rl caddy /etc/apt/sources.list.d/ 2>/dev/null || echo "(no caddy repo configured)"
+          echo "### node";           command -v node >/dev/null && node --version || echo "(not installed)"
+          echo "### tiddlywiki";     command -v tiddlywiki >/dev/null && tiddlywiki --version || echo "(not installed)"
+          echo "### tw unit";        systemctl is-enabled tiddlywiki 2>&1; systemctl is-active tiddlywiki 2>&1
+          echo "### tw process";     pgrep -af tiddlywiki || echo "(not running)"
+          echo "### tw wiki dir";    ls -la /srv/tiddlywiki 2>&1 | head -8
           echo "### disk";           df -h / | tail -1
         executable: /bin/bash
       register: l2_audit

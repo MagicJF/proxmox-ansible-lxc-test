@@ -119,6 +119,44 @@ pve_containers:
     mounts:
       mp0: "local:5,mp=/mnt/data"
 
+  # TiddlyWiki service. Layer 1 owns the guest's shape; layer 2 owns the wiki,
+  # its dependencies and the unit that serves it on every boot.
+  - vmid: 131
+    hostname: wiki-tiddly
+    cores: 1
+    memory: 1024
+    rootfs_size: 6
+    swap: 512
+    status: started
+    tags: [wiki, lab]
+    description: "TiddlyWiki server: shape owned by layer 1, the wiki and its service owned by layer 2."
+    netif:
+      # Static on the LAN bridge: layer 2 derives the SSH target from here, and a
+      # DHCP-only guest cannot be reached (nor can its URL be declared once).
+      net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.31/24,ip6=auto"
+
+    # ---- layer 2 (configure/). Layer 1 ignores the `config` block. -----------
+    manage: true
+    config:
+      tiddlywiki:
+        wiki_dir: /srv/tiddlywiki
+        port: 8080
+        # Pinned on purpose: a rebuild must install the same wiki engine. This is
+        # the version published as `latest` on npm when the guest was declared.
+        version: "5.4.1"
+        service_user: tiddlywiki
+        # Where it binds. 0.0.0.0 makes it reachable from the LAN (the point of
+        # serving it) — a TiddlyWiki server edition is writable and
+        # unauthenticated, so this is an explicit exposure decision and the guest
+        # must stay on a network that is not public.
+        listen_host: "0.0.0.0"
+      # Proof from OUTSIDE the guest, asserted after convergence: the declaration
+      # says which status and body the URL must answer.
+      http:
+        - address: ":8080"
+          expect_status: 200
+          expect_body: "TiddlyWiki"
+
 # ============================================================================
 # QEMU VMs — same declarative rules as the containers, with one important
 # difference: proxmox_kvm refuses to update net/scsi/ide/sata/virtio (updating

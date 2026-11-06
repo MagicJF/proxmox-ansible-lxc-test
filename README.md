@@ -15,7 +15,7 @@ filter_plugins/pve.py                 # engine: canonicalisation filters used by
 configure/audit.yml                   # layer 2: read-only inspection of a guest, changes nothing
 configure/site.yml                    # layer 2: converges the inside of managed guests over SSH
 configure/tasks/                      # layer 2: shared target building + access policy
-configure/roles/<app>/                # layer 2: one role per application
+configure/roles/<app>/                # layer 2: one role per application (caddy, tiddlywiki)
 filter_plugins/pve.py                 # engine: filters shared by both layers (via ansible.cfg)
 logs/                                 # run logs and the API journal (gitignored, kept via .gitkeep)
 ```
@@ -175,6 +175,47 @@ What the second verb does, per guest, is decided by the declaration:
 The role installs Caddy from the official apt repository (key + deb822 source, no `curl | bash`), renders the Caddyfile from those sites with `validate:` so a broken file can never reach the running service, writes declared index content, declares periodic jobs as **systemd timers** rather than crontabs, and then proves it: `caddy validate`, `systemctl is-active`, every declared timer active, and an HTTP probe from the control node asserting the declared status and body.
 
 Adding another application means another role under `configure/roles/` and another block under `config:` — not another repository, and not a `curl | bash` script nobody can diff.
+
+### A worked example: a TiddlyWiki server
+
+`pve_containers` declares VMID 131 `wiki-tiddly` (1 vCPU / 1024 MiB / 6 GiB, static
+`10.10.10.31/24` on the LAN bridge, `manage: true`) with:
+
+```yaml
+    config:
+      tiddlywiki:
+        wiki_dir: /srv/tiddlywiki
+        port: 8080
+        version: "5.4.1"
+        service_user: tiddlywiki
+        listen_host: "0.0.0.0"
+      http:
+        - address: ":8080"
+          expect_status: 200
+          expect_body: "TiddlyWiki"
+```
+
+`apply` creates the guest (which is born SSH-reachable through `pubkey`), and
+`configure/site.yml` installs Node.js, installs the pinned engine, runs
+`tiddlywiki /srv/tiddlywiki --init server` once, declares
+`tiddlywiki.service` (`Restart=always`, `enabled`), and then proves it: the live
+process must be *this* wiki folder on *this* port, the guest must answer HTTP 200,
+`anonymous` and the control node must also get HTTP 200 with the declared body.
+A role is included only when the guest declares its config key, so a managed guest
+that declares no `caddy` block never gets Caddy.
+
+Two decisions worth knowing:
+
+- **The engine is installed from the official npm tarball, not through Debian's
+  `npm` package**, because `apt install npm` on Debian 13 pulls ~400 packages
+  (the GTK/X stack, through its module dependencies) for a wiki that needs
+  neither. The role asserts the tarball declares no runtime dependencies, so a
+  future release that grows some fails loudly instead of quietly needing a
+  package manager.
+- **The bind address is declared, not defaulted.** A TiddlyWiki server edition is
+  writable and unauthenticated, so `listen_host` is an explicit exposure decision
+  in the manifest and the guest is expected to sit behind a network that is not
+  public.
 
 ### Why not the community-scripts installers
 

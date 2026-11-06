@@ -1,0 +1,24 @@
+# Managed by layer 2 — configure/roles/tiddlywiki/templates/tiddlywiki.service.j2
+# The wiki is declared in inventory/group_vars/all.yml under
+# pve_containers[].config.tiddlywiki; editing this file on the guest is drift and
+# will be reverted on the next run of configure/site.yml.
+[Unit]
+Description=TiddlyWiki server ({{ tiddlywiki_wiki_dir }})
+Documentation=https://tiddlywiki.com/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ tiddlywiki_service_user }}
+Group={{ tiddlywiki_service_user }}
+WorkingDirectory={{ tiddlywiki_wiki_dir }}
+ExecStart={{ tiddlywiki_bin }} {{ tiddlywiki_wiki_dir }} --listen host={{ tiddlywiki_listen_host }} port={{ tiddlywiki_port }}
+# A crash must not leave the wiki silently down between reboots.
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

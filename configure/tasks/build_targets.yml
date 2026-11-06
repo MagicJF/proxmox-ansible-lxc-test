@@ -71,8 +71,14 @@
     ansible_host: "{{ item.address }}"
     ansible_user: "{{ pve_ssh_user }}"
     ansible_ssh_private_key_file: "{{ pve_ssh_key_path }}"
+    # accept-new is not enough in a lab where a guest is recreated at the same
+    # address: its host key changes and the stale entry in known_hosts makes every
+    # later run fail with "Host key verification failed". These guests are
+    # disposable and live on an internal bridge, so the host key is not the
+    # control here — the automation key is.
     ansible_ssh_common_args: >-
-      -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
+      -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o ConnectTimeout=10 -o LogLevel=ERROR
     pve_vmid: "{{ item.vmid }}"
     l2_manage: "{{ item.manage }}"
     # The key path is resolved once (secrets file or default) and handed to the
@@ -95,11 +101,15 @@
   loop_control:
     label: "{{ item.hostname }}"
 
-- name: Build the external probe list (one entry per declared site)
+# Two declared sources feed the external proof: a Caddy site's own address/body,
+# and an explicit `config.http` check list (any service: TiddlyWiki, an app behind
+# a proxy, anything that must answer a status and a body from the control node).
+- name: Build the external probe list (declared Caddy sites + HTTP checks)
   ansible.builtin.set_fact:
     l2_probes: >-
       {{ (l2_probes | default([]))
-         + (item.config.caddy.sites | default([]) | map('combine', {'_target': item.address}) | list) }}
+         + (item.config.caddy.sites | default([]) | map('combine', {'_target': item.address}) | list)
+         + (item.config.http | default([]) | map('combine', {'_target': item.address}) | list) }}
   loop: "{{ l2_targets }}"
   loop_control:
     label: "{{ item.hostname }}"
