@@ -35,6 +35,45 @@ pve_node: Proxmox
 # ============================================================================
 pve_ssh_pubkey_path: "/home/hermes/.hermes/profiles/hermione/secrets/pve-automation_ed25519.pub"
 
+# ============================================================================
+# The control node's PATH into the guest LAN — the precondition layer 2 runs on.
+#
+# The PVE API answers on the public address from anywhere, but the guests live on
+# an internal bridge (vmbr1) the control node is not attached to. Layer 2 is SSH,
+# so without a path every guest is "unreachable" for a reason that has nothing to
+# do with its key. The path is therefore declared here and converged like any
+# other resource:
+#
+#   ansible-playbook playbooks/connect.yml      # converge the path on its own
+#   ansible-playbook configure/site.yml         # brings it up AUTOMATICALLY when
+#                                               # no guest answers on :22
+#
+# Keys follow the same rule as the SSH automation key: the private half is a file
+# outside the repository (generated here if absent, never printed) and only the
+# PUBLIC half travels. Set `manage: false` to get layer 2's plain behaviour when
+# this node already routes to the guest LAN.
+# ============================================================================
+pve_tunnel:
+  manage: true
+  # Interface name on this node; also the unit name (wg-quick@<name>).
+  name: wg-lab
+  # The endpoint lives on the lab side. The API cannot configure the Proxmox
+  # host, so that half is bootstrapped once with
+  # playbooks/tools/wg_endpoint_setup.sh (connect.yml prints the exact command
+  # WITH this node's public key when there is no handshake).
+  endpoint: "54.36.168.83:51820"
+  # The endpoint's public key — public, safe to commit. It is what authenticates
+  # the lab side of the tunnel.
+  endpoint_public_key: "3+bBS+GqR4EtWUFst+2s49rneVguWquuRBGINt/tZXQ="
+  # This node's address inside the tunnel (own /24, never the guest LAN).
+  address: "10.99.99.2/24"
+  # Only the guest LAN is routed through the tunnel; everything else (the API on
+  # its public address) keeps using the normal path.
+  guest_network: "10.10.10.0/24"
+  # No extension, like an SSH key: the public half is this path plus `.pub`.
+  private_key_path: "/home/hermes/.hermes/profiles/hermione/secrets/wg-lab-client"
+  keepalive: 25
+
 pve_defaults:
   # ---- creation-time: PVE cannot change these on an existing container ------
   # Drift here is refused, not converged: the container would have to be

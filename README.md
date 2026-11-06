@@ -8,19 +8,21 @@ Declarative IaC for the LXC containers and QEMU VMs on Proxmox VE, driven entire
 inventory/group_vars/all.yml          # THE desired state — the only file that changes per request
 playbooks/preflight.yml               # read-only: platform checks + declared-vs-live report
 playbooks/apply.yml                   # converges every declared container, then verifies via the API
+playbooks/connect.yml                 # converges the control node's PATH into the guest LAN
 playbooks/pve_engine.j2               # engine: declared-vs-live analysis, as Jinja macros
 playbooks/tools/pve_read.py           # engine: reads every guest + platform facts in ONE process
+playbooks/tools/wg_endpoint_setup.sh   # layer 2 path: the endpoint bootstrap, run once on the PVE host
 playbooks/tracing/sitecustomize.py    # engine: journals every PVE HTTP call
 filter_plugins/pve.py                 # engine: canonicalisation filters used by the macros
 configure/audit.yml                   # layer 2: read-only inspection of a guest, changes nothing
 configure/site.yml                    # layer 2: converges the inside of managed guests over SSH
-configure/tasks/                      # layer 2: shared target building + access policy
-configure/roles/<app>/                # layer 2: one role per application (caddy, tiddlywiki)
+configure/tasks/                      # layer 2: shared target building, access policy + the path
+configure/roles/<app>/                # layer 2: one role per application (caddy, tiddlywiki, apache)
 filter_plugins/pve.py                 # engine: filters shared by both layers (via ansible.cfg)
 logs/                                 # run logs and the API journal (gitignored, kept via .gitkeep)
 ```
 
-The playbooks are a fixed engine with exactly two verbs, both looping over the container list. A change request is an edit to `inventory/group_vars/all.yml` on a new branch — not a new playbook. Adding a playbook per change would scatter the real state across files that overwrite each other.
+Layer 1 is a fixed engine with two verbs (`preflight`, `apply`), both looping over the container list. A change request is an edit to `inventory/group_vars/all.yml` on a new branch — not a new playbook. Adding a playbook per change would scatter the real state across files that overwrite each other. The third verb, `connect`, owns the one thing that is not a guest: the control node's network path to the guest LAN (see [The path layer 2 runs on](#the-path-layer-2-runs-on)).
 
 `group_vars/all.yml` is a group_vars *file*, so its variables sit at the top level; nesting them under an `all:` key just defines one variable named `all` and breaks every reference.
 
@@ -63,6 +65,7 @@ ansible-playbook --syntax-check playbooks/preflight.yml
 ansible-playbook --syntax-check playbooks/apply.yml
 ansible-playbook playbooks/preflight.yml   # read-only: checks + what would change
 ansible-playbook playbooks/apply.yml       # converge + verify
+ansible-playbook playbooks/connect.yml      # converge the path layer 2 needs (usually automatic)
 ```
 
 For interactive iteration, `apply` alone is the verb: it reads the declared state, applies
@@ -139,11 +142,30 @@ The methodology, in one line per rule:
 - **Convergence is opt-in per guest.** A `config:` block plus `manage: true` means layer 2 owns the inside; `manage: false` (or absent) means audit only. A guest is never configured by accident.
 - **Each layer verifies what it declares.** Layer 1 re-reads through the API. Layer 2 validates inside the guest (`caddy validate`, `systemctl is-active`, the timers) *and* from outside (an HTTP request asserting the declared status and body).
 - **Access has a home.** Layer 1 injects the automation key **at birth** (`pubkey` in `pve_defaults` — PVE writes it into `/root/.ssh/authorized_keys` at creation and never forwards it on update). For a guest that already exists, the key is granted once from the PVE console and the run tells you the exact command, with the public key in the message.
+- **So does the path.** A key authorises a connection that already arrived. If the control node is not attached to the guest LAN, every guest looks unreachable and no key helps, so the route is declared (`pve_tunnel`) and converged — automatically, from inside this verb, when no guest answers on :22.
 
 ```bash
 ansible-playbook configure/audit.yml   # read-only: what is inside every target
 ansible-playbook configure/site.yml    # converge every guest declared manage: true
 ```
+
+### The path layer 2 runs on
+
+The PVE API answers on the public address from anywhere; the guests sit on an internal bridge. A control node outside that bridge therefore reaches **no** guest at all — which looks like an authentication failure and is really a missing route. The framework anticipates it: `pve_tunnel` declares the path, and layer 2 converges it before it needs it.
+
+`pve_tunnel` describes it in the one declared-state file: interface name, `endpoint` (`host:port`), the endpoint's **public** key, this node's tunnel address, the guest prefix to route through it, and where the private key lives.
+
+```bash
+ansible-playbook playbooks/connect.yml   # converge the path on its own
+```
+
+`configure/site.yml` runs the same task file (`configure/tasks/tunnel.yml`) automatically when its probe finds no target answering on :22, so a normal run self-heals: detect the missing route → bring the interface up → wait for the handshake → prove the guest LAN answers → converge the guests. If the path is already there, nothing is touched.
+
+Keys follow the SSH convention: the private half is a file outside the repository (generated on the first run when absent, never printed), only the public half travels, and `connect.yml` prints it.
+
+One half cannot be automated from a control node, and the framework says so instead of pretending: the **endpoint** lives on the Proxmox host, which the API cannot configure (`exec` answers 501). `playbooks/tools/wg_endpoint_setup.sh` bootstraps it once and idempotently, keyed by the public key the framework prints, and returns the endpoint's public key for `pve_tunnel.endpoint_public_key`.
+
+`preflight.yml` reports the path — `up` or `DOWN`, and how many guests answer on :22 — without changing anything, so a layer-2 problem is visible before you run the configure verb.
 
 What the second verb does, per guest, is decided by the declaration:
 

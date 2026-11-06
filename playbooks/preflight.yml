@@ -161,3 +161,41 @@
           {{ pve_journal }} did not grow during this read, so the PVE API traffic was NOT traced.
           Check playbooks/tracing/sitecustomize.py and the play-level PYTHONPATH.
         success_msg: "API trace OK: the journal grew during this read."
+
+    # ---- the layer 2 PATH, reported here and never changed here ----------
+    # Layer 1 can be perfectly in sync while layer 2 has no route to a single
+    # guest; that is worth knowing BEFORE running the configure verb, and this
+    # verb stays read-only.
+    - name: Read whether the declared tunnel interface exists
+      ansible.builtin.command: "ip link show {{ pve_tunnel.name | default('wg-lab') }}"
+      register: pf_tunnel_link
+      changed_when: false
+      failed_when: false
+      when: pve_tunnel is defined
+
+    - name: Probe every layer-2 guest on :22
+      ansible.builtin.wait_for:
+        host: "{{ item }}"
+        port: 22
+        timeout: 3
+      loop: >-
+        {{ pve_containers | selectattr('config', 'defined')
+           | map(attribute='netif', default={}) | map('pve_declared_ipv4')
+           | reject('none') | list }}
+      register: pf_path
+      # ignore_errors so the per-item `failed` survives: wait_for reports
+      # `elapsed` on timeout as well, so it cannot be used as the success key.
+      ignore_errors: true
+
+    - name: Report the layer 2 path
+      ansible.builtin.debug:
+        msg: >-
+          Layer 2 path: tunnel {{ pve_tunnel.name | default('(none declared)') }}
+          {{ 'up' if (pf_tunnel_link.rc | default(1)) == 0 else 'DOWN' }}
+          | {{ pf_answered | length }}/{{ pf_path.results | length }} guest(s) answer on :22
+          {{ '-> configure/site.yml will converge the declared tunnel before it needs it'
+             if (pf_answered | length == 0 and (pve_tunnel.manage | default(false) | bool))
+             else '' }}
+      vars:
+        pf_answered: >-
+          {{ pf_path.results | rejectattr('failed') | map(attribute='item') | list }}
