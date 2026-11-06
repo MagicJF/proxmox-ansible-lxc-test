@@ -1,0 +1,213 @@
+---
+# ===========================================================================
+# Layer 2, Apache role. Converges the INSIDE of a guest: the package, the
+# listening ports, one vhost per declared site, the content it serves, and the
+# service that keeps it up across reboots.
+#
+# Two deliberate design points:
+#
+#   1. `ports.conf` is RENDERED FROM the declared sites instead of left as the
+#      package ships it. Exposure is a decision, and it belongs in the manifest:
+#      a declared site on port 8080 must produce `Listen 8080`, not depend on
+#      someone having edited a file inside the guest.
+#
+#   2. There is no `validate:` on the vhost template. A vhost file is a FRAGMENT,
+#      not a complete Apache configuration: validating it standalone fails on
+#      every module-provided directive (`Require`, and the modules loaded by
+#      apache2.conf), which would reject a correct file. The protection is an
+#      explicit `apache2ctl configtest` on the assembled configuration, run
+#      BEFORE the handlers, so a broken declaration aborts the run and the
+#      running service keeps serving the previous good configuration.
+#
+# It verifies the RUNNING service, not the package install: a vhost can be
+# deployed and the service still be down, and another web server could be
+# answering on a familiar port.
+# ===========================================================================
+
+- name: Every declared site must declare the port it listens on
+  # The role derives `apache_listen_ports` from these values, so a missing port
+  # would either raise an opaque Jinja error or silently produce no `Listen`
+  # line. Fail with the reason instead.
+  ansible.builtin.assert:
+    that:
+      - apache_sites | selectattr('port', 'undefined') | list | length == 0
+      - apache_sites | selectattr('name', 'undefined') | list | length == 0
+      - apache_sites | selectattr('root', 'undefined') | list | length == 0
+    fail_msg: >-
+      Every site in config.apache.sites needs name, port and root. Incomplete:
+      {{ (apache_sites | selectattr('port', 'undefined') | list
+          + apache_sites | selectattr('name', 'undefined') | list
+          + apache_sites | selectattr('root', 'undefined') | list) | to_json }}
+    success_msg: "All {{ apache_sites | length }} declared site(s) carry name, port and root."
+
+- name: Install the web server
+  ansible.builtin.apt:
+    name: "{{ apache_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Read the installed Apache version
+  ansible.builtin.command: "apache2 -v"
+  register: apache_version_out
+  changed_when: false
+
+- name: The installed Apache must be the one this role was written for
+  # A future major version can change the layout this role writes into
+  # (sites-available/sites-enabled, ports.conf). Assert loudly rather than
+  # deploying a vhost nothing will read.
+  ansible.builtin.assert:
+    that:
+      # No regex on purpose: a backslash inside a YAML scalar is a known trap
+      # here, and a plain substring is enough to pin the major version.
+      - "'Apache/2' in apache_version_out.stdout"
+    fail_msg: >-
+      Unexpected Apache: {{ apache_version_out.stdout | trim }}. This role writes into
+      {{ apache_sites_available_dir }} / {{ apache_sites_enabled_dir }} and
+      {{ apache_config_dir }}/ports.conf; review the layout before trusting it.
+    success_msg: "{{ apache_version_out.stdout | trim }}"
+
+- name: Ensure every declared document root exists
+  ansible.builtin.file:
+    path: "{{ item.root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ apache_sites }}"
+  loop_control:
+    label: "{{ item.name }} -> {{ item.root }}"
+
+- name: Deploy the declared index content
+  ansible.builtin.copy:
+    dest: "{{ item.root }}/index.html"
+    content: "{{ item.index_html }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ apache_sites | selectattr('index_html', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.name }} -> {{ item.root }}/index.html"
+
+- name: Declare the ports Apache listens on, from the declared sites
+  ansible.builtin.template:
+    src: ports.conf.j2
+    dest: "{{ apache_config_dir }}/ports.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload apache
+
+- name: Stop serving the site the package enables by default
+  # Idempotent through `removes`: skipped once the symlink is gone. Without this
+  # an undeclared vhost keeps answering on the declared port whenever our site
+  # does not match the request, which is drift the manifest cannot show.
+  ansible.builtin.command:
+    cmd: "a2dissite {{ apache_packaged_site }}"
+    removes: "{{ apache_sites_enabled_dir }}/{{ apache_packaged_site }}.conf"
+  notify: reload apache
+
+- name: Deploy the declared vhosts
+  ansible.builtin.template:
+    src: vhost.conf.j2
+    dest: "{{ apache_sites_available_dir }}/{{ item.name }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    apache_site: "{{ item }}"
+  loop: "{{ apache_sites }}"
+  loop_control:
+    label: "{{ item.name }} (*:{{ item.port }} -> {{ item.root }})"
+  notify: reload apache
+
+- name: Enable the declared vhosts
+  ansible.builtin.command:
+    cmd: "a2ensite {{ item.name }}"
+    creates: "{{ apache_sites_enabled_dir }}/{{ item.name }}.conf"
+  loop: "{{ apache_sites }}"
+  loop_control:
+    label: "{{ item.name }}"
+  notify: reload apache
+
+# The whole assembled configuration, exactly as the service will read it. This
+# is what a fragment-level `validate:` cannot do (see the header comment).
+- name: The assembled configuration must parse
+  ansible.builtin.command: "apache2ctl configtest"
+  register: apache_configtest
+  changed_when: false
+  failed_when: apache_configtest.rc != 0
+
+# Anything the templates queued (the reload) must be applied BEFORE verifying:
+# otherwise the checks describe a configuration the handler then replaces, and
+# the external probe can catch the service mid-reload.
+- name: Apply any pending configuration change first
+  ansible.builtin.meta: flush_handlers
+
+- name: Serve the declared sites now and on every boot
+  ansible.builtin.systemd_service:
+    name: "{{ apache_service_name }}"
+    enabled: true
+    state: started
+
+# ---- verification: inside the guest --------------------------------------
+- name: Verify the service is active
+  ansible.builtin.command: "systemctl is-active {{ apache_service_name }}"
+  register: apache_active
+  changed_when: false
+  failed_when: apache_active.stdout | trim != 'active'
+
+- name: Read the TCP ports something is listening on
+  # Pure text tools rather than a regex filter: `ss -lntH` omits the header and
+  # the 4th column is the local address, whose port is everything after the last
+  # colon (`*:80`, `0.0.0.0:80`, `[::]:80`). One port per line, so the check
+  # compares sets instead of patterns.
+  ansible.builtin.shell:
+    cmd: "ss -lntH | awk '{print $4}' | sed 's/.*://' | sort -un"
+    executable: /bin/sh
+  register: apache_sockets
+  changed_when: false
+
+- name: Apache must be listening on every declared port
+  ansible.builtin.assert:
+    that:
+      - missing_ports | length == 0
+    fail_msg: >-
+      Apache is not listening on {{ missing_ports | join(', ') }}. Declared ports:
+      {{ apache_listen_ports | join(', ') }}; ports currently listening:
+      {{ apache_sockets.stdout_lines | join(', ') }}.
+      configtest said: {{ apache_configtest.stdout | trim }}
+    success_msg: "Listening on the declared port(s): {{ apache_listen_ports | join(', ') }}."
+  vars:
+    missing_ports: >-
+      {{ apache_listen_ports | map('string')
+         | reject('in', apache_sockets.stdout_lines) | list }}
+
+- name: The running configuration must contain every declared vhost
+  ansible.builtin.command: "apache2ctl -S"
+  register: apache_vhosts
+  changed_when: false
+  failed_when: >-
+    apache_sites | map(attribute='name')
+    | reject('in', apache_vhosts.stderr ~ apache_vhosts.stdout) | list | length > 0
+
+- name: Verify every declared site answers over HTTP from inside the guest
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ item.port }}/"
+    status_code: 200
+    return_content: true
+  register: apache_local
+  loop: "{{ apache_sites }}"
+  loop_control:
+    label: "{{ item.name }} on port {{ item.port }}"
+  failed_when: apache_local.status != 200
+
+- name: Report the converged web server
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: {{ apache_version_out.stdout | trim }},
+      {{ apache_service_name }} {{ apache_active.stdout | trim }},
+      listening on {{ apache_listen_ports | join(', ') }},
+      {{ apache_sites | length }} declared site(s):
+      {% for s in apache_sites %}{{ s.name }} (*:{{ s.port }} -> {{ s.root }}){{ ', ' if not loop.last else '' }}{% endfor %}
+      — each answered HTTP 200 from inside the guest.

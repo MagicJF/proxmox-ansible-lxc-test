@@ -1,0 +1,218 @@
+---
+# ===========================================================================
+# Layer 2, TiddlyWiki role. Converges the INSIDE of a guest: Node.js from the
+# distribution, the pinned TiddlyWiki engine, a server-edition wiki folder and
+# the systemd unit that serves it on every boot.
+#
+# It installs the engine from the OFFICIAL registry artifact rather than through
+# Debian's `npm` package, and that is a deliberate trade:
+#   - `apt install npm` on Debian 13 pulls ~400 packages (it drags the GTK/X
+#     stack in through its module dependencies) and took minutes on a 1 GiB
+#     guest, for a wiki that needs neither;
+#   - the tiddlywiki tarball IS what npm would install, version-pinned, and the
+#     package has no runtime dependencies. The role asserts that last point, so
+#     if a future version grows dependencies it fails loudly instead of quietly
+#     needing a package manager.
+#
+# It verifies the RUNNING service, not the package install: a service can start
+# and immediately exit, and another TiddlyWiki could be answering on a familiar
+# port, so the checks look at the live process, the live listener and the HTTP
+# response.
+# ===========================================================================
+
+- name: Install the runtime the wiki needs
+  # tar is in the base image; curl is what fetches the engine, and its absence
+  # once looked exactly like a broken network.
+  ansible.builtin.apt:
+    name: "{{ tiddlywiki_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Read the installed Node.js version
+  ansible.builtin.command: node --version
+  register: tw_node
+  changed_when: false
+
+- name: The installed Node.js must satisfy this TiddlyWiki
+  ansible.builtin.assert:
+    that:
+      - (tw_node.stdout | regex_replace('^v', '') | split('.') | first | int) >= tiddlywiki_min_node_major
+    fail_msg: >-
+      Node.js {{ tw_node.stdout }} is older than the {{ tiddlywiki_min_node_major }}+ that
+      TiddlyWiki {{ tiddlywiki_version }} requires. Add a suitable repository to the guest's
+      declaration and re-run; nothing else was changed.
+    success_msg: "Node.js {{ tw_node.stdout }} satisfies TiddlyWiki {{ tiddlywiki_version }}."
+
+- name: Read the installed TiddlyWiki version
+  ansible.builtin.command: "{{ tiddlywiki_bin }} --version"
+  register: tw_installed
+  changed_when: false
+  failed_when: false
+
+# Version-pinned and idempotent: touches the guest only when it has a different
+# engine, so changing the declared version applies and a repeat run is a no-op.
+- name: Install the pinned TiddlyWiki engine
+  when: (tw_installed.stdout | default('') | trim) != (tiddlywiki_version | string)
+  block:
+    - name: Fetch the engine artifact from the npm registry
+      ansible.builtin.get_url:
+        url: "https://registry.npmjs.org/tiddlywiki/-/tiddlywiki-{{ tiddlywiki_version }}.tgz"
+        dest: "/tmp/tiddlywiki-{{ tiddlywiki_version }}.tgz"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Read the artifact's manifest before trusting it
+      ansible.builtin.command: "tar -xzOf /tmp/tiddlywiki-{{ tiddlywiki_version }}.tgz package/package.json"
+      register: tw_manifest
+      changed_when: false
+
+    - name: The engine must be self-contained (no package manager needed)
+      ansible.builtin.assert:
+        that:
+          - (tw_manifest.stdout | from_json).dependencies | default({}) | length == 0
+        fail_msg: >-
+          tiddlywiki {{ tiddlywiki_version }} declares runtime dependencies
+          ({{ (tw_manifest.stdout | from_json).dependencies | default({}) | to_json }}), so it cannot
+          be installed from the tarball alone. Install a package manager in the guest (Debian's
+          `npm` pulls ~400 packages) or vendor the dependencies, then re-run.
+        success_msg: "tiddlywiki {{ tiddlywiki_version }} is self-contained."
+
+    - name: Replace any previously installed engine
+      ansible.builtin.file:
+        path: "{{ tiddlywiki_lib_dir }}"
+        state: absent
+
+    # tar -C needs the destination to exist: removing the previous engine above
+    # means recreating it here, or the extraction fails with a non-zero rc.
+    - name: Prepare the directory Node.js resolves global packages from
+      ansible.builtin.file:
+        path: "{{ tiddlywiki_lib_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Lay out the engine where Node.js resolves global packages
+      ansible.builtin.command:
+        cmd: "tar -xzf /tmp/tiddlywiki-{{ tiddlywiki_version }}.tgz -C {{ tiddlywiki_lib_dir }} --strip-components=1"
+
+    - name: Make the engine's entry point executable
+      ansible.builtin.file:
+        path: "{{ tiddlywiki_lib_dir }}/tiddlywiki.js"
+        state: file
+        owner: root
+        group: root
+        mode: "0755"
+
+    # A launcher rather than a symlink: the tarball does not guarantee the exec
+    # bit, and a symlink cannot carry one.
+    - name: Expose the engine on PATH
+      ansible.builtin.copy:
+        dest: "{{ tiddlywiki_bin }}"
+        content: |
+          #!/bin/sh
+          # Managed by layer 2 - configure/roles/tiddlywiki
+          exec node {{ tiddlywiki_lib_dir }}/tiddlywiki.js "$@"
+        owner: root
+        group: root
+        mode: "0755"
+
+- name: The engine must answer with the pinned version
+  ansible.builtin.command: "{{ tiddlywiki_bin }} --version"
+  register: tw_version_check
+  changed_when: false
+  failed_when: (tw_version_check.stdout | trim) != (tiddlywiki_version | string)
+
+- name: Ensure the service account exists
+  ansible.builtin.user:
+    name: "{{ tiddlywiki_service_user }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+    comment: "TiddlyWiki service account"
+
+- name: Ensure the wiki directory exists
+  ansible.builtin.file:
+    path: "{{ tiddlywiki_wiki_dir }}"
+    state: directory
+    owner: "{{ tiddlywiki_service_user }}"
+    group: "{{ tiddlywiki_service_user }}"
+    mode: "0755"
+
+# `--init server` lays out a server edition from the edition's template and does not
+# overwrite existing tiddlers, so the creates guard keeps this a no-op once the wiki
+# exists — user data is never clobbered by a re-run.
+- name: Initialise the wiki as a server edition
+  ansible.builtin.command:
+    cmd: "{{ tiddlywiki_bin }} {{ tiddlywiki_wiki_dir }} --init server"
+    creates: "{{ tiddlywiki_wiki_dir }}/tiddlywiki.info"
+
+- name: Keep the whole wiki owned by the service account
+  ansible.builtin.file:
+    path: "{{ tiddlywiki_wiki_dir }}"
+    state: directory
+    owner: "{{ tiddlywiki_service_user }}"
+    group: "{{ tiddlywiki_service_user }}"
+    recurse: true
+
+- name: Declare the unit that serves the wiki
+  ansible.builtin.template:
+    src: tiddlywiki.service.j2
+    dest: "/etc/systemd/system/{{ tiddlywiki_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart tiddlywiki
+
+- name: Serve the wiki now and on every boot
+  ansible.builtin.systemd_service:
+    name: "{{ tiddlywiki_service_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# ---- verification: inside the guest --------------------------------------
+# Anything the unit template queued (reload systemd, restart the wiki) must be
+# applied BEFORE verifying: otherwise the checks below describe a state that the
+# handler then replaces, and an external probe can catch the service mid-restart.
+- name: Apply any pending unit change first
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify the service is active
+  ansible.builtin.command: "systemctl is-active {{ tiddlywiki_service_name }}"
+  register: tw_active
+  changed_when: false
+  failed_when: tw_active.stdout | trim != 'active'
+
+# The running-process check the deployment notes insist on: prove the live process
+# is THIS wiki folder on THIS port, not another wiki on a familiar port.
+- name: Verify the running process is this wiki folder on this port
+  ansible.builtin.shell:
+    cmd: >-
+      pgrep -af tiddlywiki
+      | grep -F -- ' {{ tiddlywiki_wiki_dir }} '
+      | grep -F -- 'port={{ tiddlywiki_port }}'
+    executable: /bin/bash
+  register: tw_process
+  changed_when: false
+  failed_when: tw_process.rc != 0
+
+- name: Verify the wiki answers over HTTP
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ tiddlywiki_port }}/"
+    status_code: 200
+    return_content: true
+  register: tw_http
+  failed_when: >-
+    tw_http.status != 200 or 'TiddlyWiki' not in (tw_http.content | default(''))
+
+- name: Report the converged wiki
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: TiddlyWiki {{ tw_version_check.stdout | trim }} (node {{ tw_node.stdout }}),
+      wiki at {{ tiddlywiki_wiki_dir }}, {{ tiddlywiki_service_name }}.service {{ tw_active.stdout | trim }},
+      HTTP 200 on http://127.0.0.1:{{ tiddlywiki_port }}/.

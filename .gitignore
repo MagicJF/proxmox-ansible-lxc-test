@@ -1,0 +1,20 @@
+.env
+*.env
+*.vault
+*.pem
+*.key
+vault.yml
+vault.yaml
+*.retry
+__pycache__/
+
+# Run logs and the Proxmox API journal. Never commit these: they describe real
+# infrastructure, and this repository is public. The directory itself is kept
+# because Ansible's log_path cannot create it.
+logs/*
+!logs/.gitkeep
+
+# Hardcoded local credentials (playbooks/vars/secrets.yml). The playbooks load it
+# when it exists, but it must never be committed: the PVE token is
+# root-equivalent and this repository is public.
+playbooks/vars/secrets.yml

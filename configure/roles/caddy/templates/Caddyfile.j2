@@ -1,0 +1,25 @@
+# Managed by layer 2 - configure/roles/caddy/templates/Caddyfile.j2
+# The sites are declared in inventory/group_vars/all.yml under
+# pve_containers[].config.caddy. Editing this file on the guest is drift and will
+# be reverted on the next run of configure/site.yml.
+{% for site in caddy_sites %}
+{{ site.address }} {
+{% if site.encode is defined %}
+	encode {{ site.encode | join(' ') }}
+{% endif %}
+{% if site.root is defined %}
+	root * {{ site.root }}
+{% endif %}
+{% if site.file_server | default(false) | bool %}
+	file_server{{ ' browse' if site.browse | default(false) | bool else '' }}
+{% endif %}
+{% if site.respond is defined %}
+	respond "{{ site.respond }}"
+{% endif %}
+{% if site.extra is defined %}
+{% for line in site.extra %}
+	{{ line }}
+{% endfor %}
+{% endif %}
+}
+{% endfor %}

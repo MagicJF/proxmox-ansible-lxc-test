@@ -1,0 +1,26 @@
+---
+# Knobs shared by every TiddlyWiki guest. Anything guest-specific (wiki dir, port,
+# version, exposure) comes from the declared state, never from here.
+tiddlywiki_packages:
+  - nodejs
+  # curl fetches the engine artifact, and its absence once looked exactly like a
+  # broken network, which cost a debugging round on another guest.
+  - curl
+
+# TiddlyWiki's server edition needs a modern Node; assert the version that actually
+# lands instead of assuming the host's.
+tiddlywiki_min_node_major: 16
+
+tiddlywiki_lib_dir: /usr/local/lib/node_modules/tiddlywiki
+tiddlywiki_bin: /usr/local/bin/tiddlywiki
+tiddlywiki_service_name: tiddlywiki
+tiddlywiki_wiki_dir: /srv/tiddlywiki
+tiddlywiki_port: 8080
+tiddlywiki_version: "5.4.1"
+tiddlywiki_service_user: tiddlywiki
+
+# Where the HTTP server binds. 0.0.0.0 makes the wiki reachable from the LAN, which
+# is the point of serving it — but a TiddlyWiki server edition is WRITABLE and
+# unauthenticated, so this value belongs in the declaration (an explicit exposure
+# decision) and the guest must live behind a network that is not public.
+tiddlywiki_listen_host: "0.0.0.0"

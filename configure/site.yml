@@ -1,0 +1,146 @@
+---
+# ===========================================================================
+# Layer 2 — CONVERGE the inside of every guest that declares `manage: true`.
+#
+# Layer 1 owns the guest's shape through the Proxmox API; this owns what runs
+# inside it, over SSH. Both read the same declared state
+# (inventory/group_vars/all.yml), which stays the single source of truth.
+#
+# Run from the repository root:
+#     ansible-playbook configure/site.yml
+# ===========================================================================
+- name: Layer 2 - build the target inventory from the declared state
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Overridden by playbooks/vars/secrets.yml (gitignored) when it exists.
+    pve_ssh_user: root
+    pve_ssh_key_path: "/home/hermes/.hermes/profiles/hermione/secrets/pve-automation_ed25519"
+  tasks:
+    - name: Build the configuration targets
+      ansible.builtin.include_tasks: tasks/build_targets.yml
+
+- name: Layer 2 - converge the inside of every managed guest
+  hosts: pve_config_targets
+  # No fact gathering: it runs before the reachability check, so an unreachable
+  # guest would abort the play instead of being handled by the policy in
+  # tasks/reachability.yml. The role does not depend on gathered facts.
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Reachability and access policy for this guest
+      ansible.builtin.include_tasks: tasks/reachability.yml
+
+    # Each role is opt-in through ITS declared key: a guest that declares no
+    # `caddy` block must not get Caddy installed just because it is managed.
+    - name: Converge the declared Caddy instances
+      ansible.builtin.include_role:
+        name: caddy
+      vars:
+        caddy_sites: "{{ (l2_config.caddy | default({})).sites | default([]) }}"
+        caddy_timers: "{{ (l2_config.caddy | default({})).timers | default([]) }}"
+      when:
+        - l2_manage | bool
+        - l2_config.caddy is defined
+
+    - name: Converge the declared TiddlyWiki instances
+      ansible.builtin.include_role:
+        name: tiddlywiki
+      vars:
+        tw: "{{ l2_config.tiddlywiki | default({}) }}"
+        tiddlywiki_wiki_dir: "{{ tw.wiki_dir | default('/srv/tiddlywiki') }}"
+        tiddlywiki_port: "{{ tw.port | default(8080) }}"
+        tiddlywiki_version: "{{ tw.version | default('5.4.1') }}"
+        tiddlywiki_service_user: "{{ tw.service_user | default('tiddlywiki') }}"
+        tiddlywiki_listen_host: "{{ tw.listen_host | default('0.0.0.0') }}"
+      when:
+        - l2_manage | bool
+        - l2_config.tiddlywiki is defined
+
+    - name: Converge the declared Apache instances
+      ansible.builtin.include_role:
+        name: apache
+      vars:
+        apache_sites: "{{ (l2_config.apache | default({})).sites | default([]) }}"
+      when:
+        - l2_manage | bool
+        - l2_config.apache is defined
+
+    - name: "Nothing to converge: the declaration is read-only for this guest"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is declared with manage false, so layer 2 only
+          audits it (configure/audit.yml). Set manage true in the declaration when
+          you are ready for it to be converged.
+      when: not (l2_manage | bool)
+
+# ---------------------------------------------------------------------------
+# Verification from OUTSIDE the guest: the declaration says what Caddy should
+# serve, so the proof is an HTTP request from here, not a task exit status.
+# ---------------------------------------------------------------------------
+- name: Layer 2 - verify from outside every guest
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Probe every declared site over HTTP
+      ansible.builtin.uri:
+        url: "http://{{ item._target }}:{{ item.address | regex_replace('^.*:', '') }}/"
+        return_content: true
+        status_code: 200
+      register: l2_probe
+      loop: "{{ l2_probes | default([]) }}"
+      loop_control:
+        label: "{{ item._target }} {{ item.address }}"
+      # -1 means "could not even connect". After a converged run that is usually a
+      # service still coming up, so retry before calling it a failure.
+      retries: 6
+      delay: 5
+      until: (l2_probe.status | default(0) | int) == (item.expect_status | default(200) | int)
+      failed_when: false
+
+    - name: Report what came back
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item._target }} {{ item.item.address }} -> HTTP {{ item.status | default('no answer') }}
+          {{ ('| body ' ~ (item.content | trim | truncate(60))) if item.content is defined and item.content | length > 0 else '' }}
+      loop: "{{ l2_probe.results }}"
+      loop_control:
+        label: "{{ item.item._target }}"
+      changed_when: false
+
+    - name: Every declared site must answer with the status its declaration expects
+      # The expectation is declared per site (`expect_status`, default 200): a
+      # file_server over an empty directory legitimately answers 404 and the
+      # declaration should say so rather than the framework assuming.
+      ansible.builtin.assert:
+        that:
+          - item.status | default(0) | int == (item.item.expect_status | default(200) | int)
+        fail_msg: >-
+          {{ item.item._target }} {{ item.item.address }} answered
+          {{ item.status | default('nothing') }} but the declaration expects
+          {{ item.item.expect_status | default(200) }}. The Caddyfile may be deployed
+          but not serving, or the guest may be unreachable from here.
+        success_msg: >-
+          {{ item.item._target }} {{ item.item.address }} answered
+          {{ item.status }} as declared.
+      loop: "{{ l2_probe.results }}"
+      loop_control:
+        label: "{{ item.item._target }}"
+      when: l2_probe.results | length > 0
+
+    - name: A declared body must be the body the guest actually serves
+      ansible.builtin.assert:
+        that:
+          - item.item.expect_body in item.content
+        fail_msg: >-
+          {{ item.item._target }} {{ item.item.address }} served
+          "{{ item.content | default('') | trim | truncate(80) }}" but the declaration
+          says it must contain "{{ item.item.expect_body }}".
+        success_msg: "{{ item.item._target }} served the declared body: {{ item.item.expect_body }}"
+      loop: "{{ l2_probe.results }}"
+      loop_control:
+        label: "{{ item.item._target }}"
+      when:
+        - l2_probe.results | length > 0
+        - item.item.expect_body is defined
+        - item.content is defined

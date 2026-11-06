@@ -1,0 +1,13 @@
+---
+# Knobs that are the same for every Caddy guest this role configures. Anything
+# guest-specific (sites, timers) comes from the declared state, never from here.
+caddy_apt_uri: "https://dl.cloudsmith.io/public/caddy/stable/deb/debian"
+caddy_apt_key: "https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
+caddy_keyring: /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+caddy_sources: /etc/apt/sources.list.d/caddy-stable.sources
+caddy_config_path: /etc/caddy/Caddyfile
+caddy_service: caddy
+
+# Filled in from `l2_config.caddy` by configure/site.yml.
+caddy_sites: []
+caddy_timers: []

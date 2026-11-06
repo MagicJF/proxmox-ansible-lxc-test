@@ -1,0 +1,199 @@
+{#- =========================================================================
+   pve_engine.j2 — the declared-versus-live engine, as Jinja macros.
+
+   It is a .j2 next to the playbooks because that is the directory Ansible's
+   template loader searches for {% import %} (templates/ is NOT searched).
+
+   Two macros, one per guest type, each taking the declared item, its live
+   config and its runtime status, and returning the same analysis dict the
+   playbooks used to build one guest at a time. Importing them lets a single
+   templating pass analyse EVERY guest, which is what makes the engine fast:
+   the old per-guest set_fact loop cost a module execution per guest.
+
+   The mapping logic is unchanged; only the packaging is. PVE does not store
+   values verbatim:
+
+     tags        -> reordered alphabetically, ';' separated
+     features    -> ',' separated, reordered
+     startup     -> ',' separated, reordered
+     description -> trailing newline appended
+     netX/mpX/scsiX -> property order, generated volume ids and MACs rewritten
+
+   Both sides are canonicalised before comparison; comparing raw strings would
+   report permanent phantom drift. Every value goes through `| string` on both
+   sides: a number handed back by Ansible would never equal the API's string.
+   ========================================================================= -#}
+
+{#- ------------------------------------------------------------- PLAN ----- #}
+{#- One templating pass over every declared guest of both types. The playbooks
+    call this for the pre-run analysis and again after the mutations, so both
+    phases share one definition and can never disagree. -#}
+{% macro plan(lxc_specs, vm_specs, live_map) %}
+{%- set ns = namespace(out={}) -%}
+{%- for g in lxc_specs %}
+{%- set l = live_map[g.vmid | string] | default({'config': {}, 'status': ''}, true) -%}
+{%- set ns.out = ns.out | combine({ g.vmid | string: lxc(g, (l.config | default({}, true)), (l.status | default('', true))) | from_json }) -%}
+{%- endfor %}
+{%- for g in vm_specs %}
+{%- set l = live_map[g.vmid | string] | default({'config': {}, 'status': ''}, true) -%}
+{%- set ns.out = ns.out | combine({ g.vmid | string: vm(g, (l.config | default({}, true)), (l.status | default('', true))) | from_json }) -%}
+{%- endfor %}
+{{- ns.out | to_json -}}
+{% endmacro %}
+
+{#- ---------------------------------------------------------------- LXC --- #}
+{% macro lxc(guest, live, live_status) %}
+{%- set declared_norm = {
+      'hostname': guest.hostname | string,
+      'ostype': guest.ostype | string,
+      'cores': guest.cores | string,
+      'memory': guest.memory | string,
+      'swap': guest.swap | string,
+      'cpuunits': guest.cpuunits | string,
+      'onboot': (1 if guest.onboot | bool else 0) | string,
+      'cmode': guest.cmode | default('', true) | string,
+      'timezone': guest.timezone | default('', true) | string,
+      'description': guest.description | default('', true) | trim,
+      'tags': guest.tags | default([], true) | sort | join(';'),
+      'features': guest.features | default([], true) | sort | join(','),
+      'startup': guest.startup | default([], true) | sort | join(','),
+      'nameserver': guest.nameserver | default('', true) | string,
+      'searchdomain': guest.searchdomain | default('', true) | string,
+      'hookscript': guest.hookscript | default('', true) | string,
+    } | combine((guest.netif | default({}, true)) | combine(guest.mounts | default({}, true))
+               | pve_canon_attachments) -%}
+{%- set actual_norm = {
+      'hostname': live.hostname | default('') | string,
+      'ostype': live.ostype | default('') | string,
+      'cores': live.cores | default('') | string,
+      'memory': live.memory | default('') | string,
+      'swap': live.swap | default('') | string,
+      'cpuunits': live.cpuunits | default('') | string,
+      'onboot': live.onboot | default('') | string,
+      'cmode': live.cmode | default('') | string,
+      'timezone': live.timezone | default('') | string,
+      'description': live.description | default('') | trim,
+      'tags': live.tags | default('') | split(';') | sort | join(';'),
+      'features': live.features | default('') | split(',') | sort | join(','),
+      'startup': live.startup | default('') | split(',') | sort | join(','),
+      'nameserver': live.nameserver | default('') | string,
+      'searchdomain': live.searchdomain | default('') | string,
+      'hookscript': live.hookscript | default('') | string,
+    } | combine(live | pve_attachments | pve_canon_attachments) -%}
+{#- symmetric_difference cancels identical keys; unique collapses the pairs. -#}
+{%- set mismatched = ((declared_norm | dict2items) | symmetric_difference(actual_norm | dict2items))
+      | map(attribute='key') | unique | sort | list -%}
+{%- set declared_empty = declared_norm | dict2items | selectattr('value', 'eq', '')
+      | map(attribute='key') | list -%}
+{%- set undeclared_child = (live.keys() | select('match', '^net[0-9]+$') | list
+        | difference((guest.netif | default({}, true)).keys() | list))
+      + (live.keys() | select('match', '^mp[0-9]+$') | list
+        | difference((guest.mounts | default({}, true)).keys() | list)) -%}
+{#- Split rather than regex: a backreference inside a folded block stays literal. -#}
+{%- set rootfs_live = live.rootfs | default('') | split('size=') | last | split('G') | first | int -%}
+{%- set creation_drift = ([]
+      + (['unprivileged'] if (live.unprivileged | default(-1) | int) != (1 if guest.unprivileged | bool else 0) else [])
+      + (['ostype'] if (live.ostype | default('') | string) != (guest.ostype | string) else [])
+      + (['rootfs storage'] if (guest.storage ~ ':') not in (live.rootfs | default('')) else [])
+      + (['rootfs size'] if rootfs_live != (guest.rootfs_size | int) else []))
+      | sort | list -%}
+{%- set to_set = mismatched | intersect(declared_norm.keys() | list) | difference(declared_empty) | sort | list -%}
+{%- set to_delete = ((mismatched | intersect(declared_empty)) + undeclared_child) | unique | sort | list -%}
+{%- set status_expected = 'running' if (guest.status | string) == 'started' else (guest.status | string) -%}
+{%- set power_drift = (live_status | default('') | string) != status_expected -%}
+{{- {
+  'exists': live | length > 0,
+  'status': live_status | default(''),
+  'status_expected': status_expected,
+  'mismatched': mismatched,
+  'declared_subset': declared_norm | dict2items | selectattr('key', 'in', mismatched) | items2dict,
+  'actual_subset': actual_norm | dict2items | selectattr('key', 'in', mismatched) | items2dict,
+  'to_set': to_set,
+  'to_delete': to_delete,
+  'forbidden_present': to_delete | intersect(live.keys() | list) | sort | list,
+  'creation_time_drift': creation_drift,
+  'power_drift': power_drift,
+  'in_sync': (mismatched | length == 0) and (creation_drift | length == 0) and not power_drift,
+} | to_json -}}
+{% endmacro %}
+
+{#- ---------------------------------------------------------------- VM ---- #}
+{% macro vm(guest, live, live_status) %}
+{%- set with_cloudinit = guest.cloudinit | default(false) | bool -%}
+{%- set declared_norm = {
+      'name': guest.name | string,
+      'cores': guest.cores | string,
+      'sockets': guest.sockets | string,
+      'memory': guest.memory | string,
+      'cpu': guest.cpu | string,
+      'ostype': guest.ostype | string,
+      'bios': guest.bios | default('', true) | string,
+      'machine': guest.machine | default('', true) | string,
+      'scsihw': guest.scsihw | default('', true) | string,
+      'vga': guest.vga | default('', true) | string,
+      'onboot': (1 if guest.onboot | bool else 0) | string,
+      'boot': guest.boot | default('', true) | string,
+      'description': guest.description | default('', true) | trim,
+      'tags': guest.tags | default([], true) | sort | join(';'),
+    } | combine((guest.net | default({}, true)) | combine(guest.scsi | default({}, true))
+               | combine(guest.sata | default({}, true)) | combine(guest.ide | default({}, true))
+               | combine(guest.virtio | default({}, true)) | pve_canon_attachments)
+      | combine({'ide2': 'cloudinit'} if with_cloudinit else {}) -%}
+{%- set actual_norm = {
+      'name': live.name | default('') | string,
+      'cores': live.cores | default('') | string,
+      'sockets': live.sockets | default('') | string,
+      'memory': live.memory | default('') | string,
+      'cpu': live.cpu | default('') | string,
+      'ostype': live.ostype | default('') | string,
+      'bios': live.bios | default('') | string,
+      'machine': live.machine | default('') | string,
+      'scsihw': live.scsihw | default('') | string,
+      'vga': live.vga | default('') | string,
+      'onboot': live.onboot | default('') | string,
+      'boot': live.boot | default('') | string,
+      'description': live.description | default('') | trim,
+      'tags': live.tags | default('') | split(';') | sort | join(';'),
+    } | combine(live | pve_attachments | pve_canon_attachments)
+      | combine({'ide2': 'cloudinit'} if with_cloudinit and 'cloudinit' in (live.ide2 | default('')) else {}) -%}
+{%- set mismatched = ((declared_norm | dict2items) | symmetric_difference(actual_norm | dict2items))
+      | map(attribute='key') | unique | sort | list -%}
+{%- set declared_empty = declared_norm | dict2items | selectattr('value', 'eq', '')
+      | map(attribute='key') | list -%}
+{%- set undeclared_child = (live.keys() | select('match', '^(net|scsi|sata|ide|virtio)[0-9]+$') | list)
+      | difference((guest.net | default({}, true)).keys() | list)
+      | difference((guest.scsi | default({}, true)).keys() | list)
+      | difference((guest.sata | default({}, true)).keys() | list)
+      | difference((guest.ide | default({}, true)).keys() | list)
+      | difference((guest.virtio | default({}, true)).keys() | list) -%}
+{#- proxmox_kvm refuses to update these, so for a VM they are creation-time. -#}
+{%- set attachments_declared = (guest.net | default({}, true)) | combine(guest.scsi | default({}, true))
+      | combine(guest.sata | default({}, true)) | combine(guest.ide | default({}, true))
+      | combine(guest.virtio | default({}, true)) | pve_canon_attachments -%}
+{%- set attachments_live = live | pve_attachments | pve_canon_attachments -%}
+{%- set creation_drift = ([]
+      + (['bios'] if (live.bios | default('') | string) != (guest.bios | default('', true) | string) else [])
+      + (['machine'] if (live.machine | default('') | string) != (guest.machine | default('', true) | string) else [])
+      + (['scsihw'] if (live.scsihw | default('') | string) != (guest.scsihw | default('', true) | string) else [])
+      + (['ostype'] if (live.ostype | default('') | string) != (guest.ostype | string) else [])
+      + (mismatched | intersect((attachments_declared.keys() | list) + (attachments_live.keys() | list))))
+      | unique | sort | list -%}
+{%- set to_set = mismatched | intersect(declared_norm.keys() | list) | difference(declared_empty) | sort | list -%}
+{%- set to_delete = ((mismatched | intersect(declared_empty)) + undeclared_child) | unique | sort | list -%}
+{%- set status_expected = 'running' if (guest.status | string) == 'started' else (guest.status | string) -%}
+{%- set power_drift = (live_status | default('') | string) != status_expected -%}
+{{- {
+  'exists': live | length > 0,
+  'status': live_status | default(''),
+  'status_expected': status_expected,
+  'mismatched': mismatched,
+  'declared_subset': declared_norm | dict2items | selectattr('key', 'in', mismatched) | items2dict,
+  'actual_subset': actual_norm | dict2items | selectattr('key', 'in', mismatched) | items2dict,
+  'to_set': to_set,
+  'to_delete': to_delete,
+  'forbidden_present': to_delete | intersect(live.keys() | list) | sort | list,
+  'creation_time_drift': creation_drift,
+  'power_drift': power_drift,
+  'in_sync': (mismatched | length == 0) and (creation_drift | length == 0) and not power_drift,
+} | to_json -}}
+{% endmacro %}
