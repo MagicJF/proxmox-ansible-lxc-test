@@ -64,6 +64,10 @@ ansible-playbook playbooks/preflight.yml   # read-only: checks + what would chan
 ansible-playbook playbooks/apply.yml       # converge + verify
 ```
 
+For interactive iteration, `apply` alone is the verb: it reads the declared state, applies
+what differs, then re-reads and verifies by API in the same run. Run `preflight` when you
+suspect drift, not as a routine step — see [Performance and how to iterate fast](#performance-and-how-to-iterate-fast).
+
 ## Declared state
 
 `inventory/group_vars/all.yml` holds `pve_node`, a `pve_defaults` block, and `pve_containers`: **the only containers this repository manages**. A container absent from that list is never read, created or modified — the pre-existing guests `100`, `101` and `105` are deliberately out of scope. Every key of `pve_defaults` can be overridden per container.
@@ -174,6 +178,46 @@ Adding another application means another role under `configure/roles/` and anoth
 ### Why not the community-scripts installers
 
 Scripts like `community-scripts.org`'s run on the **PVE host as root**, drive `pct create` and then `pct exec` into the guest, and their "update" path is `apt upgrade` plus a GitHub release fetch. They are imperatives with no declared state: nothing to diff, nothing to verify, and they need the host shell this repository deliberately avoids. If one is ever used, run it once by hand and let layer 2 take over the inside afterwards — never both at once, or they fight over the same files.
+
+## Performance and how to iterate fast
+
+Measured on the lab control node (a container on the PVE host itself, 4 vCPU, no CPU quota):
+
+| Measurement | Result |
+|---|---|
+| `apply` with nothing to change | **219 s** for ~26 executed tasks |
+| PVE API per call, via `python-requests` | **15-80 ms** |
+| All 12 API reads of every declared guest, in **one** Python process | **0.34 s** |
+| Those same 12 reads spread across 12 Ansible tasks | ~48 s of pure overhead |
+| `ansible --version` (start-up alone) | 3.9 s |
+| Marginal cost per task (measured from 1 to 8 tasks) | ~3 s/task + ~9 s fixed |
+
+A single Ansible module execution costs seconds here, so **the runtime is the number of module
+executions, not the size of the work**. Every `loop` iteration is one execution, which is why a
+task looping over five guests pays five times. That is the whole lever:
+
+- **`apply` is the iteration verb.** It reads, applies and verifies through the API in one run.
+- **Do not re-run just to prove idempotence.** `apply` already re-reads and prints the
+  declared-versus-live comparison; a second run doubles the wall time for information you
+  already have. Reserve the repeat for changes that touch creation-time properties or power.
+- **Verification is not what costs.** `validate:`, the external HTTP probe and the journal
+  assert are nearly free inside a task. What costs is a second verb, and a task — or a loop
+  iteration — per item.
+
+`ansible.cfg` already carries `pipelining`, SSH connection reuse (`ControlMaster`/
+`ControlPersist`), `forks = 20` and `display_skipped_hosts = False`. Those remove per-task SSH
+*setup* only; they do not reduce the ~3 s of Ansible/Python overhead per execution, which is why
+fewer, coarser tasks remain the real lever.
+
+Two measurement traps, both hit for real while building this:
+
+- **`curl` lies about this API.** Every `curl` request to `:8006` takes a constant ~3.05 s of
+  TTFB — with a valid token, with a bad one (401), with `--http1.1` and against the bare IP —
+  while `python-requests`, which is what Ansible uses, answers in 15-80 ms. Benchmark with the
+  same client the engine uses before concluding the API is slow.
+- **A run is not "faster" if its outcome changed.** A 104 s → 32 s improvement turned out to be
+  a run that aborted early (`failed=1`) because its target guest had been deleted. A speed-up is
+  only a speed-up when the work done and the result are identical.
 
 ## How the engine behaves
 
