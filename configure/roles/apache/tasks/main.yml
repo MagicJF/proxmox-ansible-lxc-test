@@ -34,10 +34,10 @@
       - apache_sites | selectattr('name', 'undefined') | list | length == 0
       - apache_sites | selectattr('root', 'undefined') | list | length == 0
     fail_msg: >-
-      Every site in config.apache.sites needs name, port and root. Missing in:
-      {{ apache_sites | selectattr('port', 'undefined') | list
-         + apache_sites | selectattr('name', 'undefined') | list
-         + apache_sites | selectattr('root', 'undefined') | list | to_json }}
+      Every site in config.apache.sites needs name, port and root. Incomplete:
+      {{ (apache_sites | selectattr('port', 'undefined') | list
+          + apache_sites | selectattr('name', 'undefined') | list
+          + apache_sites | selectattr('root', 'undefined') | list) | to_json }}
     success_msg: "All {{ apache_sites | length }} declared site(s) carry name, port and root."
 
 - name: Install the web server
