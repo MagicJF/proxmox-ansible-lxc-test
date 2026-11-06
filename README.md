@@ -155,6 +155,10 @@ The PVE API answers on the public address from anywhere; the guests sit on an in
 
 `pve_tunnel` describes it in the one declared-state file: interface name, `endpoint` (`host:port`), the endpoint's **public** key, this node's tunnel address, the guest prefix to route through it, and where the private key lives.
 
+The tunnel is to the **host**, not to each guest: one peer with `AllowedIPs = <guest LAN>` covers the whole network, so a container created tomorrow is reachable the moment it exists and nothing is configured per guest. What makes the LAN reachable is the host forwarding and NATting the tunnel subnet onto the guest bridge.
+
+One thing is deliberately *not* automated, and it must stay that way: the endpoint lives on the Proxmox host, and the only API-only way to run code there would be a `hookscript` (root on the hypervisor, and this node's storages do not even offer the required `snippets` content type). The API administers guests; it does not get a backdoor to root on the host. So the endpoint is the one versioned, idempotent paste an operator performs per lab — see below.
+
 ```bash
 ansible-playbook playbooks/connect.yml   # converge the path on its own
 ```
