@@ -1,0 +1,21 @@
+# Managed by layer 2 — configure/roles/apache/templates/vhost.conf.j2
+# Rendered from the declared site "{{ apache_site.name }}" in
+# inventory/group_vars/all.yml -> pve_containers[].config.apache.sites.
+# Editing this file on the guest is drift and will be reverted on the next run
+# of configure/site.yml.
+<VirtualHost *:{{ apache_site.port }}>
+    ServerName {{ apache_site.server_name | default(apache_site.name) }}
+    ServerAdmin {{ apache_server_admin }}
+    DocumentRoot {{ apache_site.root }}
+
+    <Directory {{ apache_site.root }}>
+        # -Indexes: a directory listing is not content the declaration promised,
+        # and an empty docroot must answer 404 rather than expose the tree.
+        Options -Indexes +FollowSymLinks
+        AllowOverride None
+        Require all granted
+    </Directory>
+
+    ErrorLog ${APACHE_LOG_DIR}/{{ apache_site.name }}-error.log
+    CustomLog ${APACHE_LOG_DIR}/{{ apache_site.name }}-access.log combined
+</VirtualHost>

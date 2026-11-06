@@ -57,6 +57,15 @@
         - l2_manage | bool
         - l2_config.tiddlywiki is defined
 
+    - name: Converge the declared Apache instances
+      ansible.builtin.include_role:
+        name: apache
+      vars:
+        apache_sites: "{{ (l2_config.apache | default({})).sites | default([]) }}"
+      when:
+        - l2_manage | bool
+        - l2_config.apache is defined
+
     - name: "Nothing to converge: the declaration is read-only for this guest"
       ansible.builtin.debug:
         msg: >-

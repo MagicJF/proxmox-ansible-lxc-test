@@ -157,6 +157,56 @@ pve_containers:
           expect_status: 200
           expect_body: "TiddlyWiki"
 
+  # Apache web server. Layer 1 owns the guest's shape; layer 2 owns Apache, the
+  # vhosts and the content they serve.
+  - vmid: 132
+    hostname: web-apache
+    cores: 1
+    memory: 512
+    swap: 512
+    rootfs_size: 4
+    status: started
+    tags: [web, apache, lab]
+    description: "Apache web server: shape owned by layer 1, Apache and its declared vhosts owned by layer 2."
+    netif:
+      # Static on the LAN bridge, like the wiki guest: layer 2 derives the SSH
+      # target from here (pve_declared_ipv4) and the HTTP probe needs an address
+      # it can name once.
+      # NOT vmbr0: that is the public uplink (54.36.168.83/24 on eno3) and would
+      # expose an unauthenticated web server to the internet. A container NIC is
+      # creation-time, so getting this wrong means recreating the guest.
+      net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.32/24,ip6=auto"
+    # nameserver stays at the default (null = inherit the host's resolv.conf):
+    # that is the path already proven to reach the Debian mirrors from this LAN,
+    # and installing Apache needs exactly that.
+
+    # ---- layer 2 (configure/). Layer 1 ignores the `config` block. -----------
+    manage: true
+    config:
+      apache:
+        # One vhost per declared entry. `port` is explicit because the role
+        # renders /etc/apache2/ports.conf FROM these values: exposure is an
+        # exposure decision that belongs in the manifest.
+        sites:
+          - name: lab-web
+            port: 80
+            root: /srv/www/lab-web
+            index_html: |
+              <!doctype html>
+              <html lang="es">
+                <head><meta charset="utf-8"><title>web-apache</title></head>
+                <body>
+                  <h1>web-apache</h1>
+                  <p>Contenedor LXC 132 del laboratorio Proxmox, servido por Apache.
+                  La forma del invitado la declara la capa 1; Apache y este vhost, la capa 2.</p>
+                </body>
+              </html>
+      # Proof from OUTSIDE the guest, after convergence.
+      http:
+        - address: ":80"
+          expect_status: 200
+          expect_body: "web-apache"
+
 # ============================================================================
 # QEMU VMs — same declarative rules as the containers, with one important
 # difference: proxmox_kvm refuses to update net/scsi/ide/sata/virtio (updating

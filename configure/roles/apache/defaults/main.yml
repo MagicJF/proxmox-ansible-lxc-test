@@ -1,0 +1,34 @@
+---
+# ===========================================================================
+# Knobs shared by every Apache guest. Anything guest-specific — which vhosts
+# exist, on which port, serving which directory — comes from the declared state
+# (inventory/group_vars/all.yml), never from here.
+# ===========================================================================
+apache_packages:
+  - apache2
+
+apache_service_name: apache2
+apache_config_dir: /etc/apache2
+apache_sites_available_dir: /etc/apache2/sites-available
+apache_sites_enabled_dir: /etc/apache2/sites-enabled
+
+# Debian enables this site at install time and it answers on *:80 with
+# /var/www/html. Disabled here so the declaration is the only thing serving: an
+# undeclared vhost still answering requests is drift that is invisible in the
+# manifest.
+apache_packaged_site: "000-default"
+
+apache_server_admin: "webmaster@localhost"
+apache_run_user: "www-data"
+
+# The vhosts to converge. Left empty on purpose: the role is included by
+# configure/site.yml only for a guest that declares a `apache:` block, and the
+# declared sites are handed in from there.
+apache_sites: []
+
+# The ports Apache listens on are DERIVED from the declared sites, so the
+# declaration is the single source of truth for exposure and `ports.conf` cannot
+# drift from it. That is why every declared site must carry an explicit `port`
+# (asserted in tasks/main.yml) instead of relying on a default that this
+# derivation would not see.
+apache_listen_ports: "{{ apache_sites | map(attribute='port') | unique | sort }}"

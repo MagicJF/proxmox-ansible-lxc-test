@@ -1,0 +1,8 @@
+# Managed by layer 2 — configure/roles/apache/templates/ports.conf.j2
+# The declared sites decide the ports Apache listens on
+# (inventory/group_vars/all.yml -> pve_containers[].config.apache.sites[].port),
+# so this file cannot drift from the declaration. Editing it on the guest is
+# drift and will be reverted on the next run of configure/site.yml.
+{% for port in apache_listen_ports %}
+Listen {{ port }}
+{% endfor %}
