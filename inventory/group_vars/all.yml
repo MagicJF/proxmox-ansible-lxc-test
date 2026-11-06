@@ -1,5 +1,5 @@
 # ============================================================================
-# Desired state of every container this repository manages.
+# Desired state of every guest this repository manages.
 #
 # This is the only file that changes when a change is requested: edit it, open a
 # branch, run preflight -> apply. The playbooks under playbooks/ are a fixed
@@ -15,6 +15,25 @@
 # ============================================================================
 
 pve_node: Proxmox
+
+# ============================================================================
+# The automation key every guest is born with — a framework default, not a
+# per-guest decision.
+#
+# PVE's LXC `pubkey` parameter writes this public key into the guest's
+# /root/.ssh/authorized_keys AT CREATION. It is a birth-time property: the
+# module never forwards it on update, so layer 1 can set it and cannot re-read
+# it afterwards, and layer 2 (configure/) is what verifies it from the inside.
+#
+# The single source of truth is the key FILE, not a copy of its text:
+#   pve_ssh_pubkey_path -> the .pub next to the private key used by configure/
+# If the file is absent the lookup yields nothing and no key is injected, so a
+# clone of this repository without the key still runs (it just has no SSH
+# automation until the path is provided).
+#
+# Opting a single guest out is explicit: declare `pubkey: ""` on that guest.
+# ============================================================================
+pve_ssh_pubkey_path: "/home/hermes/.hermes/profiles/hermione/secrets/pve-automation_ed25519.pub"
 
 pve_defaults:
   # ---- creation-time: PVE cannot change these on an existing container ------
@@ -61,13 +80,8 @@ pve_defaults:
   mounts: {}
   mount_devices: []
 
-  # ---- creation-time only: not forwarded on update, never automated -------
-  # pubkey: the automation public key. PVE writes it into the container's
-  # /root/.ssh/authorized_keys AT CREATION, and it is not forwarded on update,
-  # so layer 1 can only set it at birth and cannot verify it afterwards. Layer 2
-  # (configure/) is what verifies it from the inside. That asymmetry is the
-  # clearest example of why there are two layers.
-  pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAP7yfAtQg77BdekmSLuPjAZCXRZTFZRBW1LZdv9DXK9 hermes-ansible-automation"
+  # ---- the key at birth (see pve_ssh_pubkey_path above) --------------------
+  pubkey: "{{ lookup('file', pve_ssh_pubkey_path, errors='ignore') | default('', true) | trim }}"
   # password: creation-time secret, which would have to live in Git — not
   #           declared; inject it from a vault at creation time if ever needed.
   # clone / clone_type: alternative creation path, unused here.
@@ -80,16 +94,9 @@ pve_defaults:
 # vmid + hostname are identity; changing them means "recreate".
 # Any key of pve_defaults may be overridden per container.
 pve_containers:
-  - vmid: 102
-    hostname: test-from-ansible
-    cores: 2
-
-  - vmid: 103
-    hostname: 3cores
-    cores: 3
-
   # Observability test container: every attribute below is randomly generated
-  # and overrides the defaults. Delete this entry and run apply to remove it.
+  # and overrides the defaults. It also proves the key-at-birth default: it was
+  # created by this engine, so it has /root/.ssh/authorized_keys already.
   - vmid: 167
     hostname: ct-forge-5f2a
     rootfs_size: 7
@@ -111,50 +118,6 @@ pve_containers:
       net0: "name=eth0,bridge=vmbr0,ip=dhcp"
     mounts:
       mp0: "local:5,mp=/mnt/data"
-
-  # Layer 2 demonstration target: the same shape the community-scripts Caddy
-  # script would give you (1 vCPU / 512 MiB / 6 GiB), but created by layer 1 with
-  # the automation key injected at birth — so layer 2 (configure/) has real SSH
-  # access with no manual step anywhere.
-  - vmid: 121
-    hostname: caddy-lab
-    cores: 1
-    memory: 512
-    rootfs_size: 6
-    swap: 512
-    status: started
-    tags: [caddy, lab]
-    description: "Caddy host: shape owned by layer 1, configuration owned by layer 2 (configure/)."
-    netif:
-      # The address lives here and only here: configure/ derives the SSH target
-      # from it with the pve_declared_ipv4 filter.
-      net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.21/24,ip6=auto"
-
-    # ---- layer 2 (configure/). Layer 1 ignores both keys. ------------------
-    # manage: true is the deliberate switch that lets layer 2 CONVERGE this guest
-    # instead of merely auditing it.
-    manage: true
-    config:
-      caddy:
-        sites:
-          # The declared body is what the external verification asserts: the
-          # proof is an HTTP response, not a task exit status.
-          - address: ":80"
-            respond: "hola desde la capa 2 - caddy-lab"
-            expect_body: "hola desde la capa 2 - caddy-lab"
-          - address: ":8080"
-            root: /srv/www
-            file_server: true
-            encode: [gzip, zstd]
-            index_html: "contenido declarado en group_vars para /srv/www"
-            expect_body: "contenido declarado en group_vars"
-
-        timers:
-          - name: caddy-validate
-            description: Parse /etc/caddy/Caddyfile daily and fail loudly if it does not
-            on_calendar: "daily"
-            exec_start: "/usr/bin/caddy validate --config /etc/caddy/Caddyfile"
-
 
 # ============================================================================
 # QEMU VMs — same declarative rules as the containers, with one important
@@ -190,6 +153,24 @@ pve_vm_defaults:
   ide: {}
   virtio: {}
 
+  # ---- the key at birth, for cloud-init capable images -----------------
+  # A container gets its key through `pubkey`; a VM has no equivalent, so the
+  # framework uses the same key through cloud-init: a cloud-init drive plus
+  # `ciuser`/`sshkeys`. Both are creation-time (the drive is an `ide2` disk,
+  # which proxmox_kvm refuses to update).
+  #
+  # It is ON by default because every VM this framework creates should be born
+  # reachable, and OFF for an image that does not run cloud-init — the Proxmox
+  # VE installer ISO, for instance, would never read it. Declaring
+  # `cloudinit: false` on such a guest is the explicit opt-out.
+  cloudinit: true
+  cloudinit_storage: local-zfs
+  ciuser: root
+  sshkeys: "{{ pve_defaults.pubkey }}"
+  # ipconfig0/config0 would move the VM's addressing into cloud-init; the
+  # framework keeps addressing where it already lives (the `net` value) to have
+  # one home for it.
+
 # The VMs this repository manages — and nothing else.
 pve_vms:
   - vmid: 120
@@ -198,6 +179,9 @@ pve_vms:
     memory: 4096
     # Boots the Proxmox VE installer from the ISO already on the node.
     status: started
+    # Opt-out, and the reason the default had to be overridable: the installer
+    # ISO does not run cloud-init, so a cloud-init drive would be dead weight.
+    cloudinit: false
     net:
       # vmbr1 is the internal LAN (10.10.10.0/24) where every other lab guest
       # lives. vmbr0 is the PUBLIC bridge (54.36.168.83/24 on eno3): do not put

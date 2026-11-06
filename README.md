@@ -8,9 +8,10 @@ Declarative IaC for the LXC containers and QEMU VMs on Proxmox VE, driven entire
 inventory/group_vars/all.yml          # THE desired state — the only file that changes per request
 playbooks/preflight.yml               # read-only: platform checks + declared-vs-live report
 playbooks/apply.yml                   # converges every declared container, then verifies via the API
-playbooks/vars/state.yml              # engine: declared-vs-live translation and normalisation
+playbooks/pve_engine.j2               # engine: declared-vs-live analysis, as Jinja macros
+playbooks/tools/pve_read.py           # engine: reads every guest + platform facts in ONE process
 playbooks/tracing/sitecustomize.py    # engine: journals every PVE HTTP call
-filter_plugins/pve.py                 # engine: filters shared by both layers (wired in ansible.cfg)
+filter_plugins/pve.py                 # engine: canonicalisation filters used by the macros
 configure/audit.yml                   # layer 2: read-only inspection of a guest, changes nothing
 configure/site.yml                    # layer 2: converges the inside of managed guests over SSH
 configure/tasks/                      # layer 2: shared target building + access policy
@@ -179,18 +180,51 @@ Adding another application means another role under `configure/roles/` and anoth
 
 Scripts like `community-scripts.org`'s run on the **PVE host as root**, drive `pct create` and then `pct exec` into the guest, and their "update" path is `apt upgrade` plus a GitHub release fetch. They are imperatives with no declared state: nothing to diff, nothing to verify, and they need the host shell this repository deliberately avoids. If one is ever used, run it once by hand and let layer 2 take over the inside afterwards — never both at once, or they fight over the same files.
 
+## The key at birth, by default
+
+Every guest this engine creates is born with the automation key already in place, with no
+manual step anywhere:
+
+- **Containers** use PVE's LXC `pubkey` parameter. It is a *birth-time* property: PVE writes it
+  into `/root/.ssh/authorized_keys` at creation and the module never forwards it on update, so
+  layer 1 can set it and layer 2 (`configure/`) is what verifies it from the inside.
+- **VMs** have no equivalent, so the same key travels through cloud-init: `ciuser` plus
+  `sshkeys` and a cloud-init drive (`<storage>:cloudinit`). It is on by default
+  (`pve_vm_defaults.cloudinit: true`) and off per guest for an image that does not run
+  cloud-init — the Proxmox VE installer ISO, for instance, which is why VMID 120 declares
+  `cloudinit: false`.
+
+The single source of the key is the key FILE, not a copy of its text: `pve_ssh_pubkey_path`
+points at the `.pub` next to the private key `configure/` uses, and `pve_defaults.pubkey` is a
+`lookup('file', ...)` of it. A guest opts out with `pubkey: ""`.
+
+Verified end to end: a guest created by `apply` answered over SSH as root on the first attempt,
+with the `# --- BEGIN PVE ---` marker and the automation key in `authorized_keys`.
+
 ## Performance and how to iterate fast
 
 Measured on the lab control node (a container on the PVE host itself, 4 vCPU, no CPU quota):
 
 | Measurement | Result |
 |---|---|
-| `apply` with nothing to change | **219 s** for ~26 executed tasks |
 | PVE API per call, via `python-requests` | **15-80 ms** |
-| All 12 API reads of every declared guest, in **one** Python process | **0.34 s** |
-| Those same 12 reads spread across 12 Ansible tasks | ~48 s of pure overhead |
+| All API reads of every declared guest, in **one** Python process | **0.34 s** |
+| Those same reads spread across one Ansible task per guest | ~48 s of pure overhead |
 | `ansible --version` (start-up alone) | 3.9 s |
 | Marginal cost per task (measured from 1 to 8 tasks) | ~3 s/task + ~9 s fixed |
+| `apply` before consolidation, nothing to change | 219 s |
+| **`apply` now, nothing to change** | **41 s** |
+| **`preflight` now** | **30 s** |
+| `apply` creating a guest end to end | 105 s |
+
+How it was done, without dropping a single check: **the execution boundaries were removed, not
+the verification.** One reader process (`tools/pve_read.py`) performs every guest read *and*
+every platform prerequisite (node online, storage active, template present, ISO present) that
+used to cost a task each. One templating pass (`pve_engine.j2` macros) analyses all guests,
+replacing the per-guest `set_fact` loop that cost a module execution per guest. Journal markers
+and the git revision moved into the reader. The last two runs' numbers came out of the same
+suite of checks: the platform prerequisites, the creation-time refusal, the declared-vs-live
+comparison and the independent re-read verification are all still there.
 
 A single Ansible module execution costs seconds here, so **the runtime is the number of module
 executions, not the size of the work**. Every `loop` iteration is one execution, which is why a
@@ -218,16 +252,22 @@ Two measurement traps, both hit for real while building this:
 - **A run is not "faster" if its outcome changed.** A 104 s → 32 s improvement turned out to be
   a run that aborted early (`failed=1`) because its target guest had been deleted. A speed-up is
   only a speed-up when the work done and the result are identical.
+- **A Jinja `{% %}` block produces TEXT, a single `{{ }}` expression keeps its type.** Task vars
+  built with `{% set %}`/`{% for %}` come back as strings, so `| length` counts characters and an
+  assert comparing a list with `0` never passes. Build *lists* for assertions from one `{{ }}`
+  expression and *messages* from the text blocks.
+- **`for k, v in x | dict2items` is wrong.** `dict2items` yields items, so that unpacks the
+  item's own `key`/`value` names and `v` becomes the string `"value"`. Use `x.items()`.
 
 ## How the engine behaves
 
-Both playbooks build an effective spec per container as `pve_defaults | combine(entry)`, analyse each container against a fresh API read, and loop with `loop_control.index_var` to correlate every task with its own API result.
+Both playbooks build an effective spec per guest as `pve_defaults | combine(entry)`, read every guest and the platform facts in one process, and analyse the whole set in a single templating pass (`pve_engine.j2`), so no task has to be correlated with an API result by index any more.
 
 **preflight.yml** (read-only) asserts the node is online and, per container, that its rootfs storage is active and its template is present; then prints `declared=… live=…`, what would be written, what would be deleted, the power transition and any creation-time drift, each container marked `IN SYNC` or `DRIFT`.
 
 **apply.yml** refuses creation-time drift, creates the containers that do not exist, converges only the settings that actually differ, converges the power state, then re-reads every container and re-derives the whole comparison from that fresh read. A task exit status is not accepted as proof.
 
-Normalisation is the subtle part (`playbooks/vars/state.yml`), because PVE does not store values verbatim:
+Normalisation is the subtle part (`playbooks/pve_engine.j2`), because PVE does not store values verbatim:
 
 | What PVE does | How the engine handles it |
 | --- | --- |

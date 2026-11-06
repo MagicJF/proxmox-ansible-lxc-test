@@ -1,12 +1,29 @@
 ---
-- name: Converge every container declared in inventory/group_vars/all.yml
+# ===========================================================================
+# apply.yml — the convergent verb.
+#
+# Why the run is shaped this way (measured on the lab control node):
+#   1. ONE process reads every declared guest (tools/pve_read.py). Each Ansible
+#      task costs ~3 s of module overhead while a PVE API call costs 15-80 ms,
+#      so reading the guests in one task per guest cost ~48 s for ~0.3 s of
+#      actual work.
+#   2. ONE templating pass analyses all of them (pve_engine.j2 macros), instead
+#      of a set_fact loop that cost a module execution per guest.
+#   3. Only guests that actually drifted get a mutation task.
+#   4. Verification re-reads everything in one process and re-analyses it in one
+#      pass: a task exit status is not proof that PVE stored what was declared.
+#
+# The checks were never the cost — validate/report/assert inside a task are
+# free. The number of execution boundaries was. So no check was removed.
+# ===========================================================================
+- name: Converge every guest declared in inventory/group_vars/all.yml
   hosts: localhost
   gather_facts: false
-  vars_files:
-    - vars/state.yml
   vars:
     # Credentials. When playbooks/vars/secrets.yml exists its hardcoded values
-    # win (load_vars in pre_tasks); otherwise these environment fallbacks apply.
+    # win (loaded in pre_tasks); otherwise these environment fallbacks apply.
+    # The reader tool resolves its own credentials from the same file, so the
+    # token never travels through an Ansible argument or task environment.
     pve_api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
     pve_api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
     pve_api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
@@ -28,15 +45,19 @@
     # to a machine-readable journal of the real PVE API traffic.
     pve_log_dir: "{{ playbook_dir }}/../logs"
     pve_journal: "{{ playbook_dir }}/../logs/pve-api.jsonl"
+    pve_tool: "{{ playbook_dir }}/tools/pve_read.py"
+    pve_manifest: "{{ playbook_dir }}/../inventory/group_vars/all.yml"
+    pve_secrets: "{{ playbook_dir }}/vars/secrets.yml"
   # Arming the tracer: PYTHONPATH makes CPython import playbooks/tracing/sitecustomize.py
-  # in every module process, which then journals each HTTP call to PVE.
+  # in every module process, which then journals each HTTP call to PVE. The
+  # reader tool inherits it too, so its reads land in the journal as well.
   environment:
     PYTHONPATH: "{{ playbook_dir }}/tracing"
     PVE_HTTP_TRACE: "{{ pve_log_dir }}/pve-api.jsonl"
   pre_tasks:
     - name: Look for the local credentials file
       ansible.builtin.stat:
-        path: "{{ playbook_dir }}/vars/secrets.yml"
+        path: "{{ pve_secrets }}"
       register: pve_secrets_file
 
     - name: Load the hardcoded local credentials when present (gitignored)
@@ -52,96 +73,107 @@
           No changes were made.
       when: ansible_check_mode
 
-    - name: Read the repository revision for the run header
-      ansible.builtin.command:
-        cmd: git rev-parse --short HEAD
-        chdir: "{{ playbook_dir }}/.."
-      register: pve_rev
-      changed_when: false
-      failed_when: false
-
-    - name: Mark the start of this run in the API journal
-      ansible.builtin.lineinfile:
-        path: "{{ pve_journal }}"
-        line: "{{ run_start | to_json }}"
-        create: true
-        mode: "0600"
-      vars:
-        run_start:
-          ts: "{{ '%Y-%m-%dT%H:%M:%S%z' | strftime }}"
-          event: run_start
-          playbook: "{{ ansible_play_name }}"
-          revision: "{{ pve_rev.stdout | default('unknown', true) }}"
-          containers: "{{ pve_containers | map(attribute='vmid') | list }}"
-      changed_when: false
-
-    - name: Remember the journal size so this run can prove it was traced
-      ansible.builtin.stat:
-        path: "{{ pve_journal }}"
-      register: pve_journal_start
-
   tasks:
-    - name: Build the effective spec of every declared container
-      ansible.builtin.set_fact:
-        pve_cts: "{{ (pve_cts | default([])) + [pve_defaults | combine(item)] }}"
-      loop: "{{ pve_containers }}"
-      loop_control:
-        label: "VMID {{ item.vmid }}"
+    # ---- read everything, once -------------------------------------------
+    - name: Read every declared guest (one process, one task)
+      ansible.builtin.command:
+        cmd: >-
+          python3 {{ pve_tool }}
+          --manifest {{ pve_manifest }}
+          --secrets {{ pve_secrets }}
+          --journal {{ pve_journal }}
+          --playbook '{{ ansible_play_name }}'
+          --phase read
+      register: pve_read_before
+      changed_when: false
 
-    - name: Reject a power state the module cannot converge to
+    - name: Build the effective spec of every guest and keep the live read
+      ansible.builtin.set_fact:
+        pve_cts: >-
+          {% set out = [] %}{% for i in pve_containers %}{% set _ = out.append(pve_defaults | combine(i)) %}{% endfor %}{{ out }}
+        pve_vm_specs: >-
+          {% set out = [] %}{% for i in pve_vms %}{% set _ = out.append(pve_vm_defaults | combine(i)) %}{% endfor %}{{ out }}
+        pve_read_meta: "{{ pve_read_before.stdout | from_json }}"
+        pve_live_before: "{{ (pve_read_before.stdout | from_json).guests }}"
+
+    # ---- analyse everything, once ----------------------------------------
+    - name: Analyse every declared guest in one templating pass
+      ansible.builtin.set_fact:
+        pve_plan: "{% import 'pve_engine.j2' as e %}{{ e.plan(pve_cts, pve_vm_specs, pve_live_before) | from_json }}"
+
+    - name: What the declared state means for each guest right now
+      ansible.builtin.debug:
+        msg: >-
+          {% for vmid, p in pve_plan.items() %}
+          {{ vmid }}: {{ 'IN SYNC' if p.in_sync else 'DRIFT' }}
+          {{ '| exists' if p.exists else '| absent (would be created)' }}
+          {{ '| set ' ~ (p.to_set | join(',')) if p.to_set | length > 0 else '' }}
+          {{ '| delete ' ~ (p.to_delete | join(',')) if p.to_delete | length > 0 else '' }}
+          {{ '| mismatch ' ~ (p.mismatched | join(',')) if p.mismatched | length > 0 else '' }}
+          {{ '| creation-time ' ~ (p.creation_time_drift | join(',')) if p.exists and p.creation_time_drift | length > 0 else '' }}
+          {{ '| power ' ~ p.status ~ ' -> ' ~ p.status_expected if p.power_drift else '' }}
+          {% endfor %}
+      changed_when: false
+
+    # One assert for the whole plan: the per-guest loops that used to do this
+    # were correct but cost a module execution per guest.
+    - name: Refuse a plan PVE could not apply
       ansible.builtin.assert:
         that:
-          - ct.status in ['started', 'stopped']
-        fail_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): status must be 'started' or 'stopped', not '{{ ct.status }}'."
-      loop: "{{ pve_cts }}"
-      loop_control: *pve_loop
-      run_once: false
-
-    - name: Read every declared container through the API
-      community.proxmox.proxmox_vm_info:
-        <<: *pve_auth
-        vmid: "{{ ct.vmid }}"
-        type: lxc
-        config: current
-      loop: "{{ pve_cts }}"
-      loop_control: *pve_loop
-      register: live_cts
-      no_log: true
-
-    - name: Analyse every declared container against its live state
-      ansible.builtin.set_fact:
-        pve_eval: "{{ pve_eval | default({}) | combine({ (ct.vmid | string): analysis }) }}"
-      vars:
-        vm: "{{ live_cts.results[idx].proxmox_vms | first | default({}, true) }}"
-        live: "{{ vm.config | default({}, true) }}"
-        live_status: "{{ vm.status | default('', true) }}"
-        analysis: "{{ pve_analysis }}"
-        # feed the shared difference engine with the container mapping
-        declared_norm: "{{ pve_lxc_declared_norm }}"
-        actual_norm: "{{ pve_lxc_actual_norm }}"
-        pve_undeclared_child_keys: "{{ pve_lxc_undeclared_child_keys }}"
-        pve_creation_time_drift: "{{ pve_lxc_creation_time_drift }}"
-      loop: "{{ pve_cts }}"
-      loop_control: *pve_loop
-
-    # Creation-time properties cannot be converged in place. Fail loudly for that
-    # container rather than reporting a success the API never applied.
-    - name: Refuse to converge properties PVE cannot change on an existing container
-      ansible.builtin.assert:
-        that:
-          - a.creation_time_drift | length == 0
+          - pve_read_meta.errors | length == 0
+          - pve_read_meta.platform.node_online
+          - inactive_storages | length == 0
+          - missing_templates | length == 0
+          - missing_isos | length == 0
+          - bad_status | length == 0
+          - bad_creation | length == 0
         fail_msg: >-
-          {{ ct.hostname }} (VMID {{ ct.vmid }}):
-          {{ a.creation_time_drift | join(', ') }} differs from the live container. PVE cannot apply
-          it in place and growing a rootfs is irreversible, so this container is left untouched.
-          Recreate it deliberately or revert the value.
-        success_msg: "{{ ct.hostname }} (VMID {{ ct.vmid }}): creation-time properties match."
+          {{ bad_status_text }}{{ ' | ' if bad_status | length > 0 else '' }}{{ creation_text }}
+          {{ platform_text }}
+          {{ ' | read errors: ' ~ (pve_read_meta.errors | to_json) if pve_read_meta.errors | length > 0 else '' }}
+        success_msg: "Every declared guest is readable and declarable, and the platform satisfies it."
       vars:
-        a: "{{ pve_eval[ct.vmid | string] }}"
-      loop: "{{ pve_cts }}"
-      loop_control: *pve_loop
-      when: a.exists
+        # LIST vars are single {{ }} expressions on purpose: a multi-line {% %}
+        # block renders as concatenated TEXT (a str), so `| length` would count
+        # characters and the assert would compare a string with 0. Only a single
+        # expression keeps the native list type.
+        bad_status: >-
+          {{ (pve_cts + pve_vm_specs) | selectattr('status', 'defined') | map(attribute='status')
+             | map('string') | reject('in', ['started', 'stopped']) | list }}
+        bad_creation: >-
+          {{ pve_plan | dict2items | selectattr('value.exists')
+             | selectattr('value.creation_time_drift') | map(attribute='key') | list }}
+        inactive_storages: >-
+          {{ pve_read_meta.platform.storages_active | dict2items | selectattr('value', 'eq', false)
+             | map(attribute='key') | list }}
+        missing_templates: >-
+          {{ pve_read_meta.platform.templates_present | dict2items | selectattr('value', 'eq', false)
+             | map(attribute='key') | list }}
+        missing_isos: >-
+          {{ pve_read_meta.platform.isos_present | dict2items | selectattr('value', 'eq', false)
+             | map(attribute='key') | list }}
+        # TEXT vars for the message: a str is exactly what fail_msg wants.
+        bad_status_text: >-
+          {%- set out = [] -%}
+          {%- for g in (pve_cts + pve_vm_specs) if (g.status | string) not in ['started', 'stopped'] -%}
+          {%- set _ = out.append((g.hostname | default(g.name)) ~ ' (VMID ' ~ g.vmid ~ '): status must be started or stopped, not ' ~ g.status) -%}
+          {%- endfor -%}
+          {{- out | join('; ') -}}
+        creation_text: >-
+          {%- set out = [] -%}
+          {%- for vmid, p in pve_plan.items() if p.exists and p.creation_time_drift | length > 0 -%}
+          {%- set _ = out.append('VMID ' ~ vmid ~ ': ' ~ (p.creation_time_drift | join(', ')) ~ ' cannot be applied in place (creation-time property)') -%}
+          {%- endfor -%}
+          {{- out | join('; ') -}}
+        platform_text: >-
+          {%- set out = [] -%}
+          {%- if not pve_read_meta.platform.node_online -%}{%- set _ = out.append('node ' ~ pve_node ~ ' is not online') -%}{%- endif -%}
+          {%- for k, v in pve_read_meta.platform.storages_active.items() | list if not v -%}{%- set _ = out.append('inactive storage: ' ~ k) -%}{%- endfor -%}
+          {%- for k, v in pve_read_meta.platform.templates_present.items() | list if not v -%}{%- set _ = out.append('missing template: ' ~ k) -%}{%- endfor -%}
+          {%- for k, v in pve_read_meta.platform.isos_present.items() | list if not v -%}{%- set _ = out.append('missing ISO: ' ~ k) -%}{%- endfor -%}
+          {{- out | join('; ') -}}
 
+    # ---- mutate, only what drifted ---------------------------------------
     - name: Create the containers that do not exist yet
       community.proxmox.proxmox:
         <<: *pve_auth
@@ -158,9 +190,10 @@
         cpuunits: "{{ ct.cpuunits }}"
         unprivileged: "{{ ct.unprivileged | bool }}"
         onboot: "{{ ct.onboot | bool }}"
-        # Birth-time only: PVE injects this into /root/.ssh/authorized_keys at
-        # creation and the module never forwards it on update.
-        pubkey: "{{ ct.pubkey | default(omit, true) }}"
+        # The key at birth, declared once in pve_defaults and derived from the
+        # key file. PVE writes it into /root/.ssh/authorized_keys at creation
+        # and the module never forwards it on update.
+        pubkey: "{{ ct.pubkey if (ct.pubkey | default('', true) | length > 0) else omit }}"
         cmode: "{{ ct.cmode | default(omit, true) }}"
         timezone: "{{ ct.timezone | default(omit, true) }}"
         description: "{{ ct.description | default(omit, true) }}"
@@ -179,7 +212,7 @@
       loop_control: *pve_loop
       register: create_result
       no_log: true
-      when: not (pve_eval[ct.vmid | string].exists)
+      when: not (pve_plan[ct.vmid | string].exists)
 
     # Only the keys that actually drifted are sent: the module PUTs every
     # parameter it receives, not just the ones it found different.
@@ -211,7 +244,7 @@
         update: true
         state: present
       vars:
-        a: "{{ pve_eval[ct.vmid | string] }}"
+        a: "{{ pve_plan[ct.vmid | string] }}"
       loop: "{{ pve_cts }}"
       loop_control: *pve_loop
       register: converge_result
@@ -229,128 +262,9 @@
       loop_control: *pve_loop
       register: power_result
       no_log: true
-      when: pve_eval[ct.vmid | string].power_drift
+      when: pve_plan[ct.vmid | string].power_drift
 
-    - name: Report what this run changed
-      ansible.builtin.debug:
-        msg: >-
-          {{ ct.hostname }} (VMID {{ ct.vmid }}): set {{ a.to_set | join(', ') or '-' }},
-          delete {{ a.to_delete | join(', ') or '-' }},
-          power {{ a.status or '(none)' }} -> {{ a.status_expected }}
-      vars:
-        a: "{{ pve_eval[ct.vmid | string] }}"
-      changed_when: false
-      loop: "{{ pve_cts }}"
-      loop_control: *pve_loop
-
-    - name: Re-read every declared container through the API
-      community.proxmox.proxmox_vm_info:
-        <<: *pve_auth
-        vmid: "{{ ct.vmid }}"
-        type: lxc
-        config: current
-      loop: "{{ pve_cts }}"
-      loop_control: *pve_loop
-      register: applied_cts
-      no_log: true
-
-    - name: Re-analyse every container from the fresh API read
-      ansible.builtin.set_fact:
-        pve_after: "{{ pve_after | default({}) | combine({ (ct.vmid | string): analysis }) }}"
-      vars:
-        vm: "{{ applied_cts.results[idx].proxmox_vms | first | default({}, true) }}"
-        live: "{{ vm.config | default({}, true) }}"
-        live_status: "{{ vm.status | default('', true) }}"
-        analysis: "{{ pve_analysis }}"
-        # feed the shared difference engine with the container mapping
-        declared_norm: "{{ pve_lxc_declared_norm }}"
-        actual_norm: "{{ pve_lxc_actual_norm }}"
-        pve_undeclared_child_keys: "{{ pve_lxc_undeclared_child_keys }}"
-        pve_creation_time_drift: "{{ pve_lxc_creation_time_drift }}"
-      loop: "{{ pve_cts }}"
-      loop_control: *pve_loop
-
-    # The verification re-derives everything from a fresh API read: a task exit
-    # status is not proof that PVE stored what was declared.
-    - name: Verify every container matches the declared state
-      ansible.builtin.assert:
-        that:
-          - b.exists
-          - b.mismatched | length == 0
-          - b.forbidden_present | length == 0
-          - b.creation_time_drift | length == 0
-          - not b.power_drift
-        fail_msg: >-
-          {{ ct.hostname }} (VMID {{ ct.vmid }}) does not match inventory/group_vars/all.yml after
-          apply: mismatched={{ b.declared_subset | to_json }} vs live={{ b.actual_subset | to_json }},
-          still present but declared absent={{ b.forbidden_present | join(', ') or '-' }},
-          creation-time drift={{ b.creation_time_drift | join(', ') or '-' }},
-          status {{ b.status }} vs declared {{ b.status_expected }}.
-        success_msg: >-
-          Verified {{ ct.hostname }} (VMID {{ ct.vmid }}): {{ ct.cores }} vCPU, {{ ct.memory }} MiB RAM,
-          {{ ct.swap }} MiB swap, cpuunits {{ ct.cpuunits }}, {{ b.status }},
-          rootfs {{ ct.rootfs_size }} GiB on {{ ct.storage }}, and every declared setting matches.
-      vars:
-        b: "{{ pve_after[ct.vmid | string] }}"
-      loop: "{{ pve_cts }}"
-      loop_control: *pve_loop
-
-    # =======================================================================
-    # QEMU VMs — same two verbs as for containers, with the VM mapping from
-    # playbooks/vars/state.yml. The module refuses to update net/scsi/ide/sata/
-    # virtio, so those are creation-time here: drift in them is refused.
-    # =======================================================================
-
-    - name: Build the effective spec of every declared VM
-      ansible.builtin.set_fact:
-        pve_vm_specs: "{{ (pve_vm_specs | default([])) + [pve_vm_defaults | combine(item)] }}"
-      loop: "{{ pve_vms }}"
-      loop_control:
-        label: "VMID {{ item.vmid }}"
-
-    - name: Read every declared VM through the API
-      community.proxmox.proxmox_vm_info:
-        <<: *pve_auth
-        vmid: "{{ ct.vmid }}"
-        type: qemu
-        config: current
-      loop: "{{ pve_vm_specs }}"
-      loop_control: *pve_loop
-      register: live_vms
-      no_log: true
-
-    - name: Analyse every declared VM against its live state
-      ansible.builtin.set_fact:
-        pve_vm_eval: "{{ pve_vm_eval | default({}) | combine({ (ct.vmid | string): analysis }) }}"
-      vars:
-        ga: "{{ live_vms.results[idx].proxmox_vms | first | default({}, true) }}"
-        live: "{{ ga.config | default({}, true) }}"
-        live_status: "{{ ga.status | default('', true) }}"
-        analysis: "{{ pve_analysis }}"
-        # feed the shared difference engine with the VM mapping
-        declared_norm: "{{ pve_vm_declared_norm }}"
-        actual_norm: "{{ pve_vm_actual_norm }}"
-        pve_undeclared_child_keys: "{{ pve_vm_undeclared_child_keys }}"
-        pve_creation_time_drift: "{{ pve_vm_creation_time_drift }}"
-      loop: "{{ pve_vm_specs }}"
-      loop_control: *pve_loop
-
-    - name: Refuse to converge VM properties PVE cannot change on a running VM definition
-      ansible.builtin.assert:
-        that:
-          - a.creation_time_drift | length == 0
-        fail_msg: >-
-          {{ ct.name }} (VMID {{ ct.vmid }}): {{ a.creation_time_drift | join(', ') }} differs from
-          the live VM. proxmox_kvm refuses to update net/scsi/ide/sata/virtio (it can regenerate a
-          MAC or recreate a disk) and bios/machine/scsihw/ostype are creation-time, so this VM is
-          left untouched. Recreate it deliberately or revert the value.
-        success_msg: "{{ ct.name }} (VMID {{ ct.vmid }}): creation-time properties match."
-      vars:
-        a: "{{ pve_vm_eval[ct.vmid | string] }}"
-      loop: "{{ pve_vm_specs }}"
-      loop_control: *pve_loop
-      when: a.exists
-
+    # ---- the same for VMs -------------------------------------------------
     - name: Create the VMs that do not exist yet
       community.proxmox.proxmox_kvm:
         <<: *pve_auth
@@ -373,17 +287,24 @@
         kvm: true
         net: "{{ ct.net }}"
         scsi: "{{ ct.scsi }}"
-        ide: "{{ ct.ide }}"
+        # A VM has no `pubkey`; the key at birth travels through cloud-init: the
+        # same key as the containers (single source: pve_ssh_pubkey_path), plus
+        # the cloud-init drive and its user. The drive claims ide2, so a guest
+        # that declares cloudinit true must not use ide2 for anything else.
+        ide: >-
+          {{ ((ct.ide | default({}, true)) | combine({'ide2': ct.cloudinit_storage ~ ':cloudinit,format=qcow2'})
+              if (ct.cloudinit | bool) else (ct.ide if (ct.ide | default({}, true)) else omit)) }}
+        sshkeys: >-
+          {{ ct.sshkeys if (ct.cloudinit | bool) and ((ct.sshkeys | default('', true)) | length > 0) else omit }}
+        ciuser: "{{ ct.ciuser | default(omit, true) if (ct.cloudinit | bool) else omit }}"
         timeout: 300
         state: present
       loop: "{{ pve_vm_specs }}"
       loop_control: *pve_loop
       register: vm_create
       no_log: true
-      when: not (pve_vm_eval[ct.vmid | string].exists)
+      when: not (pve_plan[ct.vmid | string].exists)
 
-    # Only the properties proxmox_kvm is willing to update, and only the ones
-    # that actually drifted.
     - name: Converge the settings that drifted on the existing VMs
       community.proxmox.proxmox_kvm:
         <<: *pve_auth
@@ -403,7 +324,7 @@
         timeout: 300
         state: present
       vars:
-        a: "{{ pve_vm_eval[ct.vmid | string] }}"
+        a: "{{ pve_plan[ct.vmid | string] }}"
       loop: "{{ pve_vm_specs }}"
       loop_control: *pve_loop
       register: vm_converge
@@ -421,47 +342,28 @@
       loop_control: *pve_loop
       register: vm_power
       no_log: true
-      when: pve_vm_eval[ct.vmid | string].power_drift
+      when: pve_plan[ct.vmid | string].power_drift
 
-    - name: Report what this run changed on the VMs
-      ansible.builtin.debug:
-        msg: >-
-          {{ ct.name }} (VMID {{ ct.vmid }}): set {{ a.to_set | join(', ') or '-' }},
-          delete {{ a.to_delete | join(', ') or '-' }},
-          power {{ a.status or '(none)' }} -> {{ a.status_expected }}
-      vars:
-        a: "{{ pve_vm_eval[ct.vmid | string] }}"
+    # ---- verify from a fresh read, once ----------------------------------
+    - name: Re-read every declared guest (one process, one task)
+      ansible.builtin.command:
+        cmd: >-
+          python3 {{ pve_tool }}
+          --manifest {{ pve_manifest }}
+          --secrets {{ pve_secrets }}
+          --journal {{ pve_journal }}
+          --playbook '{{ ansible_play_name }}'
+          --phase verify
+      register: pve_read_after
       changed_when: false
-      loop: "{{ pve_vm_specs }}"
-      loop_control: *pve_loop
 
-    - name: Re-read every declared VM through the API
-      community.proxmox.proxmox_vm_info:
-        <<: *pve_auth
-        vmid: "{{ ct.vmid }}"
-        type: qemu
-        config: current
-      loop: "{{ pve_vm_specs }}"
-      loop_control: *pve_loop
-      register: applied_vms
-      no_log: true
-
-    - name: Re-analyse every VM from the fresh API read
+    - name: Re-analyse every guest from the fresh read
       ansible.builtin.set_fact:
-        pve_vm_after: "{{ pve_vm_after | default({}) | combine({ (ct.vmid | string): analysis }) }}"
-      vars:
-        ga: "{{ applied_vms.results[idx].proxmox_vms | first | default({}, true) }}"
-        live: "{{ ga.config | default({}, true) }}"
-        live_status: "{{ ga.status | default('', true) }}"
-        analysis: "{{ pve_analysis }}"
-        declared_norm: "{{ pve_vm_declared_norm }}"
-        actual_norm: "{{ pve_vm_actual_norm }}"
-        pve_undeclared_child_keys: "{{ pve_vm_undeclared_child_keys }}"
-        pve_creation_time_drift: "{{ pve_vm_creation_time_drift }}"
-      loop: "{{ pve_vm_specs }}"
-      loop_control: *pve_loop
+        pve_read_meta_after: "{{ pve_read_after.stdout | from_json }}"
+        pve_plan_after: >-
+          {% import 'pve_engine.j2' as e %}{{ e.plan(pve_cts, pve_vm_specs, (pve_read_after.stdout | from_json).guests) | from_json }}
 
-    - name: Verify every VM matches the declared state
+    - name: Verify every guest matches the declared state
       ansible.builtin.assert:
         that:
           - b.exists
@@ -470,48 +372,31 @@
           - b.creation_time_drift | length == 0
           - not b.power_drift
         fail_msg: >-
-          {{ ct.name }} (VMID {{ ct.vmid }}) does not match inventory/group_vars/all.yml after apply:
+          VMID {{ vmid }} does not match inventory/group_vars/all.yml after apply:
           mismatched={{ b.declared_subset | to_json }} vs live={{ b.actual_subset | to_json }},
           still present but declared absent={{ b.forbidden_present | join(', ') or '-' }},
           creation-time drift={{ b.creation_time_drift | join(', ') or '-' }},
           status {{ b.status }} vs declared {{ b.status_expected }}.
         success_msg: >-
-          Verified {{ ct.name }} (VMID {{ ct.vmid }}): {{ ct.cores }} vCPU x {{ ct.sockets }} socket,
-          {{ ct.memory }} MiB RAM, {{ b.status }}, boot {{ ct.boot }}, and every declared setting matches.
+          VMID {{ vmid }} verified: {{ b.status }}, every declared setting matches
+          ({{ b.mismatched | length }} differences).
       vars:
-        b: "{{ pve_vm_after[ct.vmid | string] }}"
-      loop: "{{ pve_vm_specs }}"
-      loop_control: *pve_loop
-
-    - name: Mark the end of this run in the API journal
-      ansible.builtin.lineinfile:
-        path: "{{ pve_journal }}"
-        line: "{{ run_end | to_json }}"
-        create: true
-        mode: "0600"
-      vars:
-        run_end:
-          ts: "{{ '%Y-%m-%dT%H:%M:%S%z' | strftime }}"
-          event: run_end
-          playbook: "{{ ansible_play_name }}"
-          verified: "{{ (pve_cts | map(attribute='vmid') | list) + (pve_vm_specs | map(attribute='vmid') | list) }}"
-      changed_when: false
+        b: "{{ item.value }}"
+        vmid: "{{ item.key }}"
+      loop: "{{ pve_plan_after | dict2items }}"
+      loop_control:
+        label: "VMID {{ item.key }}"
 
     # Observability is only real if it is checked: a trace that quietly stopped
     # working must fail the run, not produce empty logs.
-    - name: Fail loudly if this run left no API trace
-      ansible.builtin.stat:
-        path: "{{ pve_journal }}"
-      register: pve_journal_end
-
     - name: Assert this run was traced to the journal
       ansible.builtin.assert:
         that:
-          - pve_journal_end.stat.size | int > pve_journal_start.stat.size | int
+          - pve_read_meta_after.journal_size_after | int > pve_read_meta.journal_size_before | int
         fail_msg: >-
           {{ pve_journal }} did not grow during this run, so its PVE API traffic was NOT traced.
           Check that playbooks/tracing/sitecustomize.py exists and that PYTHONPATH points at it
           (play-level environment), then look for `tracer_error` lines in the journal.
         success_msg: >-
           API trace OK: the journal grew by
-          {{ (pve_journal_end.stat.size | int) - (pve_journal_start.stat.size | int) }} bytes.
+          {{ (pve_read_meta_after.journal_size_after | int) - (pve_read_meta.journal_size_before | int) }} bytes.
