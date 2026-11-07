@@ -28,6 +28,13 @@ LAB="$LAB;rt3 10.10.10.166 0 rt;boot 10.10.10.143 0 boot"
 GW_1=10.11.0.1; GW_2=10.12.0.1; GW_3=10.13.0.1   # la puerta de cada sede
 W_1_2=10.99.1.1; W_2_1=10.99.1.2                  # WAN 1: rt1 <-> rt2
 W_1_3=10.99.2.1; W_3_1=10.99.2.2                  # WAN 2: rt1 <-> rt3
+# El router de cada sede, por su dirección de GESTIÓN. Hace falta porque un
+# paquete dirigido a él tiene al propio router como primer y último salto: no
+# hay ningún salto intermedio que exigirle.
+RT_1=10.10.10.162; RT_2=10.10.10.164; RT_3=10.10.10.166
+
+rt_of() { case "$1" in 1) echo "$RT_1";; 2) echo "$RT_2";; 3) echo "$RT_3";; esac; }
+es_mi_puerta() { [ "$1" = "$MY_GW" ] || [ "$1" = "$(rt_of "$MY_SITE")" ]; }
 
 gw_of() { case "$1" in 1) echo "$GW_1";; 2) echo "$GW_2";; 3) echo "$GW_3";; esac; }
 
@@ -93,26 +100,36 @@ while read -r name ip site kind; do
   total=$((total + 1))
 
   exp=$(esperado "$MY_SITE" "$site")
+  # Si el destino es mi propia puerta —su LAN o su gestión— no hay salto previo
+  # que esperar: el traceroute la muestra a la vez como primer salto y destino.
+  es_mi_puerta "$ip" && exp=""
+
   raw=$(timeout 20 traceroute -n -q 1 -w 1 -m 8 "$ip" 2>/dev/null)
   got=$(echo "$raw" | awk 'NR>1 && $2!="*" && $2!="" {print $2}')
   got_flat=$(echo $got)
   last=$(echo "$got" | tail -1)
-  got_int=$(echo "$got" | awk 'NF{for(i=1;i<NF;i++) printf "%s ",$i}')
+  # `got` trae UNA DIRECCIÓN POR LÍNEA: hay que quitar la ÚLTIMA LÍNEA (el
+  # destino) para quedarse con los intermedios. Un `awk` sobre la lista entera
+  # ve NF=1 en cada línea y no recorta nada — devolvía siempre vacío.
+  got_int=$(echo "$got" | head -n -1 | tr '\n' ' ' | sed 's/ *$//')
 
   # 1 — alcance
   if [ "$last" = "$ip" ]; then reach=OK; ok_reach=$((ok_reach + 1)); else reach=NO; fi
 
-  # 2 — primer salto (sólo tiene sentido si el destino NO es de mi sede)
-  if [ "$site" = "$MY_SITE" ]; then
+  # 2 — primer salto (no aplica si el destino es de mi sede o es mi puerta)
+  if [ "$site" = "$MY_SITE" ] || es_mi_puerta "$ip"; then
     first="-"; exempt=$((exempt + 1))
-  elif [ "$(echo $got | head -1)" = "$MY_GW" ]; then
+  elif [ "$(echo $got | awk '{print $1}')" = "$MY_GW" ]; then
     first=OK; ok_first=$((ok_first + 1))
   else
     first=NO
   fi
 
-  # 3 — camino
-  if [ "$(echo $exp)" = "$(echo $got_int)" ]; then
+  # 3 — camino (sólo si el destino contestó: si no, el traceroute se corta y los
+  # saltos que faltan no son una discrepancia, son la consecuencia)
+  if [ "$reach" = "NO" ]; then
+    path="n/a"; det="sin respuesta ($got_flat)"
+  elif [ "$(echo $exp)" = "$(echo $got_int)" ]; then
     path="="; ok_path=$((ok_path + 1)); det="$got_flat"
   else
     path="DIF"; det="esp[$exp] obt[$got_flat]"
@@ -131,7 +148,7 @@ echo
 echo "--- RESUMEN $ME ---"
 printf '  alcance      : %d/%d destinos contestan\n' "$ok_reach" "$total"
 printf '  primer salto : %d/%d por mi puerta (%d en mi propia sede exentos)\n' "$ok_first" "$exigidos" "$exempt"
-printf '  camino       : %d/%d idéntico al predicho\n' "$ok_path" "$total"
+printf '  camino       : %d/%d de los que contestan\n' "$ok_path" "$ok_reach"
 for k in pc rt sw boot; do
   case "$k" in pc) lbl="workstations";; rt) lbl="routers     ";; sw) lbl="switches    ";; boot) lbl="bootstrap   ";; esac
   tot=$(printf '%s' "$por_tipo" | awk -v k="$k" '$1==k' | wc -l)
@@ -151,7 +168,7 @@ echo "  sí contestan porque tienen rutas a las tres sedes."
 echo
 echo "### PEGA ESTO ###"
 echo "ws=$ME ip=$MY_IP sede=$MY_SITE host=$MY_HOST gw=${DEF_GW:-ninguna}(esp $MY_GW)"
-echo "alcance=$ok_reach/$total primer_salto=$ok_first/$exigidos camino=$ok_path/$total"
+echo "alcance=$ok_reach/$total primer_salto=$ok_first/$exigidos camino=$ok_path/$ok_reach"
 for k in pc rt sw boot; do
   tot=$(printf '%s' "$por_tipo" | awk -v k="$k" '$1==k' | wc -l)
   oks=$(printf '%s' "$por_tipo" | awk -v k="$k" '$1==k && $2=="OK"' | wc -l)
