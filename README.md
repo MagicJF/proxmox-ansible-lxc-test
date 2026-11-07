@@ -103,6 +103,22 @@ Declared per container, inherited from `pve_defaults` unless overridden:
 
 **Absence is state.** A setting declared as `null`/empty must not exist in the container, and the engine deletes it if it is there. That is how a hand-added interface, mount or `features=` line gets reverted.
 
+### Adding and removing a guest
+
+Adding one is: write the entry, run `apply` (shape) and then `configure/site.yml` (inside). Removing one is **two steps in this order**, because the engine never destroys anything:
+
+1. **Un-declare it** — delete the whole entry from `pve_containers` (or `pve_vms`) on a branch, commit and push. The next `apply` stops managing it; the container itself keeps running, untouched.
+2. **Destroy it** deliberately — PVE UI → *More → Destroy*, `pct destroy <vmid>` on the host, or `ansible-playbook playbooks/remove.yml -e hostname=<name> -e confirm=<name>`. `remove.yml` refuses while the guest is still declared, which is exactly why the order is not a preference.
+
+Doing it the other way round is how a deleted guest comes back: destroy a guest that is still declared and the next `apply` recreates it.
+
+**Delete the whole entry, or none of it.** YAML keeps the *last* value of a duplicated key without saying so, so an entry whose identity lines were removed while its `manage:`/`config:` block stayed does not disappear — it silently attaches to the entry above and reconfigures **that** guest (a wiki guest inheriting an `apache:` block, say). Two guards make that a loud failure instead of a silent one:
+
+- the reader parses the declared state with a **duplicate-key-rejecting loader** and stops with the key and line number;
+- every entry must carry its identity (`vmid` plus `hostname`/`name`), or the run refuses.
+
+Never leave a guest entry commented out as a scratchpad: comment it out *entirely* or delete it, so the file never holds half an entry.
+
 ### Not declarable here
 
 These are deliberately out of the file, not forgotten:
