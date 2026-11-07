@@ -287,6 +287,10 @@
         machine: "{{ ct.machine }}"
         scsihw: "{{ ct.scsihw }}"
         vga: "{{ ct.vga }}"
+        # The VNC console's keymap. It is a property of the VM, not of the
+        # guest's OS, so a Spanish keyboard has to be declared here or every
+        # console session types the wrong characters.
+        keyboard: "{{ ct.keyboard | default(omit, true) }}"
         onboot: "{{ ct.onboot | bool }}"
         boot: "{{ ct.boot }}"
         description: "{{ ct.description | default(omit, true) }}"
@@ -327,6 +331,7 @@
         memory: "{{ ct.memory if 'memory' in a.to_set else omit }}"
         cpu: "{{ ct.cpu if 'cpu' in a.to_set else omit }}"
         vga: "{{ ct.vga if 'vga' in a.to_set else omit }}"
+        keyboard: "{{ ct.keyboard if 'keyboard' in a.to_set else omit }}"
         boot: "{{ ct.boot if 'boot' in a.to_set else omit }}"
         onboot: "{{ (ct.onboot | bool) if 'onboot' in a.to_set else omit }}"
         description: "{{ ct.description if 'description' in a.to_set else omit }}"
