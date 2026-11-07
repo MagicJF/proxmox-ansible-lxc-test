@@ -259,6 +259,74 @@ Two decisions worth knowing:
   in the manifest and the guest is expected to sit behind a network that is not
   public.
 
+### A worked example: the network lab (a router VM between two isolated segments)
+
+The point of this one is that the two containers reach each other **through a
+MikroTik CHR**, not through a Proxmox bridge. Three declarations do all of it:
+
+```yaml
+pve_bridges:                      # host segments, created through the API
+  - iface: vmbr2
+  - iface: vmbr3
+
+# in pve_vms
+  - vmid: 140
+    name: routeros-chr
+    machine: pc                   # the vendor image is i440fx-era, not q35
+    cloudinit: false
+    boot: "order=scsi0"
+    disk_import:                  # a vendor image has no size to declare
+      - key: scsi0
+        source: "local:import/chr-7.25.1.raw"
+    net:
+      net0: "virtio,bridge=vmbr1" # management LAN
+      net1: "virtio,bridge=vmbr2" # segment A
+      net2: "virtio,bridge=vmbr3" # segment B
+    address: 10.10.10.50          # a VM's address lives inside its own OS
+    config:
+      routeros:
+        identity: routeros-chr
+        dhcp_client: false
+        addresses:
+          - {address: "10.10.10.50/24", interface: ether1}
+          - {address: "10.20.1.1/24", interface: ether2}
+          - {address: "10.20.2.1/24", interface: ether3}
+
+# in pve_containers, one per segment
+  - vmid: 141
+    hostname: netlab-a
+    netif:
+      net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.51/24,ip6=auto"
+      net1: "name=eth1,bridge=vmbr2,ip=10.20.1.10/24"
+    config:
+      netlab:
+        routes:
+          - {to: "10.20.2.0/24", via: "10.20.1.1", dev: eth1}
+        peers: ["10.20.2.10"]
+```
+
+`apply` creates the two segments through the API (`POST` stages the change, `PUT`
+applies it), imports the image into the router's disk and grows it to the
+declared size, and creates all three guests. `configure/site.yml` installs the
+container's route as a systemd unit, drives the router through its own API, and
+then — in a **separate pass**, because the peer is not configured until every
+guest is — pings across: `netlab-a 10.20.1.10 <-> netlab-b 10.20.2.10`, 0% loss,
+through the CHR.
+
+Two facts from building it that are worth more than the topology:
+
+- **A VM on a bridge cannot take a DHCP lease from a server running on the host
+  or in a container.** The offer crosses the virtual link with an unresolved TX
+  checksum (veth offload) and the guest's kernel drops it, while a container
+  accepts the same frame — so the DHCP server was answering all along and the
+  router was the only one not listening. Declaring static addresses is the fix
+  this repo takes; the alternative is disabling TX offload on the sender.
+- **RouterOS is not a POSIX shell**, so the SSH path every other guest uses does
+  not apply. It speaks its own API on TCP/8728, and
+  `configure/tools/routeros_apply.py` drives it with nothing but the standard
+  library, the same way `playbooks/tools/pve_read.py` drives Proxmox — a
+  collection would put `librouteros` and `pip` on the control node.
+
 ### Why not the community-scripts installers
 
 Scripts like `community-scripts.org`'s run on the **PVE host as root**, drive `pct create` and then `pct exec` into the guest, and their "update" path is `apt upgrade` plus a GitHub release fetch. They are imperatives with no declared state: nothing to diff, nothing to verify, and they need the host shell this repository deliberately avoids. If one is ever used, run it once by hand and let layer 2 take over the inside afterwards — never both at once, or they fight over the same files.
