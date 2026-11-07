@@ -1,15 +1,11 @@
 ---
 # ===========================================================================
-# routeros — the inside of a MikroTik RouterOS guest.
+# routeros — converge the declared state of a MikroTik RouterOS guest over its
+# REST API. See the role's defaults for why REST and not the binary API.
 #
-# RouterOS is not a POSIX shell: SSH lands in its own CLI, so the SSH path every
-# other guest uses does not apply. It speaks its own API on TCP/8728, and
-# configure/tools/routeros_apply.py drives it — the same pattern as
-# playbooks/tools/pve_read.py (a small stdlib client instead of a collection
-# that would drag librouteros and pip onto the control node).
-#
-# The play that includes this role runs on the control node, so the tool talks
-# to the router's management address directly.
+# Every task below is ansible.builtin.uri. The router is addressed at
+# `ansible_host` (built from the `addresses` entry on ether1 in the manifest),
+# because the play that includes this role runs on the control node.
 # ===========================================================================
 - name: Refuse a RouterOS declaration without an identity or addresses
   ansible.builtin.assert:
@@ -24,76 +20,243 @@
       RouterOS declaration is well formed: identity {{ l2_config.routeros.identity }},
       {{ l2_config.routeros.addresses | length }} address(es).
 
-# The read is also the password probe: a CHR image ships with the factory-empty
-# password, so a failed read with a declared password means "set it now", not
-# "the router is broken".
-- name: Read the router's state with the declared password
-  ansible.builtin.command:
-    cmd: >-
-      python3 {{ routeros_tool }} --host {{ ansible_host }} --user {{ routeros_user }}
-      --password={{ routeros_password }} --phase read
-  register: routeros_read
-  changed_when: false
+# --- which password does this router answer to? ----------------------------
+# A CHR image ships with the factory-empty password. The probe is also the
+# handshake: if the declared password is refused but the factory one is not,
+# this is a router that has not been given its password yet, and this run both
+# logs in with the factory one and sets the declared one at the end.
+- name: Ask the router its identity, with the password the declaration carries
+  ansible.builtin.uri:
+    url: "{{ routeros_base }}/system/identity"
+    method: GET
+    url_username: "{{ routeros_user }}"
+    url_password: "{{ routeros_password }}"
+    force_basic_auth: true
+    status_code: [200, 401]
+    return_content: true
+    timeout: "{{ routeros_timeout }}"
+  register: routeros_auth
   failed_when: false
-  no_log: true
+  # The answer says whether the password is already set. It is not a change.
+  changed_when: false
 
-- name: Converge the declared RouterOS state
-  # `--password=` (with the equals sign) on purpose: a factory-empty password
-  # renders as an empty string, and `--password ""` would make argparse swallow
-  # the NEXT argument as its value.
-  ansible.builtin.command:
-    cmd: >-
-      python3 {{ routeros_tool }} --host {{ ansible_host }} --user {{ routeros_user }}
-      --password={{ routeros_password if not routeros_read.failed else '' }}
-      {{ ('--new-password=' ~ routeros_password) if (routeros_read.failed and routeros_password | length > 0) else '' }}
-      --declared '{{ l2_config.routeros | to_json }}'
-  register: routeros_apply
-  # The tool prints what it changed; an empty `changed` list means it found the
-  # router already in the declared state.
-  changed_when: "'\"changed\": []' not in (routeros_apply.stdout | default(''))"
-  failed_when: routeros_apply.rc | int != 0
-  no_log: true
+- name: Decide which password this run logs in with
+  ansible.builtin.set_fact:
+    routeros_login_password: >-
+      {{ '' if (routeros_auth.status | default(0) | int) == 401 else routeros_password }}
+    # Only worth setting when the router still answers the factory password and
+    # the declaration actually carries one.
+    routeros_password_to_set: >-
+      {{ routeros_password if ((routeros_auth.status | default(0) | int) == 401
+                               and routeros_password | length > 0) else '' }}
 
-- name: Report what the router had to change
+- name: Report how this run authenticated
   ansible.builtin.debug:
-    msg: "{{ routeros_apply.stdout | default('') }}"
+    msg: >-
+      {{ inventory_hostname }} ({{ ansible_host }}): the declared password was
+      {{ 'refused, so this run logs in with the factory-empty one and will set the declared one'
+         if routeros_password_to_set | length > 0 else 'accepted (or no password is declared)' }}.
+
+# --- read -----------------------------------------------------------------
+- name: Read the router's state
+  ansible.builtin.include_tasks: read.yml
+
+- name: Keep the reading this run decides from
+  ansible.builtin.set_fact:
+    ros: "{{ routeros_read_index }}"
+
+- name: Reduce the identity to a plain name
+  # RouterOS answers a single-record menu either as an object or as a
+  # one-element list; both are normalised to a string here.
+  ansible.builtin.set_fact:
+    ros_identity_name: >-
+      {{ (ros.identity.name if ros.identity is mapping
+          else (ros.identity | first).name) | default('') }}
+
+- name: Say what the router had
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: identity "{{ ros_identity_name }}",
+      {{ ros.bridges | default([]) | length }} bridge(s),
+      {{ ros.bridge_ports | default([]) | length }} bridge port(s),
+      {{ ros.addresses | default([]) | length }} address(es),
+      {{ ros.dhcp_clients | default([]) | length }} DHCP client(s),
+      {{ ros.dhcp_servers | default([]) | length }} DHCP server(s),
+      {{ ros.dhcp_leases | default([]) | length }} lease(s).
+
+# --- decide ---------------------------------------------------------------
+- name: Compute the REST calls this router needs
+  ansible.builtin.set_fact:
+    routeros_plan: >-
+      {{ lookup('template', role_path ~ '/templates/plan.j2') | from_json }}
+
+- name: Report the plan, call by call, before sending anything
+  ansible.builtin.debug:
+    msg: >-
+      {{ routeros_plan | length }} REST call(s) needed
+      {{ '(the router is already in the declared state)' if routeros_plan | length == 0 else '' }}
   changed_when: false
 
-# Verification re-reads the router: a successful API call is not proof that the
-# router stored what was declared, so the answer is parsed and compared.
-- name: Re-read the router's state
-  ansible.builtin.command:
-    cmd: >-
-      python3 {{ routeros_tool }} --host {{ ansible_host }} --user {{ routeros_user }}
-      --password={{ routeros_password }} --phase read
-  register: routeros_verify
+- name: Show every call
+  ansible.builtin.debug:
+    msg: "{{ item.method }} /rest/{{ item.path }} {{ (item.body | default({})) | to_json }}"
+  loop: "{{ routeros_plan }}"
+  loop_control:
+    label: "{{ item.method }} {{ item.path }}"
   changed_when: false
-  no_log: true
 
-- name: Assert the router carries the declared identity and addresses
+# --- write ----------------------------------------------------------------
+# One REST call per change, each one attributable in the output. A call that
+# fails does NOT abort the run here on purpose: the re-read below is what proves
+# the router's state, and a single failure reported in one place beats a run
+# that dies halfway with the router in an unknown state.
+- name: Converge the router over its REST API
+  ansible.builtin.uri:
+    url: "{{ routeros_base }}/{{ item.path }}"
+    method: "{{ item.method }}"
+    body_format: "{{ 'json' if item.body is defined else 'raw' }}"
+    body: "{{ item.body | default(omit) }}"
+    url_username: "{{ routeros_user }}"
+    url_password: "{{ routeros_login_password }}"
+    force_basic_auth: true
+    status_code: [200, 201, 204]
+    return_content: true
+    timeout: "{{ routeros_timeout }}"
+  loop: "{{ routeros_plan }}"
+  loop_control:
+    label: "{{ item.method }} {{ item.path }}"
+  register: routeros_calls
+  changed_when: true
+  failed_when: false
+
+- name: Report every call that did not come back clean
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.method }} /rest/{{ item.item.path }} -> HTTP
+      {{ item.status | default('no answer') }}: {{ item.msg | default('') }}
+      {{ '(tolerated: the swap takes the router own address away for an instant, so a lost answer here is expected)'
+         if item.item.tolerant | default(false) else '' }}
+  loop: "{{ routeros_calls.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.method }} {{ item.item.path }}"
+  changed_when: false
+  when: item.status | default(0) | int not in [200, 201, 204]
+
+# --- verify ---------------------------------------------------------------
+- name: Read the router's state again
+  ansible.builtin.include_tasks: read.yml
+
+- name: Keep the reading this run verifies against
+  ansible.builtin.set_fact:
+    ros_after: "{{ routeros_read_index }}"
+
+- name: Reduce the identity to a plain name
+  ansible.builtin.set_fact:
+    ros_after_identity_name: >-
+      {{ (ros_after.identity.name if ros_after.identity is mapping
+          else (ros_after.identity | first).name) | default('') }}
+
+- name: The router must carry the declared identity
   ansible.builtin.assert:
     that:
-      - ros.identity == l2_config.routeros.identity
-      - (item.address ~ ' ' ~ item.interface) in ros.addresses
+      - ros_after_identity_name == l2_config.routeros.identity
     fail_msg: >-
-      The router does not report {{ item.address }} on {{ item.interface }} (or the
-      declared identity {{ l2_config.routeros.identity }}). It answered: {{ ros }}.
-    success_msg: "{{ item.address }} is on {{ item.interface }} as declared."
+      The router reports identity "{{ ros_after_identity_name }}" but the
+      declaration says "{{ l2_config.routeros.identity }}".
+    success_msg: "Identity is {{ ros_after_identity_name }}, as declared."
+
+- name: Every declared address must be on the router
+  ansible.builtin.assert:
+    that:
+      - found | length > 0
+    fail_msg: >-
+      {{ item.address }} is not on {{ item.interface }}. The router reports:
+      {{ ros_after.addresses | default([]) | map(attribute='address') | join(', ') }}.
+    success_msg: "{{ item.address }} is on {{ item.interface }}, as declared."
   vars:
-    ros: "{{ routeros_verify.stdout | from_json }}"
+    found: >-
+      {{ ros_after.addresses | default([]) | selectattr('address', 'equalto', item.address)
+         | selectattr('interface', 'equalto', item.interface) | list }}
   loop: "{{ l2_config.routeros.addresses }}"
   loop_control:
     label: "{{ item.address }} {{ item.interface }}"
 
-- name: Assert the DHCP client is gone when the declaration says so
+- name: Every declared bridge must exist with exactly its declared ports
   ansible.builtin.assert:
     that:
-      - ros.dhcp_clients | length == 0
+      - live_ports | length == (item.ports | default([]) | length)
+    fail_msg: >-
+      Bridge {{ item.name }} should carry {{ item.ports | default([]) | join(', ') }}
+      but the router reports {{ live_ports | join(', ') }}.
+    success_msg: "Bridge {{ item.name }} carries {{ live_ports | join(', ') }}, as declared."
+  vars:
+    live_ports: >-
+      {{ ros_after.bridge_ports | default([]) | selectattr('bridge', 'equalto', item.name)
+         | map(attribute='interface') | list | sort }}
+  loop: "{{ l2_config.routeros.bridges | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Every declared DHCP reservation must be on the router, with its address
+  ansible.builtin.assert:
+    that:
+      - live | length == 1
+      - (live | first).address == item.address
+    fail_msg: >-
+      The reservation for {{ item.mac_address }} should be {{ item.address }} but
+      the router reports {{ live | map(attribute='address') | join(', ') | default('nothing') }}.
+    success_msg: "{{ item.mac_address }} is reserved {{ item.address }}, as declared."
+  vars:
+    live: >-
+      {{ ros_after.dhcp_leases | default([])
+         | selectattr('mac-address', 'equalto', item.mac_address) | list }}
+  loop: "{{ l2_config.routeros.dhcp_servers | default([]) | map(attribute='leases') | flatten }}"
+  loop_control:
+    label: "{{ item.mac_address }}"
+
+- name: The factory DHCP client must be gone when the declaration says so
+  ansible.builtin.assert:
+    that:
+      - ros_after.dhcp_clients | default([]) | length == 0
     fail_msg: >-
       config.routeros declares dhcp_client false but the router still runs one on
-      {{ ros.dhcp_clients | join(', ') }}. A DHCP client would add a second,
-      unpredictable address to ether1.
+      {{ ros_after.dhcp_clients | default([]) | map(attribute='interface') | join(', ') }}.
+      A DHCP client would add a second, unpredictable address.
     success_msg: "No DHCP client on the router, as declared."
-  vars:
-    ros: "{{ routeros_verify.stdout | from_json }}"
   when: l2_config.routeros.dhcp_client | default(true) is false
+
+- name: Set the declared password when the router was still on the factory one
+  ansible.builtin.uri:
+    url: "{{ routeros_base }}/user/set"
+    method: POST
+    body_format: json
+    body:
+      numbers: "{{ routeros_user }}"
+      password: "{{ routeros_password_to_set }}"
+    url_username: "{{ routeros_user }}"
+    url_password: "{{ routeros_login_password }}"
+    force_basic_auth: true
+    status_code: [200, 201, 204]
+    timeout: "{{ routeros_timeout }}"
+  when: routeros_password_to_set | length > 0
+  changed_when: true
+
+- name: Confirm the declared password is the one the router now answers to
+  ansible.builtin.uri:
+    url: "{{ routeros_base }}/system/identity"
+    method: GET
+    url_username: "{{ routeros_user }}"
+    url_password: "{{ routeros_password }}"
+    force_basic_auth: true
+    status_code: 200
+    timeout: "{{ routeros_timeout }}"
+  register: routeros_password_check
+  changed_when: false
+  when: routeros_password_to_set | length > 0
+
+- name: Report the outcome
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} converged over REST: {{ routeros_plan | length }}
+      call(s) sent, {{ routeros_calls.results | default([]) | length }} answered,
+      every declared setting verified by re-reading the router.

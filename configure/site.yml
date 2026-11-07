@@ -143,6 +143,21 @@
         - l2_manage | bool
         - l2_config.netlab is defined
 
+    # The router's first address. A RouterOS guest cannot be configured until it
+    # has one, and it cannot take one from the host's DHCP server (its kernel
+    # drops offers whose UDP checksum a veth left unfinished). This guest is the
+    # machine that hands that one address over — and then never intervenes again.
+    - name: Converge the declared router bootstrap
+      ansible.builtin.include_role:
+        name: bootstrap
+      vars:
+        bootstrap_interface: "{{ (l2_config.bootstrap | default({})).interface | default('eth0') }}"
+        bootstrap_lease_mac: "{{ (l2_config.bootstrap | default({})).lease_mac | default('') }}"
+        bootstrap_lease_address: "{{ (l2_config.bootstrap | default({})).lease_address | default('') }}"
+      when:
+        - l2_manage | bool
+        - l2_config.bootstrap is defined
+
     - name: "Nothing to converge: the declaration is read-only for this guest"
       ansible.builtin.debug:
         msg: >-

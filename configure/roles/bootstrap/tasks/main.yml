@@ -1,0 +1,139 @@
+---
+# ===========================================================================
+# bootstrap — converge the one thing that has to exist before a router's own
+# API can be used: its first address.
+#
+# The declaration (inventory/group_vars/all.yml, the guest's `config.bootstrap`
+# block) says which interface, which MAC asks and which address is handed over.
+# This role converges the machine that hands it over, and then PROVES the router
+# took it: a running dnsmasq is not proof that the router got an address.
+# ===========================================================================
+- name: Refuse a bootstrap declaration without an interface, a MAC or an address
+  ansible.builtin.assert:
+    that:
+      - bootstrap_interface is defined and bootstrap_interface | length > 0
+      - bootstrap_lease_mac is defined and bootstrap_lease_mac | length > 0
+      - bootstrap_lease_address is defined and bootstrap_lease_address | length > 0
+    fail_msg: >-
+      A `bootstrap` block needs `interface`, `lease_mac` and `lease_address`
+      (got {{ l2_config.bootstrap | default({}) | to_json }}). The MAC is what
+      makes the concession deterministic; the address is what the router will
+      have before its API exists.
+    success_msg: >-
+      Bootstrap is well formed: {{ bootstrap_lease_address }} to
+      {{ bootstrap_lease_mac }} on {{ bootstrap_interface }}.
+
+- name: Install the DHCP server and the tool that fixes its offers
+  ansible.builtin.apt:
+    name:
+      - dnsmasq
+      - ethtool
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# --- the mechanism, not the symptom --------------------------------------
+# A DHCP offer leaving this container goes through a veth, which marks the
+# checksum CHECKSUM_PARTIAL and leaves it for a NIC to finish. The bridge does
+# not finish it, and the router's kernel validates UDP checksums and drops the
+# frame. Turning the offload off here is what makes the offer arrive intact.
+- name: Install the unit that turns the TX checksum offload off
+  ansible.builtin.template:
+    src: bootstrap-offload.service.j2
+    dest: "/etc/systemd/system/{{ bootstrap_offload_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: bootstrap_offload_unit_file
+
+- name: Apply the offload setting now, and on every boot
+  ansible.builtin.systemd_service:
+    name: "{{ bootstrap_offload_unit }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Install the DHCP configuration
+  ansible.builtin.template:
+    src: dnsmasq-bootstrap.conf.j2
+    dest: "{{ bootstrap_dnsmasq_conf }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: bootstrap_conf
+
+- name: Serve the declared address
+  ansible.builtin.systemd_service:
+    name: dnsmasq
+    enabled: true
+    state: "{{ 'restarted' if bootstrap_conf.changed else 'started' }}"
+  register: bootstrap_dnsmasq
+
+# --- the proof ------------------------------------------------------------
+- name: Read the interface's offload settings
+  ansible.builtin.command:
+    cmd: "ethtool -k {{ bootstrap_interface }}"
+  register: bootstrap_offload_live
+  changed_when: false
+
+- name: Assert the offer will leave with a valid checksum
+  ansible.builtin.assert:
+    that:
+      - "'tx-checksumming: off' in bootstrap_offload_live.stdout"
+    fail_msg: >-
+      {{ bootstrap_interface }} still has TX checksumming on, so every offer
+      this container sends arrives at the router with an unresolved checksum and
+      is dropped — the router would broadcast its request forever while dnsmasq
+      logs a successful offer. `ethtool -k {{ bootstrap_interface }}` said:
+      {{ bootstrap_offload_live.stdout }}.
+    success_msg: "TX checksumming is off on {{ bootstrap_interface }}: the offer will carry a valid checksum."
+
+- name: Read what dnsmasq has handed out
+  # Evidence, not the check: the router asks for this address ONCE and releases
+  # it as soon as it is configured with a static one, so an empty lease file
+  # after a successful bootstrap is the expected end state, not a failure.
+  ansible.builtin.command:
+    cmd: cat /var/lib/misc/dnsmasq.leases
+  register: bootstrap_leases
+  changed_when: false
+  failed_when: false
+
+- name: Wait for the address this container exists to hand over
+  # The real question is not "did dnsmasq log a lease" but "does the router have
+  # an address" — and the only thing a router with an address can answer on is
+  # its own API. This stays true after the router has taken the address as a
+  # static one, which is what makes the role idempotent.
+  ansible.builtin.wait_for:
+    host: "{{ bootstrap_lease_address }}"
+    port: "{{ bootstrap_answer_port }}"
+    timeout: "{{ bootstrap_answer_timeout }}"
+  register: bootstrap_answer
+  failed_when: false
+  changed_when: false
+
+- name: Assert the router has the address this container hands over
+  ansible.builtin.assert:
+    that:
+      - not (bootstrap_answer.failed | default(false))
+    fail_msg: >-
+      Nothing answers on {{ bootstrap_lease_address }}:{{ bootstrap_answer_port }},
+      so the router does not have its first address yet and its API does not
+      exist. dnsmasq's lease file says
+      "{{ bootstrap_leases.stdout | default('(empty)') | trim }}".
+      Check that dnsmasq is running on this guest (`ss -ulpn` shows it on :67)
+      and that TX checksumming is off on {{ bootstrap_interface }} — a DHCP offer
+      that leaves a veth with an unfinished UDP checksum is dropped by the
+      router's kernel, and the router then asks forever while dnsmasq logs a
+      successful offer.
+    success_msg: >-
+      {{ bootstrap_lease_address }} answers on :{{ bootstrap_answer_port }}:
+      the router has its first address, so its REST API exists and everything
+      else about it is converged over REST.
+
+- name: Report what the bootstrap had to do
+  ansible.builtin.debug:
+    msg: >-
+      {{ bootstrap_lease_address }} is answered by the router
+      ({{ 'dnsmasq still holds the lease it handed over'
+         if bootstrap_lease_mac | lower in (bootstrap_leases.stdout | default('') | lower)
+         else 'dnsmasq no longer holds the lease — expected: the router gave it back when it took the address as a static one' }}).

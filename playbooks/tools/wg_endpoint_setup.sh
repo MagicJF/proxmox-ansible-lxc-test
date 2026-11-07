@@ -21,7 +21,16 @@
 # tunnel is re-applied. It prints the endpoint's PUBLIC key, which goes into
 # pve_tunnel.endpoint_public_key in inventory/group_vars/all.yml.
 #
-# usage: wg_endpoint_setup.sh <CLIENT_PUBLIC_KEY> [SERVER_ADDRESS] [LISTEN_PORT] [GUEST_BRIDGE] [NAME]
+# usage: wg_endpoint_setup.sh <CLIENT_PUBLIC_KEY> [SERVER_ADDRESS] [LISTEN_PORT] [GUEST_BRIDGE] [NAME] [EXTRA_ROUTES]
+#
+# EXTRA_ROUTES is a comma-separated list of `<network>=<gateway>` pairs, for the
+# networks that live BEHIND a router inside the lab. The endpoint can reach the
+# router itself (it is on the guest bridge) but has no idea where the networks
+# behind it are, so without these the control node reaches the router and nothing
+# past it. They are added to the tunnel's PostUp/PostDown, so they exist exactly
+# while the tunnel does.
+#
+#   ... vmbr1 wg-lab "10.30.0.0/24=10.10.10.50"
 # ===========================================================================
 set -eu
 
@@ -30,11 +39,32 @@ TUNNEL_SERVER="${2:-10.99.99.1/24}"
 LISTEN_PORT="${3:-51820}"
 GUEST_BRIDGE="${4:-vmbr1}"
 NAME="${5:-wg-lab}"
+EXTRA_ROUTES="${6:-}"
 
 [ -n "$CLIENT_PUBKEY" ] || {
-  echo "usage: $0 <control-node-public-key> [server-address] [port] [guest-bridge] [name]" >&2
+  echo "usage: $0 <control-node-public-key> [server-address] [port] [guest-bridge] [name] [\"net=gw,net=gw\"]" >&2
   exit 2
 }
+
+# Build the route lines that go into the tunnel's own configuration, so the
+# routes live and die with the tunnel instead of being a separate thing to keep
+# in sync.
+ROUTE_UP=""
+ROUTE_DOWN=""
+if [ -n "$EXTRA_ROUTES" ]; then
+  OLDIFS=$IFS
+  IFS=','
+  for pair in $EXTRA_ROUTES; do
+    net="${pair%%=*}"
+    gw="${pair#*=}"
+    [ -n "$net" ] && [ -n "$gw" ] && [ "$net" != "$gw" ] || continue
+    ROUTE_UP="$ROUTE_UP
+PostUp   = ip route replace $net via $gw"
+    ROUTE_DOWN="$ROUTE_DOWN
+PostDown = ip route del $net via $gw"
+  done
+  IFS=$OLDIFS
+fi
 
 WG_DIR=/etc/wireguard
 # 10.99.99.1/24 -> the peer gets 10.99.99.2/32, and the tunnel subnet is
@@ -59,8 +89,8 @@ cat > "$WG_DIR/$NAME.conf" <<EOF
 Address = $TUNNEL_SERVER
 ListenPort = $LISTEN_PORT
 PrivateKey = $(cat "$WG_DIR/$NAME-server.key")
-PostUp   = iptables -t nat -A POSTROUTING -s $SUBNET -o $GUEST_BRIDGE -j MASQUERADE
-PostDown = iptables -t nat -D POSTROUTING -s $SUBNET -o $GUEST_BRIDGE -j MASQUERADE
+PostUp   = iptables -t nat -A POSTROUTING -s $SUBNET -o $GUEST_BRIDGE -j MASQUERADE$ROUTE_UP
+PostDown = iptables -t nat -D POSTROUTING -s $SUBNET -o $GUEST_BRIDGE -j MASQUERADE$ROUTE_DOWN
 
 [Peer]
 # Control node (public key only)

@@ -1,0 +1,29 @@
+# Managed by layer 2 — configure/roles/bootstrap, rendered from the `bootstrap`
+# block of this guest's declaration in inventory/group_vars/all.yml. Editing this
+# file inside the guest is drift and is reverted on the next run.
+#
+# This is NOT the lab's DHCP server. It hands ONE address to ONE machine: the
+# router, on the single occasion the router has no address at all.
+interface={{ bootstrap_interface }}
+bind-interfaces
+# No DNS: this container is not a resolver, and dnsmasq would otherwise answer
+# port 53 on the management LAN.
+port=0
+
+dhcp-range={{ bootstrap_lease_address }},{{ bootstrap_lease_address }},{{ bootstrap_netmask }},{{ bootstrap_lease_time }}
+dhcp-host={{ bootstrap_lease_mac }},{{ bootstrap_lease_address }}
+
+# Only the machine declared above. Every other client on this segment belongs to
+# the host's own DHCP server and must not be served from here — a second server
+# answering them would be an addressing race in the middle of the lab.
+dhcp-ignore=tag:!known
+
+# No router and no DNS options: the only thing this hands over is an address.
+# The router's real addressing (its static management address, its default
+# route, the lab segment) is declared in the manifest and applied over its own
+# REST API a moment later.
+dhcp-option=3
+dhcp-option=6
+
+dhcp-authoritative
+log-dhcp

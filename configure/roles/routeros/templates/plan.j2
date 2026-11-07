@@ -1,0 +1,186 @@
+{#-
+  The REST calls this router needs, computed from what it answered (ros) and what
+  the declaration asks for (l2_config.routeros). Emits a JSON list of
+  {method, path, body} — the plan is printed before anything is sent, so the run
+  says what it is going to do before it does it.
+
+  The ORDER of the list is the order of the calls, and it is load-bearing:
+    bridges -> ports -> addresses -> pool -> dhcp network -> dhcp server ->
+    leases -> deletions -> identity -> the ether1 swap.
+  The swap goes LAST and inside ONE script: removing the factory DHCP client
+  takes the router's only address away, so the static one has to be added in the
+  same execution or the router is left with nothing to talk to.
+-#}
+{%- set cfg = l2_config.routeros -%}
+{%- set ops = [] -%}
+
+{#- ---------- bridges ---------- -#}
+{%- set decl_bridges = cfg.bridges | default([]) -%}
+{%- set live_bridge_names = ros.bridges | default([]) | map(attribute='name') | list -%}
+{%- for b in decl_bridges -%}
+{%-   if b.name not in live_bridge_names -%}
+{%-     set _ = ops.append({'method': 'PUT', 'path': 'interface/bridge', 'body': {'name': b.name}}) -%}
+{%-   endif -%}
+{%- endfor -%}
+
+{#- ---------- bridge ports (the switch itself) ---------- -#}
+{%- set decl_ports = [] -%}
+{%- for b in decl_bridges -%}
+{%-   for p in b.ports | default([]) -%}
+{%-     set _ = decl_ports.append({'bridge': b.name, 'interface': p}) -%}
+{%-   endfor -%}
+{%- endfor -%}
+{%- for p in decl_ports -%}
+{%-   set found = ros.bridge_ports | default([]) | selectattr('bridge', 'equalto', p.bridge)
+                 | selectattr('interface', 'equalto', p.interface) | list -%}
+{%-   if found | length == 0 -%}
+{%-     set _ = ops.append({'method': 'PUT', 'path': 'interface/bridge/port',
+                            'body': {'bridge': p.bridge, 'interface': p.interface}}) -%}
+{%-   endif -%}
+{%- endfor -%}
+
+{#- ---------- addresses, except the ones that need the atomic swap ---------- -#}
+{#- Which interfaces carry a DHCP client we are about to remove? Their addresses
+    cannot be added here: RouterOS refuses an address that a dynamic entry
+    already holds, and the dynamic entry only disappears with the client. -#}
+{%- set decl_addresses = cfg.addresses | default([]) -%}
+{%- set client_ifaces = (ros.dhcp_clients | default([]) | map(attribute='interface') | list)
+                        if (cfg.dhcp_client | default(true) is false) else [] -%}
+{%- set swap_addresses = decl_addresses | selectattr('interface', 'in', client_ifaces) | list -%}
+{%- set plain_addresses = decl_addresses | rejectattr('interface', 'in', client_ifaces) | list -%}
+{%- for a in plain_addresses -%}
+{%-   set found = ros.addresses | default([]) | selectattr('address', 'equalto', a.address)
+                 | selectattr('interface', 'equalto', a.interface) | list -%}
+{%-   if found | length == 0 -%}
+{%-     set _ = ops.append({'method': 'PUT', 'path': 'ip/address',
+                            'body': {'address': a.address, 'interface': a.interface}}) -%}
+{%-   endif -%}
+{%- endfor -%}
+
+{#- ---------- pools, DHCP networks, servers and reservations ---------- -#}
+{%- set decl_servers = cfg.dhcp_servers | default([]) -%}
+{%- for s in decl_servers -%}
+{%-   set pool_name = s.name -%}
+{%-   set found = ros.pools | default([]) | selectattr('name', 'equalto', pool_name) | list -%}
+{%-   if found | length == 0 -%}
+{%-     set _ = ops.append({'method': 'PUT', 'path': 'ip/pool',
+                            'body': {'name': pool_name, 'ranges': s.address_pool}}) -%}
+{%-   elif (found | first).ranges | default('') != s.address_pool -%}
+{%-     set _ = ops.append({'method': 'PATCH', 'path': 'ip/pool/' ~ (found | first)['.id'],
+                            'body': {'ranges': s.address_pool}}) -%}
+{%-   endif -%}
+
+{%-   set found = ros.dhcp_networks | default([]) | selectattr('address', 'equalto', s.network) | list -%}
+{%-   if found | length == 0 -%}
+{%-     set _ = ops.append({'method': 'PUT', 'path': 'ip/dhcp-server/network',
+                            'body': {'address': s.network, 'gateway': s.gateway, 'dns-server': s.dns_server}}) -%}
+{%-   else -%}
+{%-     set live_net = found | first -%}
+{%-     if live_net.gateway | default('') != s.gateway or live_net['dns-server'] | default('') != s.dns_server -%}
+{%-       set _ = ops.append({'method': 'PATCH', 'path': 'ip/dhcp-server/network/' ~ live_net['.id'],
+                              'body': {'gateway': s.gateway, 'dns-server': s.dns_server}}) -%}
+{%-     endif -%}
+{%-   endif -%}
+
+{%-   set found = ros.dhcp_servers | default([]) | selectattr('name', 'equalto', s.name) | list -%}
+{%-   if found | length == 0 -%}
+{%-     set _ = ops.append({'method': 'PUT', 'path': 'ip/dhcp-server',
+                            'body': {'name': s.name, 'interface': s.interface,
+                                     'address-pool': pool_name, 'disabled': 'false'}}) -%}
+{%-   else -%}
+{%-     set live_srv = found | first -%}
+{%-     if live_srv.disabled | default('false') | string | lower == 'true'
+           or live_srv.interface | default('') != s.interface
+           or live_srv['address-pool'] | default('') != pool_name -%}
+{%-       set _ = ops.append({'method': 'PATCH', 'path': 'ip/dhcp-server/' ~ live_srv['.id'],
+                              'body': {'interface': s.interface, 'address-pool': pool_name, 'disabled': 'false'}}) -%}
+{%-     endif -%}
+{%-   endif -%}
+
+{%-   for l in s.leases | default([]) -%}
+{%-     set found = ros.dhcp_leases | default([])
+                     | selectattr('mac-address', 'equalto', l.mac_address) | list -%}
+{%-     if found | length == 0 -%}
+{%-       set _ = ops.append({'method': 'PUT', 'path': 'ip/dhcp-server/lease',
+                              'body': {'address': l.address, 'mac-address': l.mac_address,
+                                       'comment': l.comment | default('')}}) -%}
+{%-     else -%}
+{%-       set live_lease = found | first -%}
+{%-       if live_lease.address | default('') != l.address -%}
+{%-         set _ = ops.append({'method': 'PATCH', 'path': 'ip/dhcp-server/lease/' ~ live_lease['.id'],
+                                'body': {'address': l.address}}) -%}
+{%-       endif -%}
+{%-     endif -%}
+{%-   endfor -%}
+{%- endfor -%}
+
+{#- ---------- the declaration is authoritative: remove what it does not ask for ---------- -#}
+{#- Static entries only. A dynamic entry is RouterOS's own bookkeeping (an address
+    from a client we have not removed yet, a lease our own server handed out) and
+    deleting it by hand is fighting the router, not converging it. -#}
+{%- for b in ros.bridges | default([]) -%}
+{%-   if b.name not in (decl_bridges | map(attribute='name') | list) -%}
+{%-     set _ = ops.append({'method': 'DELETE', 'path': 'interface/bridge/' ~ b['.id']}) -%}
+{%-   endif -%}
+{%- endfor -%}
+{%- for p in ros.bridge_ports | default([]) -%}
+{%-   set wanted = decl_ports | selectattr('bridge', 'equalto', p.bridge)
+                  | selectattr('interface', 'equalto', p.interface) | list -%}
+{%-   if wanted | length == 0 and p.dynamic | default('false') | string | lower != 'true' -%}
+{%-     set _ = ops.append({'method': 'DELETE', 'path': 'interface/bridge/port/' ~ p['.id']}) -%}
+{%-   endif -%}
+{%- endfor -%}
+{%- for a in ros.addresses | default([]) -%}
+{%-   set wanted = decl_addresses | selectattr('address', 'equalto', a.address)
+                  | selectattr('interface', 'equalto', a.interface) | list -%}
+{%-   if wanted | length == 0 and a.dynamic | default('false') | string | lower != 'true' -%}
+{%-     set _ = ops.append({'method': 'DELETE', 'path': 'ip/address/' ~ a['.id']}) -%}
+{%-   endif -%}
+{%- endfor -%}
+{%- for l in ros.dhcp_leases | default([]) -%}
+{#- The declared key is `mac_address`; the router's is `mac-address`. Mixing them
+    up is not a silent miss here: Ansible's strict undefined raises on a missing
+    key, which is exactly how this was found. -#}
+{%-   set wanted = decl_servers | map(attribute='leases') | flatten
+                  | selectattr('mac_address', 'equalto', l['mac-address']) | list -%}
+{%-   if wanted | length == 0 and l.dynamic | default('false') | string | lower != 'true' -%}
+{%-     set _ = ops.append({'method': 'DELETE', 'path': 'ip/dhcp-server/lease/' ~ l['.id']}) -%}
+{%-   endif -%}
+{%- endfor -%}
+{%- for s in ros.dhcp_servers | default([]) -%}
+{%-   if s.name not in (decl_servers | map(attribute='name') | list) -%}
+{%-     set _ = ops.append({'method': 'DELETE', 'path': 'ip/dhcp-server/' ~ s['.id']}) -%}
+{%-   endif -%}
+{%- endfor -%}
+{%- for n in ros.dhcp_networks | default([]) -%}
+{%-   if n.address not in (decl_servers | map(attribute='network') | list) -%}
+{%-     set _ = ops.append({'method': 'DELETE', 'path': 'ip/dhcp-server/network/' ~ n['.id']}) -%}
+{%-   endif -%}
+{%- endfor -%}
+{%- for p in ros.pools | default([]) -%}
+{%-   if p.name not in (decl_servers | map(attribute='name') | list) -%}
+{%-     set _ = ops.append({'method': 'DELETE', 'path': 'ip/pool/' ~ p['.id']}) -%}
+{%-   endif -%}
+{%- endfor -%}
+
+{#- ---------- identity ---------- -#}
+{%- if ros_identity_name | default('') != cfg.identity -%}
+{%-   set _ = ops.append({'method': 'POST', 'path': 'system/identity/set',
+                          'body': {'name': cfg.identity}}) -%}
+{%- endif -%}
+
+{#- ---------- the swap, last and atomic ---------- -#}
+{%- if (cfg.dhcp_client | default(true) is false) and (client_ifaces | length > 0 or swap_addresses | length > 0) -%}
+{%-   set lines = [] -%}
+{%-   for i in client_ifaces -%}
+{%-     set _ = lines.append('/ip dhcp-client remove [find interface=' ~ i ~ ']') -%}
+{%-   endfor -%}
+{%-   for a in swap_addresses -%}
+{%-     set _ = lines.append('/ip address add address=' ~ a.address ~ ' interface=' ~ a.interface) -%}
+{%-   endfor -%}
+{%-   set _ = ops.append({'method': 'POST', 'path': 'execute',
+                          'body': {'script': lines | join('; ')},
+                          'tolerant': true}) -%}
+{%- endif -%}
+
+{{ ops | to_json }}

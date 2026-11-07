@@ -1,0 +1,28 @@
+---
+# ===========================================================================
+# bootstrap — le da a un RouterOS su PRIMERA dirección.
+#
+# Por qué existe: un CHR recién importado arranca sin ninguna dirección, sólo
+# con un cliente DHCP en ether1. Su API (REST o binaria) no existe hasta que
+# tiene una. Y como es una VM, no puede tomar una concesión del DHCP del host:
+# la oferta llega con un checksum de UDP que el kernel del invitado descarta.
+#
+# Ese mismo defecto es lo que hace determinista a este contenedor: la oferta del
+# DHCP del host NUNCA llega al router, así que la única que ve es la de aquí. No
+# hay carrera entre dos servidores.
+#
+# No es un servidor DHCP del lab: concede UNA dirección a UNA máquina, en la
+# única ocasión en que esa máquina no tiene ninguna. Todo lo demás (el segmento
+# del lab, el DHCP de las workstations con sus reservas) lo hace el propio
+# RouterOS, y lo converge configure/roles/routeros por su API REST.
+# ===========================================================================
+bootstrap_netmask: "255.255.255.0"
+bootstrap_lease_time: "1h"
+bootstrap_dnsmasq_conf: /etc/dnsmasq.d/bootstrap.conf
+bootstrap_offload_unit: bootstrap-tx-offload.service
+# How long to wait for the router to have its first address. Generous on
+# purpose: on a first run this competes with the router's own boot.
+bootstrap_answer_timeout: 240
+# The port that proves the router HAS the address. Its REST API is the first
+# thing that can answer, so `www` (80) is the check.
+bootstrap_answer_port: 80

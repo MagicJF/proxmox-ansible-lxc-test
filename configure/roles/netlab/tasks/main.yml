@@ -29,6 +29,10 @@
     group: root
     mode: "0644"
   register: netlab_unit
+  # A guest that declares only peers (a workstation that gets its default gateway
+  # from DHCP, for instance) has no routes of its own, and a unit with nothing to
+  # run is noise: what it needs is the connectivity proof, not a service.
+  when: netlab_routes | length > 0
 
 - name: Apply the declared routes now and on every boot
   ansible.builtin.systemd_service:
@@ -37,6 +41,7 @@
     state: "{{ 'restarted' if netlab_unit.changed else 'started' }}"
     daemon_reload: true
   register: netlab_unit_state
+  when: netlab_routes | length > 0
 
 - name: The declared routes must be the routes the kernel actually has
   ansible.builtin.command:

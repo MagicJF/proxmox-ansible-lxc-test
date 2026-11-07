@@ -1,10 +1,48 @@
 ---
-# The tool that drives the RouterOS API. Stdlib only, like pve_read.py: a
-# collection would add librouteros (and pip) to the control node.
-routeros_tool: "{{ role_path }}/../../tools/routeros_apply.py"
+# ===========================================================================
+# routeros — the inside of a MikroTik RouterOS guest, over its REST API.
+#
+# RouterOS is not a POSIX shell, so the SSH path every other guest uses does not
+# apply. It speaks HTTP: GET / PUT / PATCH / DELETE on `/rest/<menu>` with HTTP
+# Basic auth, on the `www` service (port 80), which a CHR image has enabled by
+# default. This role drives that API directly with ansible.builtin.uri — no
+# collection, no librouteros, and no binary API on TCP/8728.
+#
+# The play that includes this role runs on the control node, so the role talks
+# to the router's management address directly (ansible_host, derived from the
+# `addresses` entry on ether1 in the declaration).
+#
+# Reading, deciding and writing are three separate passes on purpose:
+#   - every table is READ first and the raw answer is kept, so the run can say
+#     what the router had, not only what it did;
+#   - the difference is computed from that reading into an explicit list of REST
+#     CALLS, which is printed before anything is sent;
+#   - only then is anything written, one call per change, each one attributable;
+#   - and the result is READ AGAIN, because a 200 is not proof that the router
+#     stored what was declared.
+# ===========================================================================
 routeros_user: admin
 # A CHR image ships with the factory-empty password. Declare
 # pve_routeros_password in playbooks/vars/secrets.yml to set one: the first run
 # then logs in with the factory password and sets the declared one, and every
 # run after that uses it.
 routeros_password: "{{ pve_routeros_password | default('') }}"
+# Plain HTTP on the `www` service. www-ssl (443) is OFF on a CHR image, so TLS
+# would be a second thing to converge before the first one could be used.
+routeros_scheme: http
+routeros_port: 80
+routeros_base: "{{ routeros_scheme }}://{{ ansible_host }}:{{ routeros_port }}/rest"
+routeros_timeout: 20
+
+# Every table the declaration can touch, in the order they are read. `key` is
+# the name the role refers to them by; `path` is the REST menu.
+routeros_tables:
+  - {key: identity, path: system/identity}
+  - {key: bridges, path: interface/bridge}
+  - {key: bridge_ports, path: interface/bridge/port}
+  - {key: addresses, path: ip/address}
+  - {key: dhcp_clients, path: ip/dhcp-client}
+  - {key: pools, path: ip/pool}
+  - {key: dhcp_servers, path: ip/dhcp-server}
+  - {key: dhcp_networks, path: ip/dhcp-server/network}
+  - {key: dhcp_leases, path: ip/dhcp-server/lease}
