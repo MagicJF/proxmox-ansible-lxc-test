@@ -435,6 +435,13 @@ executions, not the size of the work**. Every `loop` iteration is one execution,
 task looping over five guests pays five times. That is the whole lever:
 
 - **`apply` is the iteration verb.** It reads, applies and verifies through the API in one run.
+- **To iterate on ONE guest, `--limit` already works — and it is the only selective run that
+  stays honest.** `ansible-playbook configure/site.yml --limit localhost,lab-chr` runs the engine
+  and converges exactly that guest (measured: `lab-chr ok=24 changed=0`, while the plays for the
+  other guests report `skipping: no hosts matched`). `localhost` is required, because it is the
+  play that builds the target inventory. Tags would buy the same convenience while inviting runs
+  that skip part of a guest's declaration; a `--limit` names a guest, and a guest is converged
+  whole or not at all.
 - **Do not re-run just to prove idempotence.** `apply` already re-reads and prints the
   declared-versus-live comparison; a second run doubles the wall time for information you
   already have. Reserve the repeat for changes that touch creation-time properties or power.
