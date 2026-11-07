@@ -276,109 +276,60 @@ Two decisions worth knowing:
   in the manifest and the guest is expected to sit behind a network that is not
   public.
 
-### A worked example: two workstations and a switch
+### A worked example: a three-site network, described in one file
 
-The point of this one is that **each workstation is a PC**: one NIC, no management
-leg, and every bit of switching and addressing done by a MikroTik CHR, as it
-would be on real hardware. The lab must not behave like a virtualised network.
+The lab declared now is a company network — one headquarters and two branches —
+and it is there to exercise the framework on something that is **not** a flat
+list of identical guests:
 
-```
-          vmbr1  (gestión, 10.10.10.0/24)
-            │
-         ether1
-      ┌───────────┐
-      │  lab-chr  │  ether2 ──── vmbr2 ──── ws1     ← el "latiguillo RJ45"
-      │  (switch) │  ether3 ──── vmbr3 ──── ws2
-      └───────────┘
-
-      bridge "lan" = ether2 + ether3      ← esto ES el switch
-      10.30.0.1/24 + DHCP con una reserva por MAC
+```text
+SEDE 1 (central)             SEDE 2                   SEDE 3
+  ws1 ws2   ws3 ws4            ws5 ws6                  ws7 ws8
+     │         │                  │                        │
+   sw1 ═════ sw2                 sw3                      sw4
+     │                            │                        │
+    rt1 ════ WAN 1 ════ rt2        rt1 ════ WAN 2 ════ rt3
 ```
 
-Three declarations carry it:
+**Seven RouterOS guests and eight PCs**, all of it in `inventory/group_vars/all.yml`:
 
-```yaml
-pve_bridges:                      # un cable por bridge, sin puertos
-  - {iface: vmbr2, comments: "lab cable: lab-chr ether2 <-> ws1"}
-  - {iface: vmbr3, comments: "lab cable: lab-chr ether3 <-> ws2"}
+- **Four switches, and they are pure L2.** They put their data ports into a
+  RouterOS bridge and put **no address on it**. That is what makes them switches
+  rather than routers: their address lives only on their management leg
+  (`ether1` → `vmbr1`). A switch with an address on its bridge starts routing,
+  and the topology silently stops being the one in the diagram.
+- **Three routers** that do route: their site's LAN on one leg, the WAN on
+  another. The layout is **hierarchical** — `rt1` knows both remote networks and
+  `rt2`/`rt3` carry a default route to it — so adding a fourth site is one entry
+  and one route, not a mesh of them.
+- **Eight workstations, each a PC**: one NIC, **no management interface, and no
+  `config:` block at all**, so layer 2 never enters them. That is how it is done
+  in a company: a desktop has one interface, takes its address by DHCP, and fleet
+  management is an agent that calls OUT, never an inbound connection. Their
+  address comes from their site's router as a DHCP reservation keyed to their
+  MAC, and the `address:` in their entry **IS** that reservation — the router
+  derives it from there, so the two cannot drift apart.
+- **Verification does not enter them; it comes from the routers**, which is how a
+  network engineer tests a network: `/ping`, `/tool/traceroute`, `/ip/arp`,
+  `/ip/dhcp-server/lease` and `/interface/bridge/host`. As an independent second
+  view, the PVE API reads the container's own interfaces
+  (`GET /nodes/<node>/lxc/<id>/interfaces`) — that is the hypervisor's view, not a
+  management path into the guest. Both were used, and they agree.
 
-# in pve_chr_defaults (merged only for entries declaring `chr: true`)
-pve_chr_defaults:
-  cores: 2
-  memory: 512
-  machine: pc                    # the vendor image is i440fx-era, not q35
-  cloudinit: false
-  boot: "order=scsi0"
-  serial: {serial0: socket}      # the console that respects a non-US keyboard
-  vga: serial0
-  scsi: {scsi0: "local-zfs:8"}
-  disk_import: [{key: scsi0, source: "local:import/chr-7.25.1.raw"}]
+Addressing, so a reader can follow the pings: management `10.10.10.16x` (the last
+octet **is** the vmid), the sites `10.11/10.12/10.13.0.0/24`, and the two WAN
+links as `/30`s (`10.99.1.0/30`, `10.99.2.0/30`). Fourteen portless bridges
+(`vmbr4`…`vmbr17`), **one per cable** — the bridge name appears literally at both
+of its ends, and the state validator refuses a name that is cited but never
+declared, so a typo cannot produce a one-ended cable.
 
-# in pve_vms — el switch
-  - vmid: 140
-    name: lab-chr
-    chr: true
-    net:
-      net0: "virtio={{ lab_router_mac }},bridge=vmbr1"   # ether1: gestión
-      net1: "virtio,bridge=vmbr2"                        # ether2: a ws1
-      net2: "virtio,bridge=vmbr3"                        # ether3: a ws2
-    config:
-      routeros:
-        identity: lab-chr
-        dhcp_client: false
-        addresses:
-          - {address: "{{ lab_router_mgmt }}/24", interface: ether1}
-          - {address: "{{ lab_gateway }}/24",     interface: "{{ lab_bridge_name }}"}
-        bridges: [{name: "{{ lab_bridge_name }}", ports: [ether2, ether3]}]
-        dhcp_servers:
-          - name: lab
-            interface: "{{ lab_bridge_name }}"
-            address_pool: "10.30.0.10-10.30.0.254"
-            network: "{{ lab_network }}"
-            gateway: "{{ lab_gateway }}"
-            dns_server: "{{ lab_gateway }}"
-            # derivado de las workstations: su `address:` y la MAC de su net0
-            leases: "{{ ... }}"
-
-# in pve_containers — una workstation: UNA sola interfaz, y es la del lab
-  - vmid: 141
-    hostname: ws1
-    address: "10.30.0.11"        # la reserva que el CHR deriva de aquí
-    netif: {net0: "name=eth0,bridge=vmbr2,hwaddr=BC:24:11:00:00:51,ip=dhcp"}
-```
-
-**The switch is a bridge inside RouterOS**, not a Proxmox one: `ether2` and
-`ether3` are ports of the same RouterOS bridge, so the frames are switched by the
-CHR. `ether1` stays outside it — the management port of a switch, with the
-management address of a switch.
-
-**The router is converged over its REST API**, with `ansible.builtin.uri`
-(`configure/roles/routeros`). It reads every table it can touch, computes an
-explicit list of REST calls, prints that plan before sending anything, sends one
-call per change, and then re-reads the router: a 200 is not proof that the router
-stored what was declared. A router already in the declared state costs **zero**
-calls.
-
-The workstation declares `ip=dhcp` and the CHR derives its reservation from the
-workstation's own entry — its `address:` and the MAC on its `net0` — so no value
-is written twice. That is what a real switch does with a DHCP reservation.
-
-Three consequences worth stating plainly:
-
-- **The workstations have no management leg.** Layer 2 reaches them *through the
-  lab*, so the control node's traffic has to be ROUTED to the network behind the
-  router: `pve_tunnel.endpoint_routes` declares it and
-  `playbooks/tools/wg_endpoint_setup.sh` applies it, in the same one-time paste
-  that already exists. It is the only manual step left, because the PVE API
-  cannot configure the host's routing table. Until it exists, a workstation
-  declared `manage: true` fails its reachability check — and with `serial: 1`,
-  one such guest stops every batch queued behind it.
-- **A bridge per cable is not decoration.** If two guests shared one bridge,
-  Proxmox would be doing the switching and the router would be a picture of a
-  network. One bridge = one cable.
-- **A CHR has no address at all when it boots**, so its API does not exist yet
-  and nothing about it can be declared. See the next section.
-
+**A clean deploy leaves the workstations with no address until they are
+rebooted.** Their DHCP client runs when the container is created, when their
+site's DHCP server does not exist yet, and it does not retry forever. The routers
+serve them as soon as they are converged, and a reboot puts them right — which is
+also true of the routers themselves, and is why the order that works is: create,
+converge the **bootstrap**, reboot the **routers**, converge the **routers**,
+reboot the **workstations**, verify from the routers.
 ### The one thing the API cannot do: a router's first address
 
 A freshly imported CHR boots with a DHCP client on `ether1` and **no address**,
