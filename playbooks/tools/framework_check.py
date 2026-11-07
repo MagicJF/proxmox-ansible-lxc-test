@@ -286,6 +286,79 @@ def drill(verb, preflight):
     return 0
 
 
+LABCHECK = os.path.join(REPO, "playbooks/tools/lab-check.sh")
+
+
+# ---------------------------------------------------------------------------
+# `agree`: la comprobación que SÍ puede encontrar lo que falta.
+#
+# El mapa de lab-check.sh es una copia a mano de parte de la declaración, y por
+# eso puede desincronizarse sin que nada lo note: el script no puede detectar
+# que su propia lista está mal, porque la lista es su ENTRADA. Un test que sólo
+# pregunta por las direcciones que ya tiene nunca echa en falta ninguna — y esa
+# fue exactamente la forma del último error: una dirección que era el VMID del
+# invitado y no su IP.
+#
+# La cura es no comparar elemento a elemento, sino CONJUNTOS: derivar de la
+# declaración qué direcciones DEBEN existir, derivar del mapa cuáles se van a
+# probar, y quedarse con lo que falta en cada lado. La ausencia es el dato.
+# ---------------------------------------------------------------------------
+def declared_addresses():
+    """Las direcciones que la declaración dice que hay. La fuente de verdad."""
+    m = yaml.safe_load(open(MANIFEST, encoding="utf-8"))
+    out = {}
+    for c in m.get("pve_containers", []):
+        cfg = c.get("config") or {}
+        if "bootstrap" in cfg:
+            net0 = (c.get("netif") or {}).get("net0", "")
+            ip = re.search(r"\bip=([\d.]+)/", net0)
+            if ip:
+                out[c["hostname"]] = ip.group(1)
+        elif "site" in c and c.get("address"):
+            out[c["hostname"]] = c["address"]
+    for v in m.get("pve_vms", []):
+        if not v.get("chr"):
+            continue
+        ros = (v.get("config") or {}).get("routeros") or {}
+        for a in ros.get("addresses", []):
+            if a.get("interface") == "ether1":
+                out[v["name"]] = a["address"].split("/")[0]
+    return out
+
+
+def mapped_addresses():
+    """Las direcciones que el script va a probar, leídas de su propio mapa."""
+    out = {}
+    for line in open(LABCHECK, encoding="utf-8"):
+        if "LAB=" not in line:
+            continue
+        for mm in re.finditer(r"([\w-]+) ([\d.]+) \d+ \w+", line):
+            out[mm.group(1)] = mm.group(2)
+    return out
+
+
+def agree():
+    say("== agree: el mapa del propio test contra la declaración ==")
+    decl = declared_addresses()
+    mapped = mapped_addresses()
+    say(f"  la declaración declara {len(decl)} direcciones; el mapa prueba {len(mapped)}")
+
+    by_addr = {a: n for n, a in decl.items()}
+    seen = {a: n for n, a in mapped.items()}
+    missing = {a: n for a, n in by_addr.items() if a not in seen}
+    extra = {a: n for a, n in seen.items() if a not in by_addr}
+
+    for a, n in sorted(missing.items()):
+        say(f"  FALTA en el mapa : {a:<15} ({n}) — declarado, y el script no lo prueba")
+    for a, n in sorted(extra.items()):
+        say(f"  SOBRA en el mapa : {a:<15} ({n}) — el script prueba algo que nadie declara")
+
+    if missing or extra:
+        fail("el mapa del test y la declaración no dicen lo mismo")
+    say("\nPASS: el test prueba exactamente lo que la declaración declara.")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     sub = parser.add_subparsers(dest="mode")
@@ -294,12 +367,15 @@ def main():
     drl = sub.add_parser("drill", help="inject drift, watch preflight see it and apply repair it")
     drl.add_argument("--verb", default="playbooks/apply.yml")
     drl.add_argument("--preflight", default="playbooks/preflight.yml")
+    sub.add_parser("agree", help="the check's own map must match the declaration")
     args = parser.parse_args()
 
     if args.mode == "invariant":
         return invariant(args.verb)
     if args.mode == "drill":
         return drill(args.verb, args.preflight)
+    if args.mode == "agree":
+        return agree()
     parser.print_help()
     return 2
 
