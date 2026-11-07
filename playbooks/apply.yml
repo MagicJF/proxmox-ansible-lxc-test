@@ -99,6 +99,12 @@
         pve_read_meta: "{{ pve_read_before.stdout | from_json }}"
         pve_live_before: "{{ (pve_read_before.stdout | from_json).guests }}"
 
+    # Before anything is analysed or written: the declared state has to make
+    # sense as a whole. See playbooks/tasks/validate_state.yml for why a
+    # dangling reference is worth a task of its own.
+    - name: Refuse a declared state that points at something that does not exist
+      ansible.builtin.include_tasks: tasks/validate_state.yml
+
     # ---- analyse everything, once ----------------------------------------
     - name: Analyse every declared guest in one templating pass
       ansible.builtin.set_fact:

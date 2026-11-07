@@ -69,6 +69,12 @@
           {% set out = [] %}{% for i in pve_vms %}{% set _ = out.append(pve_vm_defaults | combine(pve_chr_defaults if (i.chr | default(false)) else {}) | combine(i)) %}{% endfor %}{{ out }}
         pve_read_meta: "{{ pve_read.stdout | from_json }}"
 
+    # Same check as apply.yml, and for the same reason: preflight is the verb you
+    # run when you suspect something, so it must refuse a declared state that
+    # points at something that does not exist rather than report on it.
+    - name: Refuse a declared state that points at something that does not exist
+      ansible.builtin.include_tasks: tasks/validate_state.yml
+
     - name: Analyse every declared guest in one templating pass
       ansible.builtin.set_fact:
         pve_plan: "{% import 'pve_engine.j2' as e %}{{ e.plan(pve_cts, pve_vm_specs, pve_read_meta.guests) | from_json }}"

@@ -1,0 +1,42 @@
+---
+# ===========================================================================
+# The declared state must not point at anything that does not exist.
+#
+# Included by BOTH verbs, before either of them mutates anything, so a dangling
+# reference stops preflight and apply alike, with the same message.
+#
+# The checks live in filter_plugins/state.py rather than in the reader, and that
+# placement is the whole point: pve_read.py parses the manifest RAW, so it sees
+# `"{{ lab_bridge_name }}"` as a literal string and every templated value would
+# be a false positive. Ansible resolves the Jinja before it calls a filter, so
+# the filter sees the values the run will actually act on.
+#
+# It runs against `pve_cts`/`pve_vm_specs` — the effective specs, defaults
+# already merged — so what is validated is what the engine is about to act on,
+# not a second reading of the same file that could drift from it.
+#
+# Why this is worth a task: RouterOS ACCEPTS an address on an interface name
+# that does not exist and silently does not create it. The API answers 200, the
+# run reports success, and the router lacks the address. The failure then
+# surfaces two layers later, in a connectivity test, looking like a network
+# problem. This turns it into a parse error that names the reference.
+# ===========================================================================
+- name: The declared state must not point at anything that does not exist
+  ansible.builtin.assert:
+    that:
+      - pve_state_problems | length == 0
+    fail_msg: >-
+      The declared state has {{ pve_state_problems | length }} dangling reference(s),
+      so nothing was read and nothing was changed.
+      {% for problem in pve_state_problems %}
+      {{ loop.index }}. {{ problem }}
+      {% endfor %}
+    success_msg: "Every reference inside the declared state resolves."
+  vars:
+    pve_state_problems: >-
+      {{ {'containers': pve_cts,
+          'vms': pve_vm_specs,
+          'targets': pve_config_targets | default([]),
+          'bridges': pve_bridges | default([]),
+          'tunnel': pve_tunnel | default({})}
+         | pve_state_problems }}
