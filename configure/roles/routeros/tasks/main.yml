@@ -181,6 +181,26 @@
   loop_control:
     label: "{{ item.address }} {{ item.interface }}"
 
+- name: Every declared route must be on the router AND installed
+  ansible.builtin.assert:
+    that:
+      - found | length == 1
+      - (found | first).active | default('false') | string | lower == 'true'
+    fail_msg: >-
+      {{ item.dst_address }} via {{ item.gateway }} is not a single ACTIVE route on
+      the router. A route can be stored and still inactive — that is exactly what
+      happens when its gateway is not reachable — so this asserts the route is
+      INSTALLED, not merely present. The router reports:
+      {{ ros_after.routes | default([]) | map(attribute='dst-address') | join(', ') }}.
+    success_msg: "{{ item.dst_address }} via {{ item.gateway }} is installed, as declared."
+  vars:
+    found: >-
+      {{ ros_after.routes | default([]) | selectattr('dst-address', 'equalto', item.dst_address)
+         | selectattr('gateway', 'equalto', item.gateway) | list }}
+  loop: "{{ l2_config.routeros.routes | default([]) }}"
+  loop_control:
+    label: "{{ item.dst_address }} via {{ item.gateway }}"
+
 - name: Every declared bridge must exist with exactly its declared ports
   ansible.builtin.assert:
     that:

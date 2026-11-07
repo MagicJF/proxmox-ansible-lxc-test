@@ -8,10 +8,13 @@
 #      next apply would recreate it — "I deleted it and it came back" is exactly
 #      that loop;
 #   2. it needs -e confirm=<hostname or vmid> so a typo cannot delete a guest;
-#   3. it looks the guest up BY HOSTNAME: community.proxmox.proxmox matches
-#      `vm["vmid"] == vmid` against the cluster's integer vmid, so a VMID alone
-#      never matches and the module answers "already absent" while touching
-#      nothing (learned the hard way);
+#   3. it passes the guest's hostname AND its vmid to the destroy module, because
+#      the module needs both and each one alone is wrong in a different way. It
+#      resolves the guest BY NAME, so a vmid alone never matches and the module
+#      answers "already absent" while touching nothing (learned the hard way) —
+#      but a hostname alone stops being unique as soon as two guests share one,
+#      which is what replacing a lab without renaming produces. The pair is what
+#      disambiguates;
 #   4. it refuses to delete a RUNNING guest unless -e force=true is given;
 #   5. it proves the result by re-reading the platform: the guest must be gone and
 #      — unless -e keep_disks=true — no volume of it may remain in any storage.
@@ -180,10 +183,16 @@
       community.proxmox.proxmox:
         <<: *pve_auth
         node: "{{ pve_node }}"
-        # By hostname on purpose: the module matches the cluster's INTEGER vmid
-        # against the parameter, so a VMID never matches and it would report
-        # "already absent" while deleting nothing.
+        # BOTH the hostname and the vmid, and the pair is the point. The module
+        # resolves the guest by NAME, so the vmid alone does not match (it would
+        # answer "already absent" while deleting nothing) — but the hostname
+        # alone stops being unique the moment two guests share a name, which is
+        # exactly what happens when a lab is replaced without renaming: this play
+        # then died with "Multiple VMs found with hostname ws1. Please specify
+        # VMID.", hidden behind this task's own `no_log`. With both, the module
+        # disambiguates and the destroy is unambiguous again.
         hostname: "{{ t.name }}"
+        vmid: "{{ t.vmid | int }}"
         state: absent
         force: "{{ do_force }}"
         purge: true
@@ -200,6 +209,8 @@
         <<: *pve_auth
         node: "{{ pve_node }}"
         name: "{{ t.name }}"
+        # Same pair as the container above, and for the same reason.
+        vmid: "{{ t.vmid | int }}"
         state: absent
         force: "{{ do_force }}"
         purge: true

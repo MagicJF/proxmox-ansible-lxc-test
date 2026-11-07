@@ -17,31 +17,63 @@
 pve_node: Proxmox
 
 # ============================================================================
-# Identidad del laboratorio de conectividad — UNA sola verdad.
+# EL LABORATORIO DE TRES SEDES — la única verdad de su direccionamiento.
 #
-# Tres consumidores distintos necesitan estos mismos cuatro valores: la
-# declaración del CHR (su dirección de gestión y la del segmento del lab), el
-# contenedor de bootstrap (la dirección que le concede al CHR en el primer
-# arranque), el servidor DHCP del propio CHR (la red y la puerta de enlace) y la
-# ruta que el endpoint necesita para llegar al lab. Declararlos una vez aquí es
-# lo que evita que se separen.
+# La topología es la de una empresa pequeña con una central y dos delegaciones:
 #
-# Las direcciones de las WORKSTATIONS no están aquí: cada una declara la suya en
-# su propia entrada (es su identidad en el segmento) y el CHR las deriva.
+#   SEDE 1 (central)              SEDE 2 (delegación)     SEDE 3 (delegación)
+#     ws1 ws2   ws3 ws4             ws5 ws6                 ws7 ws8
+#        │         │                   │                       │
+#      sw1 ═════ sw2                  sw3                     sw4
+#        │                             │                       │
+#       rt1 ════ WAN 1 ════ rt2         rt1 ════ WAN 2 ════ rt3
+#
+# Cuatro switches y tres routers RouterOS. Cada switch es L2 PURO —conmuta y NO
+# enruta: su dirección es sólo de administración— y cada router es la puerta de
+# enlace de su sede. Eso es lo que hace que esto sea la topología de una red real
+# y no una colección de máquinas con direcciones.
+#
+# El reparto es JERÁRQUICO (hub-and-spoke): rt1 es la central y conoce las dos
+# redes remotas; rt2 y rt3 tienen una ruta POR DEFECTO hacia rt1. Es la
+# configuración real de una delegación, y añadir una cuarta sede es una entrada
+# más y una ruta más en el hub.
+#
+# Direccionamiento — una línea por decisión, para que se lea de un vistazo:
+#   10.10.10.0/24   la LAN de PVE, donde vive la pata de GESTIÓN de cada RouterOS
+#   10.11.0.0/24    SEDE 1 — 4 workstations, puerta 10.11.0.1 en rt1
+#   10.12.0.0/24    SEDE 2 — 2 workstations, puerta 10.12.0.1 en rt2
+#   10.13.0.0/24    SEDE 3 — 2 workstations, puerta 10.13.0.1 en rt3
+#   10.99.1.0/30    cable punto a punto rt1<->rt2 (WAN 1): .1 = rt1, .2 = rt2
+#   10.99.2.0/30    cable punto a punto rt1<->rt3 (WAN 2): .1 = rt1, .2 = rt3
+#
+# La dirección de gestión de cada RouterOS acaba en su propio VMID: sw1 es .160
+# porque su vmid es 160. Una regla, no una tabla de excepciones.
+#
+# Y las WORKSTATIONS no declaran aquí su dirección: cada una lleva la suya en su
+# propia entrada, porque es su identidad en el segmento, y el router la deriva de
+# ahí. Una sola verdad, no dos que se separan.
 # ============================================================================
-# La pata de gestión del CHR: en la LAN 10.10.10.0/24, como la IP de
-# administración de cualquier switch real.
-lab_router_mgmt: "10.10.10.50"
-# La MAC de su ether1. Fijada porque el bootstrap ata la concesión a ella: es lo
-# que hace determinista la primera dirección de un CHR que aún no tiene ninguna.
-lab_router_mac: "BC:24:11:00:00:40"
-# El segmento del lab, detrás del router.
-lab_network: "10.30.0.0/24"
-lab_gateway: "10.30.0.1"
-# El nombre del bridge de RouterOS: los puertos del switch. Se declara una vez
-# porque la dirección del segmento y el servidor DHCP viven EN él, y "bridge" no
-# es un nombre de interfaz — la interfaz se llama como se llame este bridge.
-lab_bridge_name: "lan"
+lab_site1_network: "10.11.0.0/24"
+lab_site1_gateway: "10.11.0.1"
+lab_site1_pool: "10.11.0.100-10.11.0.199"
+lab_site2_network: "10.12.0.0/24"
+lab_site2_gateway: "10.12.0.1"
+lab_site2_pool: "10.12.0.100-10.12.0.199"
+lab_site3_network: "10.13.0.0/24"
+lab_site3_gateway: "10.13.0.1"
+lab_site3_pool: "10.13.0.100-10.13.0.199"
+lab_wan1_network: "10.99.1.0/30"
+lab_wan1_hub: "10.99.1.1"
+lab_wan1_spoke: "10.99.1.2"
+lab_wan2_network: "10.99.2.0/30"
+lab_wan2_hub: "10.99.2.1"
+lab_wan2_spoke: "10.99.2.2"
+# La red del cliente del túnel (el nodo de control). Los routers necesitan una
+# ruta de VUELTA hacia ella, o una workstation que conteste al control node
+# mandaría la respuesta por su ruta por defecto y se perdería. Es la
+# contrapartida de pve_tunnel.endpoint_routes.
+lab_control_network: "10.99.99.0/24"
+lab_control_via: "10.10.10.1"
 
 # ============================================================================
 # The automation key every guest is born with — a framework default, not a
@@ -96,24 +128,31 @@ pve_tunnel:
   address: "10.99.99.2/24"
   # Only the lab's networks are routed through the tunnel; everything else (the
   # API on its public address) keeps using the normal path. It is a LIST because
-  # the lab's guests no longer share one subnet: the workstations live in their
-  # sites' networks and are reachable only THROUGH the MikroTik topology, so the
-  # control node needs a route into each of them.
+  # the lab's guests no longer share one subnet: each site is its own network and
+  # is reachable only THROUGH the MikroTik topology, so the control node needs a
+  # route into each of them.
   guest_network:
-    - "10.10.10.0/24"   # la LAN de gestión (el host y el CHR)
-    - "10.30.0.0/24"    # la red del lab: vive DETRÁS del CHR, así que el
-                        # endpoint necesita una ruta para ella (abajo)
+    - "10.10.10.0/24"   # la LAN de gestión (el host y las patas de gestión)
+    - "10.11.0.0/24"    # SEDE 1, detrás de rt1
+    - "10.12.0.0/24"    # SEDE 2, detrás de rt2
+    - "10.13.0.0/24"    # SEDE 3, detrás de rt3
   # Rutas que el ENDPOINT (el host Proxmox) necesita para entregar el tráfico del
   # túnel a una red que no tiene conectada. Sin ellas el control node alcanza al
-  # CHR pero no a las workstations que están detrás: el endpoint manda esos
-  # paquetes por su ruta por defecto y mueren en el camino.
+  # router de la sede pero no a las workstations que están detrás: el endpoint
+  # manda esos paquetes por su ruta por defecto y mueren en el camino.
   #
   # Es la única línea que hay que pegar a mano, y la aplica el MISMO script que
   # ya se pega una vez (playbooks/tools/wg_endpoint_setup.sh), que la recibe como
-  # último argumento. `via` es la dirección de gestión del router de esa red.
+  # último argumento. `via` es la dirección de gestión del router de esa red, que
+  # es como se llega a la red de una sede en la vida real: por la pata de
+  # administración de su router.
   endpoint_routes:
-    - to: "{{ lab_network }}"
-      via: "{{ lab_router_mgmt }}"
+    - to: "{{ lab_site1_network }}"
+      via: "10.10.10.162"   # rt1
+    - to: "{{ lab_site2_network }}"
+      via: "10.10.10.164"   # rt2
+    - to: "{{ lab_site3_network }}"
+      via: "10.10.10.166"   # rt3
   # No extension, like an SSH key: the public half is this path plus `.pub`.
   private_key_path: "/home/hermes/.hermes/profiles/hermione/secrets/wg-lab-client"
   keepalive: 25
@@ -130,15 +169,46 @@ pve_tunnel:
 # `bridge_ports` empty is what makes a link isolated. Only creation is
 # automated: a segment that already exists is left alone, because recreating a
 # bridge under a running lab would cut its guests off.
+#
+# Catorce cables. El nombre de cada bridge describe el CABLE, y por eso aparece
+# literal en sus dos puntas: en el `netif` de la workstation y en el `net` del
+# router. El validador del manifiesto rechaza un bridge citado que no esté
+# declarado aquí, así que una errata no puede dejar un cable de una sola punta.
 # ============================================================================
 pve_bridges:
-  # Un cable RJ45, y nada más: cada bridge lleva UN enlace punto a punto entre el
-  # router y una workstation. Sin puertos físicos y sin dirección, así que quien
-  # conmuta y quien reparte las direcciones es el RouterOS, no Proxmox.
-  - iface: vmbr2
-    comments: "lab cable: lab-chr ether2 <-> ws1 (isolated, no ports)"
-  - iface: vmbr3
-    comments: "lab cable: lab-chr ether3 <-> ws2 (isolated, no ports)"
+  # ---- SEDE 1 ---------------------------------------------------------------
+  - iface: vmbr4
+    comments: "cable: ws1 eth0 <-> sw1 ether2 (acceso, sin etiquetar)"
+  - iface: vmbr5
+    comments: "cable: ws2 eth0 <-> sw1 ether3 (acceso, sin etiquetar)"
+  - iface: vmbr6
+    comments: "cable: ws3 eth0 <-> sw2 ether2 (acceso, sin etiquetar)"
+  - iface: vmbr7
+    comments: "cable: ws4 eth0 <-> sw2 ether3 (acceso, sin etiquetar)"
+  - iface: vmbr8
+    comments: "cable: sw1 ether4 <-> sw2 ether4 (TRONCAL L2 entre los dos switches)"
+  - iface: vmbr9
+    comments: "cable: sw1 ether5 <-> rt1 ether2 (el switch entrega la sede a su router)"
+  # ---- SEDE 2 ---------------------------------------------------------------
+  - iface: vmbr10
+    comments: "cable: ws5 eth0 <-> sw3 ether2"
+  - iface: vmbr11
+    comments: "cable: ws6 eth0 <-> sw3 ether3"
+  - iface: vmbr12
+    comments: "cable: sw3 ether4 <-> rt2 ether2"
+  # ---- SEDE 3 ---------------------------------------------------------------
+  - iface: vmbr13
+    comments: "cable: ws7 eth0 <-> sw4 ether2"
+  - iface: vmbr14
+    comments: "cable: ws8 eth0 <-> sw4 ether3"
+  - iface: vmbr15
+    comments: "cable: sw4 ether4 <-> rt3 ether2"
+  # ---- LA WAN: dos enlaces punto a punto, no un segmento compartido ---------
+  - iface: vmbr16
+    comments: "WAN 1: rt1 ether3 <-> rt2 ether3 (10.99.1.0/30)"
+  - iface: vmbr17
+    comments: "WAN 2: rt1 ether4 <-> rt3 ether3 (10.99.2.0/30)"
+
 pve_defaults:
   # ---- creation-time: PVE cannot change these on an existing container ------
   # Drift here is refused, not converged: the container would have to be
@@ -154,7 +224,7 @@ pve_defaults:
   # started | stopped
   status: stopped
 
-  # ---- resources (converged in place) -------------------------------------
+  # ---- resources (converged in place) --------------------------------------
   memory: 2048
   swap: 512
   cores: 2
@@ -162,7 +232,7 @@ pve_defaults:
   # cpulimit on update, so it cannot be declared coherently. Use cpuunits.
   cpuunits: 1024
 
-  # ---- behaviour (converged in place) -------------------------------------
+  # ---- behaviour (converged in place) --------------------------------------
   onboot: false
   description: "Managed by proxmox-ansible-lxc-test. Declare changes in inventory/group_vars/all.yml."
   tags: [ansible-managed, lab]
@@ -262,58 +332,146 @@ pve_containers:
           expect_body: "TiddlyWiki"
 
   # ---------------------------------------------------------------------------
-  # El laboratorio de conectividad: dos workstations y el switch que las une.
+  # LAS OCHO WORKSTATIONS — ordenadores, no contenedores con pata de gestión.
   #
-  # Cada workstation es un PC: UNA sola NIC, sin interfaz de gestión, en su
-  # propio bridge aislado — el latiguillo RJ45 que la une al switch. Su dirección
-  # la reparte el propio RouterOS por DHCP, como en cualquier red real, y por eso
-  # layer 2 no puede derivarla de un `net0` estático: se declara aquí como la
-  # dirección que el switch le RESERVA, y el CHR la deriva de esta entrada.
+  # Cada una es un PC: UNA sola NIC, en su propio bridge aislado (el latiguillo
+  # RJ45 hacia su switch) y SIN interfaz de gestión. Así se hace en una empresa:
+  # un PC de oficina tiene un interfaz y recibe su dirección por DHCP; nadie le
+  # pone un segundo NIC "de gestión", y nadie entra en él por SSH desde la red —
+  # la gestión real de un parque es un agente que SALE hacia fuera, nunca una
+  # conexión hacia dentro.
   #
-  # La MAC va declarada en el net0 porque es lo que ata la reserva a la interfaz:
-  # una sola verdad, no dos. PVE la respeta al crear la LXC.
+  # Por eso ninguna declara `config:` y capa 2 no entra en ellas. Su dirección la
+  # reparte por DHCP el router de su sede, con una reserva atada a la MAC, y el
+  # `address:` de aquí ES esa reserva: el router la deriva de esta entrada, así
+  # que no hay dos sitios donde pueda desincronizarse.
+  #
+  # La verificación no necesita entrar en ellas — sale de los ROUTERS, que es
+  # como prueba una red un ingeniero de redes: /ping, /tool/traceroute, /ip/arp,
+  # /ip/dhcp-server/lease y /interface/bridge/host.
+  #
+  # La MAC va declarada porque es lo que ata la reserva a la interfaz, y porque
+  # el nombre del bridge tiene que coincidir con la punta del cable en el router:
+  # el validador del manifiesto comprueba las dos cosas.
+  #
+  # Esquema de MAC: BC:24:11:00:<clase>:<índice>, con 50 = workstation y 60+n =
+  # el RouterOS número n. Legible al buscar en la tabla de conmutación.
   # ---------------------------------------------------------------------------
-  - vmid: 141
+  - vmid: 150
     hostname: ws1
+    site: sede1
+    address: "10.11.0.11"
     cores: 1
-    memory: 512
-    rootfs_size: 6
+    memory: 256
+    rootfs_size: 4
     swap: 256
     status: started
-    tags: [netlab, workstation, lab]
-    description: "Workstation 1: una sola NIC en el cable hacia el CHR. Sin interfaz de gestión, como un PC."
-    # La dirección que el CHR le reserva por MAC. La usan el servidor DHCP del
-    # router (la concesión) y layer 2 (dónde hablarle por SSH).
-    address: "10.30.0.11"
+    tags: [netlab, workstation, sede1]
+    description: "Workstation 1 (sede 1): una sola NIC en el cable hacia sw1. Sin pata de gestión, como un PC."
     netif:
-      net0: "name=eth0,bridge=vmbr2,hwaddr=BC:24:11:00:00:51,ip=dhcp"
-    # Sin bloque `config`: layer 2 NO entra en esta workstation. No tiene interfaz
-    # de gestión a propósito — es un PC — así que sólo se llega a ella cruzando el
-    # switch, y eso necesita una ruta en el ENDPOINT que la API de PVE no puede
-    # añadir (está declarada en pve_tunnel.endpoint_routes y la aplica el script
-    # del túnel). Mientras esa ruta no exista, declararla `manage: true` no la
-    # convergería: haría fallar su comprobación de alcanzabilidad y, con `serial`,
-    # abortaría también los invitados que van detrás en la lista.
-    #
-    # Su dirección la reparte el CHR por DHCP con una reserva por MAC. El
-    # `address:` de arriba ES esa reserva: el CHR la deriva de aquí, y la MAC de
-    # su net0 es lo que ata la concesión a esta interfaz. Una sola verdad.
+      net0: "name=eth0,bridge=vmbr4,hwaddr=BC:24:11:00:50:01,ip=dhcp"
 
-  - vmid: 142
+  - vmid: 151
     hostname: ws2
+    site: sede1
+    address: "10.11.0.12"
     cores: 1
-    memory: 512
-    rootfs_size: 6
+    memory: 256
+    rootfs_size: 4
     swap: 256
     status: started
-    tags: [netlab, workstation, lab]
-    description: "Workstation 2: una sola NIC en el cable hacia el CHR. Sin interfaz de gestión, como un PC."
-    address: "10.30.0.12"
+    tags: [netlab, workstation, sede1]
+    description: "Workstation 2 (sede 1): una sola NIC en el cable hacia sw1."
     netif:
-      net0: "name=eth0,bridge=vmbr3,hwaddr=BC:24:11:00:00:52,ip=dhcp"
+      net0: "name=eth0,bridge=vmbr5,hwaddr=BC:24:11:00:50:02,ip=dhcp"
+
+  - vmid: 152
+    hostname: ws3
+    site: sede1
+    address: "10.11.0.13"
+    cores: 1
+    memory: 256
+    rootfs_size: 4
+    swap: 256
+    status: started
+    tags: [netlab, workstation, sede1]
+    description: "Workstation 3 (sede 1): una sola NIC en el cable hacia sw2. Para llegar a ella hay que cruzar el troncal entre los dos switches."
+    netif:
+      net0: "name=eth0,bridge=vmbr6,hwaddr=BC:24:11:00:50:03,ip=dhcp"
+
+  - vmid: 153
+    hostname: ws4
+    site: sede1
+    address: "10.11.0.14"
+    cores: 1
+    memory: 256
+    rootfs_size: 4
+    swap: 256
+    status: started
+    tags: [netlab, workstation, sede1]
+    description: "Workstation 4 (sede 1): una sola NIC en el cable hacia sw2."
+    netif:
+      net0: "name=eth0,bridge=vmbr7,hwaddr=BC:24:11:00:50:04,ip=dhcp"
+
+  - vmid: 154
+    hostname: ws5
+    site: sede2
+    address: "10.12.0.11"
+    cores: 1
+    memory: 256
+    rootfs_size: 4
+    swap: 256
+    status: started
+    tags: [netlab, workstation, sede2]
+    description: "Workstation 5 (sede 2, delegación): en la red de rt2, al otro lado de la WAN 1."
+    netif:
+      net0: "name=eth0,bridge=vmbr10,hwaddr=BC:24:11:00:50:05,ip=dhcp"
+
+  - vmid: 155
+    hostname: ws6
+    site: sede2
+    address: "10.12.0.12"
+    cores: 1
+    memory: 256
+    rootfs_size: 4
+    swap: 256
+    status: started
+    tags: [netlab, workstation, sede2]
+    description: "Workstation 6 (sede 2, delegación): en la red de rt2."
+    netif:
+      net0: "name=eth0,bridge=vmbr11,hwaddr=BC:24:11:00:50:06,ip=dhcp"
+
+  - vmid: 156
+    hostname: ws7
+    site: sede3
+    address: "10.13.0.11"
+    cores: 1
+    memory: 256
+    rootfs_size: 4
+    swap: 256
+    status: started
+    tags: [netlab, workstation, sede3]
+    description: "Workstation 7 (sede 3, delegación): en la red de rt3, al otro lado de la WAN 2."
+    netif:
+      net0: "name=eth0,bridge=vmbr13,hwaddr=BC:24:11:00:50:07,ip=dhcp"
+
+  - vmid: 157
+    hostname: ws8
+    site: sede3
+    address: "10.13.0.12"
+    cores: 1
+    memory: 256
+    rootfs_size: 4
+    swap: 256
+    status: started
+    tags: [netlab, workstation, sede3]
+    description: "Workstation 8 (sede 3, delegación): en la red de rt3."
+    netif:
+      net0: "name=eth0,bridge=vmbr14,hwaddr=BC:24:11:00:50:08,ip=dhcp"
 
   # ---------------------------------------------------------------------------
-  # El bootstrap del CHR: el único punto que la API de PVE no puede resolver.
+  # El bootstrap de los SIETE routers: el único punto que la API de PVE no puede
+  # resolver.
   #
   # Un CHR recién importado arranca SIN dirección (sólo un cliente DHCP en
   # ether1) y, al ser una VM, no puede tomar una concesión del DHCP del host: la
@@ -321,11 +479,15 @@ pve_containers:
   # medido en este lab). Sin dirección no hay API REST, así que hace falta algo
   # que le dé la primera.
   #
-  # Este contenedor es ese algo: vive en la MISMA pata de gestión que el CHR,
-  # corre dnsmasq atado a la MAC de su ether1 y con el offload de TX desactivado
-  # (sin eso su propia oferta tendría el mismo checksum roto), y concede
-  # exactamente una dirección: la de gestión del CHR. A partir de ahí todo lo
-  # demás lo hace la API REST, y este contenedor no vuelve a intervenir.
+  # Este contenedor es ese algo: vive en la MISMA pata de gestión que los routers
+  # (vmbr1), corre dnsmasq atado a las MACs de sus ether1 y con el offload de TX
+  # desactivado (sin eso su propia oferta tendría el mismo checksum roto), y
+  # concede exactamente una dirección a cada uno. A partir de ahí todo lo demás lo
+  # hace la API REST, y este contenedor no vuelve a intervenir.
+  #
+  # Las reservas se DERIVAN de la declaración de cada router —la MAC de su net0 y
+  # la dirección que ya declara en ether1—, así que aquí no se repite ningún valor
+  # y no pueden separarse. Un router nuevo en la lista es una reserva más.
   #
   # Dirección estática a propósito: es infraestructura, no una workstation, y
   # layer 2 tiene que poder entrar a configurarla antes de que el lab exista.
@@ -340,17 +502,24 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, bootstrap, lab]
-    description: "Concede al CHR su primera dirección por DHCP (atada a su MAC) para que la API REST exista. No hace nada más."
+    description: "Concede a cada router su primera dirección por DHCP (atada a su MAC) para que su API REST exista. No hace nada más."
     netif:
       net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.53/24"
     manage: true
     config:
       bootstrap:
         interface: eth0
-        # La MAC que pide la dirección y la dirección que se le concede salen de
-        # la identidad del lab (arriba): no se repiten.
-        lease_mac: "{{ lab_router_mac }}"
-        lease_address: "{{ lab_router_mgmt }}"
+        hosts: >-
+          {%- set out = [] -%}
+          {%- for v in pve_vms | selectattr('chr', 'defined') -%}
+          {%-   set mac = v.net.net0 | regex_replace('^.*virtio=([0-9A-Fa-f:]{17}).*$', '\\1') -%}
+          {%-   set mgmt = v.config.routeros.addresses
+                          | selectattr('interface', 'equalto', 'ether1') | first -%}
+          {%-   set _ = out.append({'mac': mac,
+                                    'address': mgmt.address.split('/')[0],
+                                    'name': v.name}) -%}
+          {%- endfor -%}
+          {{ out }}
 
 # ============================================================================
 # QEMU VMs — same declarative rules as the containers, with one important
@@ -408,10 +577,13 @@ pve_vm_defaults:
 # Shared by every router of the network lab. They sit ON TOP of pve_vm_defaults
 # (which describe the nested PVE guest) and apply only to entries declaring
 # `chr: true`, so the vendor image, the boot order and the console live in one
-# block instead of five copies.
+# block instead of seven copies.
 pve_chr_defaults:
-  cores: 2
-  memory: 512
+  # 1 core y 256 MiB por router: un CHR que conmuta y enruta sin hacer más no
+  # necesita más, y son SIETE. 7 x 256 MiB = 1.75 GiB, que es lo que hace que el
+  # lab entero quepa en los ~7.5 GiB libres del nodo.
+  cores: 1
+  memory: 256
   status: started
   manage: true
   # The vendor image has no cloud-init, so the drive would be dead weight.
@@ -423,7 +595,9 @@ pve_chr_defaults:
   boot: "order=scsi0"
   tags: [netlab, routeros, lab]
   scsi:
-    scsi0: "local-zfs:8"
+    # 1 GiB y no 8: la imagen del fabricante ocupa 128 MiB y RouterOS CHR vive en
+    # RAM, así que un disco grande aquí es espacio asignado que nadie usa.
+    scsi0: "local-zfs:1"
   # The vendor image, imported instead of created: proxmox_kvm can only build a
   # disk from a size, so the raw image is uploaded to a storage that accepts
   # `import` and attached with the API's creation-time import-from syntax (see
@@ -444,73 +618,273 @@ pve_chr_defaults:
   # console keymap, which in RouterOS is US with no setting to change it.
 
 # The VMs this repository manages — and nothing else.
+#
+# SIETE routers MikroTik RouterOS: cuatro switches y tres routers, que es la
+# topología de la red de tres sedes. Cada uno tiene una pata de GESTIÓN en vmbr1
+# (todo switch administrable tiene su dirección de administración, y sin ella no
+# habría forma de configurarlo) y el resto de sus patas son los CABLES del
+# diagrama, uno por bridge.
+#
+# Los CUATRO SWITCHES son L2 PURO: ponen sus patas de datos en un bridge de
+# RouterOS y NO le ponen dirección. Eso es lo que los hace switches y no routers
+# — su dirección vive sólo en la pata de gestión. Un switch al que se le pone
+# dirección en el bridge empieza a enrutar y la topología deja de ser la que dice
+# el diagrama.
+#
+# Los TRES ROUTERS sí enrutan: la LAN de su sede en una pata, la WAN en otra, y
+# las rutas estáticas declaradas abajo. rt1 es el hub y conoce las dos redes
+# remotas; rt2 y rt3 tienen una ruta por defecto hacia él.
+#
+# Las MACs van todas declaradas, y no por gusto: las NICs de una VM son
+# creation-time, así que una MAC generada por PVE sería drift contra un valor
+# declarado vacío y `apply` lo RECHAZA. Esquema: BC:24:11:00:6<n>:0<p>, con n el
+# número de router (1..7) y p el número de pata.
+#
+# El orden y el nombre de las patas importan: `ether1` es SIEMPRE la gestión,
+# porque es la que el bootstrap direcciona y la que `addresses` usa. Cambiar ese
+# orden deja al router sin API.
 pve_vms:
-  # ---------------------------------------------------------------------------
-  # El switch/router del lab: un MikroTik RouterOS CHR.
-  #
-  # Tres puertos, y cada uno es un cable:
-  #   ether1 -> vmbr1   la pata de GESTIÓN. Todo switch real tiene su dirección
-  #                     de administración; sin ella no habría forma de
-  #                     configurarlo ni de llegar al lab.
-  #   ether2 -> vmbr2   el cable hacia ws1
-  #   ether3 -> vmbr3   el cable hacia ws2
-  # ether2 y ether3 van al MISMO bridge de RouterOS: eso ES el switch. ether1
-  # queda fuera, como el puerto de consola/gestión de un switch.
-  #
-  # Todo lo de dentro (bridge, direcciones, DHCP con reservas) se declara en
-  # `config.routeros` y lo converge configure/roles/routeros hablando con la API
-  # REST del router — nunca por SSH ni por la API binaria.
-  #
-  # Las NICs de una VM son creation-time (proxmox_kvm no las actualiza), así que
-  # las MACs quedan fijadas aquí: la de ether1 es la que el bootstrap usa para
-  # concederle la primera dirección.
-  # ---------------------------------------------------------------------------
-  - vmid: 140
-    name: lab-chr
+  # =========================================================================
+  # SEDE 1 — la central
+  # =========================================================================
+
+  # sw1: el switch de acceso que conecta ws1, ws2, el otro switch y el router.
+  # Cuatro patas de datos (ether2..ether5) en UN bridge, sin dirección en él.
+  - vmid: 160
+    name: sw1
     chr: true
     net:
-      net0: "virtio={{ lab_router_mac }},bridge=vmbr1"
-      net1: "virtio=BC:24:11:00:00:41,bridge=vmbr2"
-      net2: "virtio=BC:24:11:00:00:42,bridge=vmbr3"
+      net0: "virtio=BC:24:11:00:61:01,bridge=vmbr1"     # ether1 gestion
+      net1: "virtio=BC:24:11:00:61:02,bridge=vmbr4"     # ether2 -> ws1
+      net2: "virtio=BC:24:11:00:61:03,bridge=vmbr5"     # ether3 -> ws2
+      net3: "virtio=BC:24:11:00:61:04,bridge=vmbr8"     # ether4 -> sw2 (troncal)
+      net4: "virtio=BC:24:11:00:61:05,bridge=vmbr9"     # ether5 -> rt1
     config:
       routeros:
-        identity: lab-chr
-        # Direcciones estáticas. La de ether1 es la de gestión — la misma que el
-        # bootstrap le concede por DHCP en el primer arranque, para que la API
-        # REST exista. La del bridge es la puerta de enlace del lab.
+        identity: sw1
         addresses:
-          - address: "{{ lab_router_mgmt }}/24"
+          - address: "10.10.10.160/24"
             interface: ether1
-          - address: "{{ lab_gateway }}/24"
-            interface: "{{ lab_bridge_name }}"
-        # El switch: estos dos puertos van al mismo bridge de RouterOS.
+        # El switch. Sin `address` en el bridge: si la tuviera, enrutaría.
         bridges:
-          - name: "{{ lab_bridge_name }}"
-            ports: [ether2, ether3]
+          - name: lan
+            ports: [ether2, ether3, ether4, ether5]
         # Un CHR de fábrica trae un cliente DHCP en ether1. Con una dirección
         # estática declarada, ese cliente es drift y se elimina.
         dhcp_client: false
+
+  # sw2: el segundo switch de acceso de la central. Cuelga de sw1 por el troncal
+  # (mismo dominio L2, que es lo que hace que las cuatro workstations de la sede
+  # compartan una sola red).
+  - vmid: 161
+    name: sw2
+    chr: true
+    net:
+      net0: "virtio=BC:24:11:00:62:01,bridge=vmbr1"     # ether1 gestion
+      net1: "virtio=BC:24:11:00:62:02,bridge=vmbr6"     # ether2 -> ws3
+      net2: "virtio=BC:24:11:00:62:03,bridge=vmbr7"     # ether3 -> ws4
+      net3: "virtio=BC:24:11:00:62:04,bridge=vmbr8"     # ether4 -> sw1 (troncal)
+    config:
+      routeros:
+        identity: sw2
+        addresses:
+          - address: "10.10.10.161/24"
+            interface: ether1
+        bridges:
+          - name: lan
+            ports: [ether2, ether3, ether4]
+        dhcp_client: false
+
+  # rt1: el router de la central y el núcleo de la WAN. Es la puerta de enlace de
+  # su sede y el único que conoce las redes remotas; rt2 y rt3 dependen de él.
+  - vmid: 162
+    name: rt1
+    chr: true
+    net:
+      net0: "virtio=BC:24:11:00:63:01,bridge=vmbr1"     # ether1 gestion
+      net1: "virtio=BC:24:11:00:63:02,bridge=vmbr9"     # ether2 -> sw1 (la LAN de la sede)
+      net2: "virtio=BC:24:11:00:63:03,bridge=vmbr16"    # ether3 -> WAN 1
+      net3: "virtio=BC:24:11:00:63:04,bridge=vmbr17"    # ether4 -> WAN 2
+    config:
+      routeros:
+        identity: rt1
+        addresses:
+          - address: "10.10.10.162/24"
+            interface: ether1
+          - address: "{{ lab_site1_gateway }}/24"
+            interface: ether2
+          - address: "{{ lab_wan1_hub }}/30"
+            interface: ether3
+          - address: "{{ lab_wan2_hub }}/30"
+            interface: ether4
+        dhcp_client: false
+        # Las dos redes que rt1 ve por la WAN, más la vuelta hacia el nodo de
+        # control. Los saltos ya existen como redes conectadas (ether3/ether4),
+        # así que RouterOS instala estas rutas ACTIVAS.
+        routes:
+          - dst_address: "{{ lab_site2_network }}"
+            gateway: "{{ lab_wan1_spoke }}"
+          - dst_address: "{{ lab_site3_network }}"
+            gateway: "{{ lab_wan2_spoke }}"
+          - dst_address: "{{ lab_control_network }}"
+            gateway: "{{ lab_control_via }}"
         dhcp_servers:
-          - name: lab
-            interface: "{{ lab_bridge_name }}"
-            address_pool: "10.30.0.10-10.30.0.254"
-            network: "{{ lab_network }}"
-            gateway: "{{ lab_gateway }}"
-            dns_server: "{{ lab_gateway }}"
-            # Una reserva por workstation. La dirección y la MAC salen de la
-            # declaración de la propia workstation (arriba): la MAC de su net0 y
-            # su `address:`. Aquí no se repite ningún valor.
+          - name: sede1
+            interface: ether2
+            address_pool: "{{ lab_site1_pool }}"
+            network: "{{ lab_site1_network }}"
+            gateway: "{{ lab_site1_gateway }}"
+            dns_server: "{{ lab_site1_gateway }}"
+            # Una reserva por workstation DE ESTA SEDE. La dirección y la MAC
+            # salen de la declaración de la propia workstation: aquí no se repite
+            # ningún valor, así que no pueden desincronizarse.
             leases: >-
               {%- set out = [] -%}
               {%- for c in pve_containers
-                     | selectattr('address', 'defined')
-                     | selectattr('netif', 'defined') -%}
-              {%- set _ = out.append({
+                     | selectattr('site', 'defined')
+                     | selectattr('site', 'equalto', 'sede1') -%}
+              {%-   set _ = out.append({
                     'address': c.address,
                     'mac_address': c.netif.net0 | regex_replace('^.*hwaddr=([0-9A-Fa-f:]{17}).*$', '\\1'),
                     'comment': c.hostname }) -%}
               {%- endfor -%}
               {{ out }}
+
+  # =========================================================================
+  # SEDE 2 — delegación
+  # =========================================================================
+
+  # sw3: el switch de la delegación. Une sus dos workstations.
+  - vmid: 163
+    name: sw3
+    chr: true
+    net:
+      net0: "virtio=BC:24:11:00:64:01,bridge=vmbr1"     # ether1 gestion
+      net1: "virtio=BC:24:11:00:64:02,bridge=vmbr10"    # ether2 -> ws5
+      net2: "virtio=BC:24:11:00:64:03,bridge=vmbr11"    # ether3 -> ws6
+      net3: "virtio=BC:24:11:00:64:04,bridge=vmbr12"    # ether4 -> rt2
+    config:
+      routeros:
+        identity: sw3
+        addresses:
+          - address: "10.10.10.163/24"
+            interface: ether1
+        bridges:
+          - name: lan
+            ports: [ether2, ether3, ether4]
+        dhcp_client: false
+
+  # rt2: el router de la delegación. Una pata a su switch, una a la WAN 1, y una
+  # ruta POR DEFECTO hacia rt1 — la configuración real de una delegación.
+  - vmid: 164
+    name: rt2
+    chr: true
+    net:
+      net0: "virtio=BC:24:11:00:65:01,bridge=vmbr1"     # ether1 gestion
+      net1: "virtio=BC:24:11:00:65:02,bridge=vmbr12"    # ether2 -> sw3 (la LAN de la sede)
+      net2: "virtio=BC:24:11:00:65:03,bridge=vmbr16"    # ether3 -> WAN 1
+    config:
+      routeros:
+        identity: rt2
+        addresses:
+          - address: "10.10.10.164/24"
+            interface: ether1
+          - address: "{{ lab_site2_gateway }}/24"
+            interface: ether2
+          - address: "{{ lab_wan1_spoke }}/30"
+            interface: ether3
+        dhcp_client: false
+        routes:
+          # La delegación no necesita saber qué hay al otro lado: todo lo que no
+          # es local va por la central. Añadir una sede nueva no toca esta línea.
+          - dst_address: "0.0.0.0/0"
+            gateway: "{{ lab_wan1_hub }}"
+          - dst_address: "{{ lab_control_network }}"
+            gateway: "{{ lab_control_via }}"
+        dhcp_servers:
+          - name: sede2
+            interface: ether2
+            address_pool: "{{ lab_site2_pool }}"
+            network: "{{ lab_site2_network }}"
+            gateway: "{{ lab_site2_gateway }}"
+            dns_server: "{{ lab_site2_gateway }}"
+            leases: >-
+              {%- set out = [] -%}
+              {%- for c in pve_containers
+                     | selectattr('site', 'defined')
+                     | selectattr('site', 'equalto', 'sede2') -%}
+              {%-   set _ = out.append({
+                    'address': c.address,
+                    'mac_address': c.netif.net0 | regex_replace('^.*hwaddr=([0-9A-Fa-f:]{17}).*$', '\\1'),
+                    'comment': c.hostname }) -%}
+              {%- endfor -%}
+              {{ out }}
+
+  # =========================================================================
+  # SEDE 3 — delegación
+  # =========================================================================
+
+  - vmid: 165
+    name: sw4
+    chr: true
+    net:
+      net0: "virtio=BC:24:11:00:66:01,bridge=vmbr1"     # ether1 gestion
+      net1: "virtio=BC:24:11:00:66:02,bridge=vmbr13"    # ether2 -> ws7
+      net2: "virtio=BC:24:11:00:66:03,bridge=vmbr14"    # ether3 -> ws8
+      net3: "virtio=BC:24:11:00:66:04,bridge=vmbr15"    # ether4 -> rt3
+    config:
+      routeros:
+        identity: sw4
+        addresses:
+          - address: "10.10.10.165/24"
+            interface: ether1
+        bridges:
+          - name: lan
+            ports: [ether2, ether3, ether4]
+        dhcp_client: false
+
+  - vmid: 166
+    name: rt3
+    chr: true
+    net:
+      net0: "virtio=BC:24:11:00:67:01,bridge=vmbr1"     # ether1 gestion
+      net1: "virtio=BC:24:11:00:67:02,bridge=vmbr15"    # ether2 -> sw4 (la LAN de la sede)
+      net2: "virtio=BC:24:11:00:67:03,bridge=vmbr17"    # ether3 -> WAN 2
+    config:
+      routeros:
+        identity: rt3
+        addresses:
+          - address: "10.10.10.166/24"
+            interface: ether1
+          - address: "{{ lab_site3_gateway }}/24"
+            interface: ether2
+          - address: "{{ lab_wan2_spoke }}/30"
+            interface: ether3
+        dhcp_client: false
+        routes:
+          - dst_address: "0.0.0.0/0"
+            gateway: "{{ lab_wan2_hub }}"
+          - dst_address: "{{ lab_control_network }}"
+            gateway: "{{ lab_control_via }}"
+        dhcp_servers:
+          - name: sede3
+            interface: ether2
+            address_pool: "{{ lab_site3_pool }}"
+            network: "{{ lab_site3_network }}"
+            gateway: "{{ lab_site3_gateway }}"
+            dns_server: "{{ lab_site3_gateway }}"
+            leases: >-
+              {%- set out = [] -%}
+              {%- for c in pve_containers
+                     | selectattr('site', 'defined')
+                     | selectattr('site', 'equalto', 'sede3') -%}
+              {%-   set _ = out.append({
+                    'address': c.address,
+                    'mac_address': c.netif.net0 | regex_replace('^.*hwaddr=([0-9A-Fa-f:]{17}).*$', '\\1'),
+                    'comment': c.hostname }) -%}
+              {%- endfor -%}
+              {{ out }}
+
   # ---- plantilla de VM (sin declarar) --------------------------------------
   # - vmid: 120
   #   name: pve-nested

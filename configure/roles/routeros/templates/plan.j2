@@ -5,8 +5,11 @@
   says what it is going to do before it does it.
 
   The ORDER of the list is the order of the calls, and it is load-bearing:
-    bridges -> ports -> addresses -> pool -> dhcp network -> dhcp server ->
-    leases -> deletions -> identity -> the ether1 swap.
+    bridges -> ports -> addresses -> routes -> pool -> dhcp network ->
+    dhcp server -> leases -> deletions -> identity -> the ether1 swap.
+  Routes come after the addresses because a route whose gateway is not yet
+  reachable is ACCEPTED but stored INACTIVE, and the verification demands an
+  active one: this order keeps that failure honest instead of self-inflicted.
   The swap goes LAST and inside ONE script: removing the factory DHCP client
   takes the router's only address away, so the static one has to be added in the
   same execution or the router is left with nothing to talk to.
@@ -54,6 +57,21 @@
 {%-   if found | length == 0 -%}
 {%-     set _ = ops.append({'method': 'PUT', 'path': 'ip/address',
                             'body': {'address': a.address, 'interface': a.interface}}) -%}
+{%-   endif -%}
+{%- endfor -%}
+
+{#- ---------- static routes ---------- -#}
+{#- The write verb is NOT `PUT ip/route`. On RouterOS 7.25 that answers 400 "no
+    such command" even though `GET ip/route` works: the menu takes
+    `POST ip/route/add`, which is what the console `/ip route add` maps to.
+    Measured against a live CHR, not assumed. -#}
+{%- set decl_routes = cfg.routes | default([]) -%}
+{%- for r in decl_routes -%}
+{%-   set found = ros.routes | default([]) | selectattr('dst-address', 'equalto', r.dst_address)
+                 | selectattr('gateway', 'equalto', r.gateway) | list -%}
+{%-   if found | length == 0 -%}
+{%-     set _ = ops.append({'method': 'POST', 'path': 'ip/route/add',
+                            'body': {'dst-address': r.dst_address, 'gateway': r.gateway}}) -%}
 {%-   endif -%}
 {%- endfor -%}
 
@@ -135,6 +153,19 @@
                   | selectattr('interface', 'equalto', a.interface) | list -%}
 {%-   if wanted | length == 0 and a.dynamic | default('false') | string | lower != 'true' -%}
 {%-     set _ = ops.append({'method': 'DELETE', 'path': 'ip/address/' ~ a['.id']}) -%}
+{%-   endif -%}
+{%- endfor -%}
+{%- for r in ros.routes | default([]) -%}
+{#- Only the routes this role creates. `static` is RouterOS's marker for a route
+    an operator or the API added; a `dynamic` one is the router's own
+    bookkeeping (a connected network, later a route a protocol installed) and
+    deleting it is fighting the router, not converging it. Measured: a static
+    route carries `static: "true"`, a connected one carries no `static` at all,
+    and both are STRINGS. -#}
+{%-   set wanted = decl_routes | selectattr('dst_address', 'equalto', r['dst-address'])
+                  | selectattr('gateway', 'equalto', r.gateway) | list -%}
+{%-   if wanted | length == 0 and r.static | default('false') | string | lower == 'true' -%}
+{%-     set _ = ops.append({'method': 'DELETE', 'path': 'ip/route/' ~ r['.id']}) -%}
 {%-   endif -%}
 {%- endfor -%}
 {%- for l in ros.dhcp_leases | default([]) -%}

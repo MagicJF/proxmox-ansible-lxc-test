@@ -155,8 +155,7 @@
         name: bootstrap
       vars:
         bootstrap_interface: "{{ (l2_config.bootstrap | default({})).interface | default('eth0') }}"
-        bootstrap_lease_mac: "{{ (l2_config.bootstrap | default({})).lease_mac | default('') }}"
-        bootstrap_lease_address: "{{ (l2_config.bootstrap | default({})).lease_address | default('') }}"
+        bootstrap_hosts: "{{ (l2_config.bootstrap | default({})).hosts | default([]) }}"
       when:
         - l2_manage | bool
         - l2_config.bootstrap is defined
@@ -251,14 +250,39 @@
       until: (l2_probe.status | default(0) | int) == (item.expect_status | default(200) | int)
       failed_when: false
 
+    - name: Reduce what came back before anything loops over it
+      # ONE expression, not a per-item loop, and that is the whole point. A task
+      # that loops echoes its loop value into its own result, and the loop value
+      # here is a registered `uri` result — whose `content` is the ENTIRE response
+      # body. Probe a wiki page and a handful of log lines become megabytes of
+      # HTML: measured at 6.15 MB per run, which filled logs/ansible.log faster
+      # than every other task combined and which the retention policy was quietly
+      # bounding (two 13 MB archives are the evidence). Reducing it here means no
+      # later loop can ever see the body again.
+      ansible.builtin.set_fact:
+        l2_probe_report: >-
+          {%- set out = [] -%}
+          {%- for r in l2_probe.results -%}
+          {%-   set _ = out.append({
+                'target': r.item._target,
+                'address': r.item.address,
+                'status': r.status | default(0) | int,
+                'expect_status': r.item.expect_status | default(200) | int,
+                'expect_body': r.item.expect_body | default(''),
+                'body_head': r.content | default('') | trim | truncate(60),
+                'body_has': r.item.expect_body | default('') in (r.content | default('')) }) -%}
+          {%- endfor -%}
+          {{ out }}
+      when: l2_probe.results | length > 0
+
     - name: Report what came back
       ansible.builtin.debug:
         msg: >-
-          {{ item.item._target }} {{ item.item.address }} -> HTTP {{ item.status | default('no answer') }}
-          {{ ('| body ' ~ (item.content | trim | truncate(60))) if item.content is defined and item.content | length > 0 else '' }}
-      loop: "{{ l2_probe.results }}"
+          {{ item.target }} {{ item.address }} -> HTTP {{ item.status | default('no answer') }}
+          {{ ('| body ' ~ item.body_head) if item.body_head | length > 0 else '' }}
+      loop: "{{ l2_probe_report | default([]) }}"
       loop_control:
-        label: "{{ item.item._target }}"
+        label: "{{ item.target }}"
       changed_when: false
 
     - name: Every declared site must answer with the status its declaration expects
@@ -267,33 +291,27 @@
       # declaration should say so rather than the framework assuming.
       ansible.builtin.assert:
         that:
-          - item.status | default(0) | int == (item.item.expect_status | default(200) | int)
+          - item.status | int == item.expect_status | int
         fail_msg: >-
-          {{ item.item._target }} {{ item.item.address }} answered
-          {{ item.status | default('nothing') }} but the declaration expects
-          {{ item.item.expect_status | default(200) }}. The Caddyfile may be deployed
-          but not serving, or the guest may be unreachable from here.
-        success_msg: >-
-          {{ item.item._target }} {{ item.item.address }} answered
-          {{ item.status }} as declared.
-      loop: "{{ l2_probe.results }}"
+          {{ item.target }} {{ item.address }} answered {{ item.status | default('nothing') }}
+          but the declaration expects {{ item.expect_status }}. The Caddyfile may be
+          deployed but not serving, or the guest may be unreachable from here.
+        success_msg: "{{ item.target }} {{ item.address }} answered {{ item.status }} as declared."
+      loop: "{{ l2_probe_report | default([]) }}"
       loop_control:
-        label: "{{ item.item._target }}"
-      when: l2_probe.results | length > 0
+        label: "{{ item.target }}"
 
     - name: A declared body must be the body the guest actually serves
+      # Decided against the FULL body, not against the truncated head the report
+      # shows: `body_has` is computed where the body is still whole, so a declared
+      # string that appears past the first 60 characters is still found.
       ansible.builtin.assert:
         that:
-          - item.item.expect_body in item.content
+          - item.body_has
         fail_msg: >-
-          {{ item.item._target }} {{ item.item.address }} served
-          "{{ item.content | default('') | trim | truncate(80) }}" but the declaration
-          says it must contain "{{ item.item.expect_body }}".
-        success_msg: "{{ item.item._target }} served the declared body: {{ item.item.expect_body }}"
-      loop: "{{ l2_probe.results }}"
+          {{ item.target }} {{ item.address }} served "{{ item.body_head }}" but the
+          declaration says it must contain "{{ item.expect_body }}".
+        success_msg: "{{ item.target }} served the declared body: {{ item.expect_body }}"
+      loop: "{{ l2_probe_report | default([]) | selectattr('expect_body', 'ne', '') | list }}"
       loop_control:
-        label: "{{ item.item._target }}"
-      when:
-        - l2_probe.results | length > 0
-        - item.item.expect_body is defined
-        - item.content is defined
+        label: "{{ item.target }}"

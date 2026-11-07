@@ -41,6 +41,7 @@ routeros_tables:
   - {key: bridges, path: interface/bridge}
   - {key: bridge_ports, path: interface/bridge/port}
   - {key: addresses, path: ip/address}
+  - {key: routes, path: ip/route}
   - {key: dhcp_clients, path: ip/dhcp-client}
   - {key: pools, path: ip/pool}
   - {key: dhcp_servers, path: ip/dhcp-server}
