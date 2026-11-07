@@ -319,24 +319,24 @@ pve_vm_defaults:
 
 # The VMs this repository manages — and nothing else.
 pve_vms:
-  - vmid: 120
-    name: pve-nested
-    cores: 4
-    memory: 4096
-    # Boots the Proxmox VE installer from the ISO already on the node.
-    status: started
-    # Opt-out, and the reason the default had to be overridable: the installer
-    # ISO does not run cloud-init, so a cloud-init drive would be dead weight.
-    cloudinit: false
-    net:
-      # vmbr1 is the internal LAN (10.10.10.0/24) where every other lab guest
-      # lives. vmbr0 is the PUBLIC bridge (54.36.168.83/24 on eno3): do not put
-      # a lab guest there unless you mean to expose it to the internet.
-      net0: "virtio,bridge=vmbr1"
-    scsi:
-      scsi0: "local-zfs:32"
-    ide:
-      ide2: "local:iso/proxmox-ve_9.2-1.iso,media=cdrom"
+  # - vmid: 120
+  #   name: pve-nested
+  #   cores: 4
+  #   memory: 4096
+  #   # Boots the Proxmox VE installer from the ISO already on the node.
+  #   status: started
+  #   # Opt-out, and the reason the default had to be overridable: the installer
+  #   # ISO does not run cloud-init, so a cloud-init drive would be dead weight.
+  #   cloudinit: false
+  #   net:
+  #     # vmbr1 is the internal LAN (10.10.10.0/24) where every other lab guest
+  #     # lives. vmbr0 is the PUBLIC bridge (54.36.168.83/24 on eno3): do not put
+  #     # a lab guest there unless you mean to expose it to the internet.
+  #     net0: "virtio,bridge=vmbr1"
+  #   scsi:
+  #     scsi0: "local-zfs:32"
+  #   ide:
+  #     ide2: "local:iso/proxmox-ve_9.2-1.iso,media=cdrom"
 
   # The router of the network lab: MikroTik's CHR (RouterOS in a QEMU VM),
   # deployed from the vendor image instead of from an ISO. It is the only
@@ -414,6 +414,13 @@ pve_vms:
           - {address: "10.10.10.50/24", interface: ether1}
           - {address: "10.20.1.1/24", interface: ether2}
           - {address: "10.20.2.1/24", interface: ether3}
+        # The console's SPEED, which is not cosmetic: QEMU's emulated UART paces
+        # the guest's output at the port's baud rate, and RouterOS defaults a
+        # newly detected port to 9600 — roughly a kilobyte per second, which is
+        # exactly why this console feels sluggish next to a container's, whose
+        # pty has no UART to pace it.
+        ports:
+          - {name: serial0, baud_rate: 115200}
 
 # ============================================================================
 # Layer 2 — configuration targets (guest-side, over SSH).

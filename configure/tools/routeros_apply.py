@@ -83,7 +83,12 @@ def _read_sentence(sock):
 
 
 def _command(sock, words, timeout=10):
-    """Send one command and read every sentence up to !done / !trap / !fatal."""
+    """Send one command and read every sentence up to !done / !fatal.
+
+    A failed command answers `!trap` and THEN `!done`, so stopping at the trap
+    leaves that `!done` in the buffer and every later command reads the previous
+    reply — which shows up as an empty, silently wrong verification.
+    """
     sock.settimeout(timeout)
     for word in words:
         sock.sendall(_encode(word))
@@ -94,7 +99,7 @@ def _command(sock, words, timeout=10):
         if not sentence:
             return sentences
         sentences.append(sentence)
-        if sentence[0] in ("!done", "!trap", "!fatal"):
+        if sentence[0] in ("!done", "!fatal"):
             return sentences
 
 
@@ -126,7 +131,7 @@ def connect(host, user, password, timeout=10):
 # Declared state -> RouterOS
 # --------------------------------------------------------------------------- #
 def read_state(sock):
-    state = {"addresses": [], "identity": None, "dhcp_clients": []}
+    state = {"addresses": [], "identity": None, "dhcp_clients": [], "ports": {}}
     for sentence in _command(sock, ["/ip/address/print"]):
         if sentence[0] != "!re":
             continue
@@ -143,6 +148,15 @@ def read_state(sock):
         if sentence[0] == "!re":
             item = dict(w[1:].split("=", 1) for w in sentence[1:] if w.startswith("="))
             state["dhcp_clients"].append({"id": item.get(".id"), "interface": item.get("interface")})
+    for sentence in _command(sock, ["/port/print"]):
+        if sentence[0] == "!re":
+            item = dict(w[1:].split("=", 1) for w in sentence[1:] if w.startswith("="))
+            state["ports"][item.get("name")] = item
+    state["consoles"] = []
+    for sentence in _command(sock, ["/system/console/print"]):
+        if sentence[0] == "!re":
+            item = dict(w[1:].split("=", 1) for w in sentence[1:] if w.startswith("="))
+            state["consoles"].append(item)
     return state
 
 
@@ -185,6 +199,35 @@ def apply_state(sock, declared, new_password=None):
         else:
             report["errors"].append(f"identity: {reply[-1]}")
 
+    # ---- serial ports: the baud rate is not cosmetic ------------------------
+    # QEMU's emulated UART paces the guest's output at the port's baud rate, so
+    # a console left at RouterOS's 9600 default moves about a kilobyte per
+    # second — visibly sluggish next to a container's pty, which has no UART to
+    # pace it. Raising it is the difference between "usable" and "painful".
+    for port in declared.get("ports", []):
+        live = state["ports"].get(port["name"])
+        if live is None:
+            report["errors"].append(f"port {port['name']} does not exist on the router")
+            continue
+        if str(live.get("baud-rate")) != str(port["baud_rate"]):
+            # RouterOS refuses to touch a port a console is using ("Cannot
+            # change port while in use!"), so the consoles attached to it are
+            # detached for the duration of the change and put back afterwards.
+            attached = [c for c in state["consoles"] if c.get("port") == port["name"]]
+            for console in attached:
+                _command(sock, ["/system/console/set",
+                                f"=numbers={console.get('.id')}", "=disabled=yes"])
+            reply = _command(sock, ["/port/set", f"=numbers={port['name']}",
+                                    f"=baud-rate={port['baud_rate']}"])
+            for console in attached:
+                _command(sock, ["/system/console/set",
+                                f"=numbers={console.get('.id')}", "=disabled=no"])
+            if _ok(reply):
+                report["changed"].append(
+                    f"port {port['name']} baud-rate {live.get('baud-rate')} -> {port['baud_rate']}")
+            else:
+                report["errors"].append(f"port {port['name']}: {reply[-1]}")
+
     # ---- password (only when the router still uses the factory-empty one) ---
     if new_password:
         reply = _command(sock, ["/user/set", "=numbers=0", f"=password={new_password}"])
@@ -199,6 +242,12 @@ def apply_state(sock, declared, new_password=None):
     report["addresses"] = [f"{a['address']} {a['interface']}" for a in after["addresses"]]
     report["identity"] = after["identity"]
     report["dhcp_clients"] = [c["interface"] for c in after["dhcp_clients"]]
+    report["ports"] = {name: p.get("baud-rate") for name, p in after["ports"].items()}
+    for port in declared.get("ports", []):
+        if str(after["ports"].get(port["name"], {}).get("baud-rate")) != str(port["baud_rate"]):
+            report["errors"].append(
+                f"port {port['name']} still at {after['ports'].get(port['name'], {}).get('baud-rate')}, "
+                f"declared {port['baud_rate']}")
     missing = wanted - {(a["address"], a["interface"]) for a in after["addresses"]}
     if missing:
         report["errors"].append(f"declared addresses still missing: {sorted(missing)}")
