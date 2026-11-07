@@ -8,20 +8,25 @@
 # This role converges the machine that hands it over, and then PROVES the router
 # took it: a running dnsmasq is not proof that the router got an address.
 # ===========================================================================
-- name: Refuse a bootstrap declaration without an interface, a MAC or an address
+- name: Refuse a bootstrap declaration without an interface and a list of hosts
   ansible.builtin.assert:
     that:
       - bootstrap_interface is defined and bootstrap_interface | length > 0
-      - bootstrap_lease_mac is defined and bootstrap_lease_mac | length > 0
-      - bootstrap_lease_address is defined and bootstrap_lease_address | length > 0
+      - bootstrap_hosts is defined and bootstrap_hosts | length > 0
+      # Every entry carries BOTH keys. `rejectattr` twice looked like it said
+      # this and did not: an entry with a `mac` but no `address` is dropped by
+      # the first rejection, so a half-declared host passed the check.
+      - bootstrap_hosts | selectattr('mac', 'defined') | selectattr('address', 'defined')
+        | list | length == bootstrap_hosts | length
     fail_msg: >-
-      A `bootstrap` block needs `interface`, `lease_mac` and `lease_address`
-      (got {{ l2_config.bootstrap | default({}) | to_json }}). The MAC is what
-      makes the concession deterministic; the address is what the router will
-      have before its API exists.
+      A `bootstrap` block needs `interface` and a non-empty `hosts` list, each
+      entry carrying `mac` and `address` (got
+      {{ l2_config.bootstrap | default({}) | to_json }}). The MAC is what makes
+      each concession deterministic; the address is what each router will have
+      before its own API exists.
     success_msg: >-
-      Bootstrap is well formed: {{ bootstrap_lease_address }} to
-      {{ bootstrap_lease_mac }} on {{ bootstrap_interface }}.
+      Bootstrap is well formed: {{ bootstrap_hosts | length }} reservation(s) on
+      {{ bootstrap_interface }} — {{ bootstrap_hosts | map(attribute='address') | join(', ') }}.
 
 - name: Install the DHCP server and the tool that fixes its offers
   ansible.builtin.apt:
@@ -98,42 +103,49 @@
   changed_when: false
   failed_when: false
 
-- name: Wait for the address this container exists to hand over
+- name: Wait for every router to take the address this container hands over
   # The real question is not "did dnsmasq log a lease" but "does the router have
-  # an address" — and the only thing a router with an address can answer on is
+  # an address" — and the only thing a router WITH an address can answer on is
   # its own API. This stays true after the router has taken the address as a
   # static one, which is what makes the role idempotent.
-  ansible.builtin.wait_for:
-    host: "{{ bootstrap_lease_address }}"
-    port: "{{ bootstrap_answer_port }}"
-    timeout: "{{ bootstrap_answer_timeout }}"
-  register: bootstrap_answer
-  failed_when: false
-  changed_when: false
-
-- name: Assert the router has the address this container hands over
-  ansible.builtin.assert:
-    that:
-      - not (bootstrap_answer.failed | default(false))
-    fail_msg: >-
-      Nothing answers on {{ bootstrap_lease_address }}:{{ bootstrap_answer_port }},
-      so the router does not have its first address yet and its API does not
-      exist. dnsmasq's lease file says
-      "{{ bootstrap_leases.stdout | default('(empty)') | trim }}".
-      Check that dnsmasq is running on this guest (`ss -ulpn` shows it on :67)
-      and that TX checksumming is off on {{ bootstrap_interface }} — a DHCP offer
-      that leaves a veth with an unfinished UDP checksum is dropped by the
-      router's kernel, and the router then asks forever while dnsmasq logs a
-      successful offer.
-    success_msg: >-
-      {{ bootstrap_lease_address }} answers on :{{ bootstrap_answer_port }}:
-      the router has its first address, so its REST API exists and everything
-      else about it is converged over REST.
+  #
+  # NO `failed_when: false` here, deliberately, and the reason is a bug this role
+  # used to have: `failed_when: false` OVERWRITES the result's `failed` to false,
+  # so an assertion reading `bootstrap_answer.failed` is always satisfied and a
+  # router that never took its address passes silently. Measured with a
+  # wait_for against a closed port: the result came back with `failed=False` and
+  # the only surviving trace was the message. So the task is allowed to fail —
+  # the loop label names the router, and Ansible's own error names it again —
+  # and the block below turns it into a diagnosis instead of a stack trace.
+  block:
+    - name: Wait for the API port of every router this container addresses
+      ansible.builtin.wait_for:
+        host: "{{ item.address }}"
+        port: "{{ bootstrap_answer_port }}"
+        timeout: "{{ bootstrap_answer_timeout }}"
+      loop: "{{ bootstrap_hosts }}"
+      loop_control:
+        label: "{{ item.name | default(item.address) }}"
+  rescue:
+    - name: Report which router did not take its first address
+      ansible.builtin.fail:
+        msg: >-
+          A router did not answer on :{{ bootstrap_answer_port }}, so it does not
+          have its first address yet and its REST API does not exist. dnsmasq's
+          lease file says "{{ bootstrap_leases.stdout | default('(empty)') | trim }}".
+          Check that dnsmasq is running on this guest (`ss -ulpn` shows it on :67)
+          and that TX checksumming is off on {{ bootstrap_interface }}: a DHCP
+          offer that leaves a veth with an unfinished UDP checksum is dropped by
+          the router's kernel, and the router then asks forever while dnsmasq
+          logs a successful offer. Every router this container serves:
+          {{ bootstrap_hosts | map(attribute='name') | zip(bootstrap_hosts | map(attribute='address'))
+             | map('join', '=') | join(', ') }}.
 
 - name: Report what the bootstrap had to do
   ansible.builtin.debug:
     msg: >-
-      {{ bootstrap_lease_address }} is answered by the router
-      ({{ 'dnsmasq still holds the lease it handed over'
-         if bootstrap_lease_mac | lower in (bootstrap_leases.stdout | default('') | lower)
-         else 'dnsmasq no longer holds the lease — expected: the router gave it back when it took the address as a static one' }}).
+      {{ bootstrap_hosts | length }} router(s) have their first address and their
+      REST API exists: {{ bootstrap_hosts | map(attribute='address') | join(', ') }}.
+      {{ 'dnsmasq still holds the leases it handed over'
+         if bootstrap_hosts | map(attribute='mac') | map('lower') | select('in', bootstrap_leases.stdout | default('') | lower) | list | length > 0
+         else 'dnsmasq no longer holds them — expected: each router gave its lease back when it took the address as a static one' }}.

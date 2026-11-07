@@ -10,13 +10,16 @@ bind-interfaces
 # port 53 on the management LAN.
 port=0
 
-dhcp-range={{ bootstrap_lease_address }},{{ bootstrap_lease_address }},{{ bootstrap_netmask }},{{ bootstrap_lease_time }}
-dhcp-host={{ bootstrap_lease_mac }},{{ bootstrap_lease_address }}
-
-# Only the machine declared above. Every other client on this segment belongs to
-# the host's own DHCP server and must not be served from here — a second server
-# answering them would be an addressing race in the middle of the lab.
-dhcp-ignore=tag:!known
+# ONE `dhcp-range`, and in `static` mode: dnsmasq hands out no addresses from a
+# pool, it answers only the hosts declared below. That is what keeps this
+# container from racing the host's own DHCP server for any other machine on the
+# segment — the same effect as the `dhcp-ignore=tag:!known` it replaces, said in
+# the one line that was needed anyway.
+dhcp-range={{ bootstrap_hosts[0].address }},static,{{ bootstrap_netmask }},{{ bootstrap_lease_time }}
+{% for h in bootstrap_hosts %}
+# {{ h.name | default('router') }}
+dhcp-host={{ h.mac }},{{ h.address }}
+{% endfor %}
 
 # No router and no DNS options: the only thing this hands over is an address.
 # The router's real addressing (its static management address, its default
