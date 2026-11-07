@@ -40,7 +40,7 @@ import re
 from ansible.errors import AnsibleFilterError
 
 # Container and VM attachment keys: interfaces, mount points, every disk bus.
-_ATTACHMENT_KEY = re.compile(r"^(net|mp|scsi|virtio|sata|ide|efidisk|tpmstate)[0-9]+$")
+_ATTACHMENT_KEY = re.compile(r"^(net|mp|scsi|virtio|sata|ide|efidisk|tpmstate|serial)[0-9]+$")
 
 _VOLUME_SHORTHAND = re.compile(r"^([^:,]+):([0-9]+)$")
 # Only PVE-generated volume ids are reduced to their storage; an ISO path is not.

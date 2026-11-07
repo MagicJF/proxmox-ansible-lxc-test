@@ -351,13 +351,21 @@ pve_vms:
     cloudinit: false
     # CHR is an i440fx-era image: it boots on the PC chipset, not on q35.
     machine: pc
-    # The VNC console's keymap. It belongs to the VM, not to RouterOS: without
-    # it the console is en-us and a Spanish keyboard types the wrong characters
-    # (the `-`, `/` and quote keys, which is exactly what RouterOS commands are
-    # made of). Declare it per VM rather than in pve_vm_defaults: it is a
-    # property of the session you type into, and the nested PVE guest already
-    # chose its own layout at install time.
-    keyboard: es
+    # NO `keyboard:` here, deliberately — it cannot do what it looks like it
+    # does. That option only tells the VNC server how to turn the browser's keys
+    # into SCANCODES; the last translation is the guest's own console keymap,
+    # and RouterOS's console is US with no setting to change it. So every value
+    # of `keyboard` renders the US character for that key position: a Spanish
+    # `/` (Shift+7) comes out as `&` whichever way it is set, and setting it to
+    # `es` merely breaks the one workaround that does work (typing the US key
+    # for the character you want).
+    #
+    # The console that respects the keyboard is the SERIAL one: it carries
+    # CHARACTERS, not scancodes, so the browser's layout survives to the guest.
+    # Declaring the port is all it takes — RouterOS detects it on boot and
+    # creates its own console on it (`/system/console`: port=serial0, vt102).
+    serial:
+      serial0: socket
     # The imported image is the only disk, so it must be the boot device (the
     # default order expects the cloud-init drive this VM does not have).
     boot: "order=scsi0"

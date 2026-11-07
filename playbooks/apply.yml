@@ -297,6 +297,11 @@
         tags: "{{ ct.tags | default(omit, true) }}"
         kvm: true
         net: "{{ ct.net }}"
+        # A serial port declared as `socket` is what gives PVE's UI a console
+        # that carries CHARACTERS instead of scancodes — the only console that
+        # respects a non-US keyboard when the guest's own console layout cannot
+        # be changed (RouterOS, for instance).
+        serial: "{{ ct.serial | default(omit, true) }}"
         # A disk that comes from a vendor image is rewritten here into the API's
         # creation-time import syntax; its declared size is applied afterwards
         # (tasks/disk_import.yml), because PVE creates the volume at the image's
@@ -332,6 +337,8 @@
         cpu: "{{ ct.cpu if 'cpu' in a.to_set else omit }}"
         vga: "{{ ct.vga if 'vga' in a.to_set else omit }}"
         keyboard: "{{ ct.keyboard if 'keyboard' in a.to_set else omit }}"
+        serial: >-
+          {{ ct.serial if ((ct.serial | default({}, true)).keys() | list | intersect(a.to_set) | length > 0) else omit }}
         boot: "{{ ct.boot if 'boot' in a.to_set else omit }}"
         onboot: "{{ (ct.onboot | bool) if 'onboot' in a.to_set else omit }}"
         description: "{{ ct.description if 'description' in a.to_set else omit }}"
