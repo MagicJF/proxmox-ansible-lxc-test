@@ -125,6 +125,29 @@
     - tunnel_link.rc == 0
     - tunnel_conf.changed
 
+- name: Route every declared network through the tunnel
+  # `wg-quick up` installs the routes derived from AllowedIPs, but `wg syncconf`
+  # above only rewrites the peer list: it never touches the kernel's routing
+  # table. When the declaration GROWS, the interface ends up allowing the new
+  # prefixes while the kernel still sends them out the default route — the
+  # tunnel reports itself healthy, `wg show` lists every network, and every added
+  # one answers `Timeout` because its packets never entered the tunnel. Reconcile
+  # the routes explicitly, which is exactly what wg-quick's `Table = auto` would
+  # have done at `up`, and report `changed` from the difference in the table so a
+  # run that adds nothing stays quiet.
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      before=$(ip -o route show dev {{ pve_tunnel.name | quote }} | awk '{print $1}' | sort)
+      for prefix in {{ pve_tunnel.guest_network | join(' ') }}; do
+        ip route replace "$prefix" dev {{ pve_tunnel.name | quote }}
+      done
+      after=$(ip -o route show dev {{ pve_tunnel.name | quote }} | awk '{print $1}' | sort)
+      [ "$before" = "$after" ] || echo changed
+    executable: /bin/sh
+  register: tunnel_routes
+  changed_when: "'changed' in tunnel_routes.stdout"
+
 - name: Keep the tunnel up across reboots
   ansible.builtin.systemd_service:
     name: "wg-quick@{{ pve_tunnel.name }}"

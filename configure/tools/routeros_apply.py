@@ -30,6 +30,7 @@ import json
 import socket
 import struct
 import sys
+import time
 
 PORT = 8728
 
@@ -111,6 +112,55 @@ def _ok(sentences):
     return bool(sentences) and sentences[-1][0] == "!done"
 
 
+def _run_script(sock, name, lines, timeout=8):
+    """Create a script ON the router and run it there.
+
+    The API has no `[find]`, so a stale script with the same name is removed by
+    `.id` after a print. `run` is allowed to time out: it is the step that may
+    take the address away, and the script keeps running on the router whatever
+    happens to this connection.
+    """
+    for sentence in _command(sock, ["/system/script/print"]):
+        if sentence[0] != "!re":
+            continue
+        item = dict(w[1:].split("=", 1) for w in sentence[1:] if w.startswith("="))
+        if item.get("name") == name:
+            _command(sock, ["/system/script/remove", f"=.id={item['.id']}"])
+    _command(sock, ["/system/script/add", f"=name={name}",
+                    "=source=" + "\n".join(lines)])
+    try:
+        _command(sock, ["/system/script/run", f"=number={name}"], timeout=timeout)
+    except OSError:
+        pass
+
+
+def _detach_from_dhcp(sock, declared, reconnect, report):
+    """Remove the DHCP client and install the declared addresses server-side.
+
+    The obvious order cannot work over the API. A declared address is normally
+    the very one the DHCP client holds — the bootstrap hands the router the
+    address the declaration names — so adding it first answers
+    `failure: already have such address` (verified on chr-c, `!trap`), and
+    removing the client first drops the address this session runs over: the
+    socket dies before the add is ever sent, and the router is left with no
+    address at all. That is a one-way door — the API is gone, MAC-telnet did not
+    interoperate with RouterOS 7.25, and the serial console cannot be driven
+    from a script.
+
+    A RouterOS script runs on the router, so the removal and the address land
+    together whether or not this connection survives them. Afterwards the tool
+    reconnects to the declared address and carries on.
+    """
+    lines = ["/ip/dhcp-client/remove [find]"]
+    for address, interface in sorted({(a["address"], a["interface"])
+                                      for a in declared.get("addresses", [])}):
+        lines.append(f"/ip/address/add address={address} interface={interface}")
+    _run_script(sock, "hermes-dhcp-detach", lines)
+    report["changed"].append(
+        "dhcp-client removed and the declared addresses installed (server-side script)")
+    return reconnect()
+
+
 def connect(host, user, password, timeout=10):
     """Log in, handling both the modern and the challenge/response flow."""
     sock = socket.socket()
@@ -176,8 +226,13 @@ def read_state(sock):
     return state
 
 
-def apply_state(sock, declared, new_password=None):
-    """Converge the live router to the declaration. Returns a report."""
+def apply_state(sock, declared, new_password=None, reconnect=None):
+    """Converge the live router to the declaration.
+
+    Returns `(report, sock)`. The socket can be a NEW one: dropping the DHCP
+    client takes away the address this session runs over, so the caller gets the
+    reconnected socket back instead of one that is known to be dead.
+    """
     state = read_state(sock)
     report = {"changed": [], "addresses": [], "identity": None,
               "dhcp_clients": [], "password_set": False, "errors": []}
@@ -215,6 +270,19 @@ def apply_state(sock, declared, new_password=None):
                     report["errors"].append(
                         f"bridge {bridge['name']} port remove: {reply[-1]}")
 
+    # ---- dhcp-client and the address it holds: one server-side script -------
+    # The order matters and it is not the obvious one; `_detach_from_dhcp` carries
+    # the full account. It never runs once something has failed: taking the
+    # address away is the one change that can strand a router, so it happens only
+    # while the session is still known to be healthy, and `reconnect` must exist
+    # (the caller's job) for the tool to find the router again afterwards.
+    if (declared.get("dhcp_client") is False
+            and state["dhcp_clients"]
+            and not report["errors"]
+            and reconnect is not None):
+        sock = _detach_from_dhcp(sock, declared, reconnect, report)
+        state = read_state(sock)
+
     # ---- addresses: add what is missing, remove what is not declared --------
     wanted = {(a["address"], a["interface"]) for a in declared.get("addresses", [])}
     live = {(a["address"], a["interface"]): a for a in state["addresses"] if not a["dynamic"]}
@@ -230,15 +298,6 @@ def apply_state(sock, declared, new_password=None):
             report["changed"].append(f"address -{key[0]} {key[1]}")
         else:
             report["errors"].append(f"remove {key[0]}: {reply[-1]}")
-
-    # ---- dhcp-client -------------------------------------------------------
-    if declared.get("dhcp_client") is False:
-        for client in state["dhcp_clients"]:
-            reply = _command(sock, ["/ip/dhcp-client/remove", f"=.id={client['id']}"])
-            if _ok(reply):
-                report["changed"].append(f"dhcp-client removed on {client['interface']}")
-            else:
-                report["errors"].append(f"dhcp-client remove: {reply[-1]}")
 
     # ---- identity ----------------------------------------------------------
     if declared.get("identity") and state["identity"] != declared["identity"]:
@@ -340,7 +399,7 @@ def apply_state(sock, declared, new_password=None):
         report["errors"].append(f"declared addresses still missing: {sorted(missing)}")
     if declared.get("dhcp_client") is False and after["dhcp_clients"]:
         report["errors"].append(f"dhcp client still present: {report['dhcp_clients']}")
-    return report
+    return report, sock
 
 
 def main():
@@ -354,6 +413,23 @@ def main():
     ap.add_argument("--phase", default="apply", choices=["apply", "read"])
     args = ap.parse_args()
 
+    def reconnect():
+        """A fresh session at the same address, waiting for the router to have it.
+
+        The router is briefly without any address while its own script runs, so
+        one attempt is not enough. NOTE: this only works because the script puts
+        the declared address back; it is not a general retry.
+        """
+        last = None
+        for _ in range(20):
+            try:
+                return connect(args.host, args.user, args.password)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                time.sleep(2)
+        sys.exit(f"routeros_apply.py: {args.host} did not answer again after the "
+                 f"change: {type(last).__name__}: {last}")
+
     declared = json.loads(args.declared)
     try:
         sock = connect(args.host, args.user, args.password)
@@ -366,7 +442,8 @@ def main():
                               "addresses": [f"{a['address']} {a['interface']}" for a in state["addresses"]],
                               "dhcp_clients": [c["interface"] for c in state["dhcp_clients"]]}))
             return
-        report = apply_state(sock, declared, new_password=args.new_password)
+        report, sock = apply_state(sock, declared, new_password=args.new_password,
+                                   reconnect=reconnect)
     finally:
         sock.close()
     print(json.dumps(report))
