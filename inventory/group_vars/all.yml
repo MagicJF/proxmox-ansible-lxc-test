@@ -360,12 +360,21 @@ pve_vms:
     # `es` merely breaks the one workaround that does work (typing the US key
     # for the character you want).
     #
-    # The console that respects the keyboard is the SERIAL one: it carries
-    # CHARACTERS, not scancodes, so the browser's layout survives to the guest.
-    # Declaring the port is all it takes — RouterOS detects it on boot and
-    # creates its own console on it (`/system/console`: port=serial0, vt102).
+    # The console you actually want is the serial one: it carries CHARACTERS,
+    # not scancodes, so the browser's layout survives all the way to the guest.
+    # Declaring the port is not enough to USE it — PVE's web console only offers
+    # the serial terminal when the VM's display IS that port, which is what
+    # `vga: serial0` does (it turns the VGA adapter off and redirects the
+    # Console button to the serial one). RouterOS detects the port on boot and
+    # creates its own console on it (`/port`: used-by "Serial Console(#0)";
+    # `/system/console`: port=serial0, term=vt102).
+    #
+    # The trade-off, stated plainly: with no VGA there is no screen, so the boot
+    # phase shows nothing until RouterOS prints its prompt. Reverting is one
+    # line — put `vga: std` back here and run apply.
     serial:
       serial0: socket
+    vga: serial0
     # The imported image is the only disk, so it must be the boot device (the
     # default order expects the cloud-init drive this VM does not have).
     boot: "order=scsi0"
