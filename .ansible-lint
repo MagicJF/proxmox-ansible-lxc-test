@@ -1,0 +1,61 @@
+---
+# ===========================================================================
+# ansible-lint — a ratchet, not a gate.
+#
+# What it is for here: stopping a NEW task from quietly breaking a convention
+# this repository leans on — an unnamed task, a `command` whose `changed` is the
+# module's guess instead of a statement, a file written with the wrong mode.
+#
+# What it is NOT: a correctness check. It cannot see inside a
+# `lookup('template')`, so it does not catch the class of bug that actually costs
+# a run in this repository — a wrong key name across an API boundary, or an
+# interface named after its type. That class is covered by the manifest
+# validator (filter_plugins/state.py + playbooks/tasks/validate_state.yml),
+# which runs before either verb touches anything.
+#
+# It has to stay GREEN. A linter with 27 standing findings teaches you to ignore
+# it, which is worse than not running it at all. So the rules that matter are
+# enforced, and every deliberate deviation is written down here with its reason
+# rather than silently suppressed.
+#
+# Run it from the repository root:  ansible-lint
+# ===========================================================================
+profile: basic
+
+skip_list:
+  # The manifest uses `>-` blocks and long Jinja one-liners deliberately: they
+  # are read by people far more often than they are linted.
+  - yaml[line-length]
+
+  # configure/site.yml passes a role's variables explicitly at the call site
+  # (`tw`, `caddy_sites`, ...) rather than letting the role reach into its own
+  # defaults. That is the point of the call site: what a role is given is
+  # visible where it is given. The rule wants every one of them prefixed with
+  # the role's name.
+  - var-naming[no-role-prefix]
+
+  # This repository waits for a task by name (`when: X.changed`) instead of
+  # notifying a handler, because the wait is part of the verification the run
+  # prints. See the comment above the wait in playbooks/tasks/bridges.yml.
+  - no-handler
+
+  # Handler names here are lowercase and consistent across every role. The rule
+  # wants Title Case; renaming them means editing nine `notify:` references
+  # across four roles, and a `notify` that silently stops matching a handler is
+  # exactly the failure this repository refuses to introduce for a capital
+  # letter.
+  - name[casing]
+
+warn_list:
+  # Deliberate `command`/`shell` where a module exists: these roles use the text
+  # tools whose output they can read and assert on, and each one says why in a
+  # comment above it. Warned rather than skipped, because the next one might not
+  # have a reason.
+  - command-instead-of-module
+
+  # The rule is right in general and wrong for this code. Every one of the five
+  # sites either runs with `set +e` on purpose (the read-only audit, which must
+  # keep going after a failure) or is a read with `changed_when: false` whose
+  # failure is caught by the assertion that consumes its output. Adding
+  # `pipefail` mechanically would change behaviour, not fix it.
+  - risky-shell-pipe

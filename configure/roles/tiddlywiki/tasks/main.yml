@@ -97,6 +97,10 @@
     - name: Lay out the engine where Node.js resolves global packages
       ansible.builtin.command:
         cmd: "tar -xzf /tmp/tiddlywiki-{{ tiddlywiki_version }}.tgz -C {{ tiddlywiki_lib_dir }} --strip-components=1"
+      # `command` reports `changed` for every run, so say it explicitly instead
+      # of letting the module decide: this task only runs when the pinned version
+      # differs from the installed one, and when it runs it IS a change.
+      changed_when: true
 
     - name: Make the engine's entry point executable
       ansible.builtin.file:

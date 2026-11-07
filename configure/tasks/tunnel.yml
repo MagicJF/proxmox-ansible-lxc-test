@@ -124,6 +124,10 @@
   when:
     - tunnel_link.rc == 0
     - tunnel_conf.changed
+  # It only runs when the declared configuration differs from the running one,
+  # so a run of it is a change by definition. Saying so keeps the module's
+  # unconditional `changed` from being the thing that decides.
+  changed_when: true
 
 - name: Route every declared network through the tunnel
   # `wg-quick up` installs the routes derived from AllowedIPs, but `wg syncconf`

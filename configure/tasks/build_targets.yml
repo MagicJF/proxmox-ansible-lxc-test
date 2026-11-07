@@ -75,8 +75,8 @@
       kind: "{{ 'api' if (src.config.routeros is defined) else 'ssh' }}"
   loop: >-
     {{ (pve_config_targets | default([]))
-       + (pve_containers | selectattr('config', 'defined') | list)
-       + (l2_vm_specs | selectattr('config', 'defined') | list) }}
+       + (pve_containers | default([]) | selectattr('config', 'defined') | list)
+       + (l2_vm_specs | default([]) | selectattr('config', 'defined') | list) }}
   loop_control:
     label: "{{ item.hostname | default(item.name) }} (VMID {{ item.vmid }})"
 
