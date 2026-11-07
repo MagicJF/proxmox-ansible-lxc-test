@@ -77,6 +77,9 @@
       when: ansible_check_mode
 
   tasks:
+    - name: Keep logs/ bounded (the policy in the declared state)
+      ansible.builtin.include_tasks: tasks/prune_logs.yml
+
     # ---- read everything, once -------------------------------------------
     - name: Read every declared guest (one process, one task)
       ansible.builtin.command:

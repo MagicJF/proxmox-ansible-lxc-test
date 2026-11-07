@@ -1,0 +1,45 @@
+---
+# ===========================================================================
+# Retención de logs/ — el único directorio del repositorio que crece solo.
+#
+# Lo incluye CADA verbo, antes de tocar nada, para que la política declarada en
+# inventory/group_vars/all.yml la aplique el framework y no un operador. Un lab
+# que solo se maneja con los verbos nunca necesita acordarse de esto.
+#
+# La ruta lleva `../playbooks/` porque este fichero se incluye desde las DOS
+# capas: desde playbooks/ el rodeo es inocuo, y desde configure/ es lo que
+# apunta al script. Es la misma forma que ya usa `pve_manifest` en los verbos.
+#
+# La única arruga, dicha para que nadie tenga que descubrirla: la rotación COPIA
+# el log acumulado al archivo y vacía el vivo, y lo hace mientras esta misma
+# ejecución ya está escribiendo en él. Así que la cabecera PLAY de la ejecución
+# EN CURSO se queda al final del archivo. Las ejecuciones ya terminadas se
+# archivan enteras, que es la parte que importa. Para rotar sin ningún corte,
+# el script suelto entre ejecuciones:
+#
+#   python3 playbooks/tools/logs_prune.py
+#
+# Sobre por qué esta tarea nunca reporta `changed`, ver el bloque de abajo: no es
+# un detalle de estilo, es lo que impide que la garantía de convergencia dependa
+# de cuántos MB hayan escrito las ejecuciones anteriores.
+# ===========================================================================
+# `changed_when: false` a propósito, y no es pereza: la retención de logs NO es
+# convergencia. La garantía central del framework es que reejecutar un verbo
+# sobre un lab ya convergido no cambia nada, y esa garantía no puede depender de
+# cuántos MB hayan escrito las ejecuciones anteriores. Con `changed_when` sacado
+# del JSON del script, la rotación dispara sola cada ~96 ejecuciones (el log de
+# framework_check crece ~85 KB por corrida, contra un tope de 8 MB) y el chequeo
+# de invariantes fallaría sin que nada esté mal: un falso positivo que enseña a
+# ignorar el chequeo. Lo que sí importa se conserva: si el script no puede hacer
+# su trabajo, la tarea FALLA (failed_when sobre el rc), y el JSON que imprime
+# queda en el resultado registrado.
+- name: Keep logs/ bounded (rotate what is over the cap, drop what is too old)
+  ansible.builtin.command:
+    cmd: python3 {{ playbook_dir }}/../playbooks/tools/logs_prune.py --json
+  register: pve_log_prune
+  changed_when: false
+  failed_when: pve_log_prune.rc != 0
+  # connect.yml runs its play as root (it owns the endpoint, and only it does), so
+  # this task must opt out: logs/ belongs to the user who invoked the verb, and a
+  # root-owned archive inside it is a file that user can no longer prune.
+  become: false

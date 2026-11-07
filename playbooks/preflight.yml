@@ -49,6 +49,9 @@
       when: pve_secrets_file.stat.exists
 
   tasks:
+    - name: Keep logs/ bounded (the policy in the declared state)
+      ansible.builtin.include_tasks: tasks/prune_logs.yml
+
     - name: Read every declared guest and the platform facts (one process, one task)
       ansible.builtin.command:
         cmd: >-

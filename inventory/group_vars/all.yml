@@ -3,7 +3,7 @@
 #
 # This is the only file that changes when a change is requested: edit it, open a
 # branch, run preflight -> apply. The playbooks under playbooks/ are a fixed
-# engine (two verbs) and never grow one file per request.
+# engine (preflight, apply, connect, remove) and never grow one file per request.
 #
 # It is a group_vars FILE for the group "all", so variables sit at the top level.
 # Nesting them under an "all:" key would define one variable named "all" and
@@ -550,3 +550,27 @@ pve_config_targets:
     hostname: caddy
     address: 10.10.10.2
     manage: false
+
+# ============================================================================
+# Retención de logs/ — el ÚNICO directorio del repositorio que crece solo.
+#
+# Ansible solo sabe AÑADIR a su `log_path`: nunca lo rota, así que un fichero
+# acumula todas las ejecuciones para siempre. La política tiene dos mitades, y
+# hacen falta las dos: un fichero vivo que pasa de `live_max_mb` se rota a
+# logs/archive/ y se vacía (acota cada fichero), y los archivos con más de
+# `keep_days` o más allá de `keep_count` se borran (acota el directorio).
+#
+# La aplica el propio framework, en cada verbo y antes de tocar nada, así que un
+# lab que solo se maneja con los verbos nunca necesita un operador. Para el caso
+# contrario —nadie ejecuta el framework en días— el mismo script vale suelto:
+#
+#   python3 playbooks/tools/logs_prune.py --dry-run
+#   python3 playbooks/tools/logs_prune.py
+#
+# El archivo más reciente NUNCA se borra, diga lo que diga `keep_count`: es el
+# que alguien iría a mirar. Con los valores de abajo el techo es 10 × 8 MB.
+# ============================================================================
+pve_log_retention:
+  live_max_mb: 8
+  keep_days: 14
+  keep_count: 10

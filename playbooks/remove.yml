@@ -109,6 +109,9 @@
       register: rem_journal_start
 
   tasks:
+    - name: Keep logs/ bounded (the policy in the declared state)
+      ansible.builtin.include_tasks: tasks/prune_logs.yml
+
     - name: Read the live platform, so the decision is based on reality
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ pve_node }}/{{ item }}"

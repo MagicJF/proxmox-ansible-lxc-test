@@ -16,6 +16,7 @@ playbooks/pve_engine.j2                # engine: declared-vs-live analysis, as J
 playbooks/tasks/                       # engine: shared steps (segments, disk import, state validation)
 playbooks/tools/pve_read.py            # engine: reads every guest + platform facts in ONE process
 playbooks/tools/framework_check.py     # the framework's own test: convergent, and sees drift
+playbooks/tools/logs_prune.py          # engine: retention for logs/, applied by every verb
 playbooks/tools/wg_endpoint_setup.sh   # layer 2 path: the endpoint bootstrap, run once on the PVE host
 playbooks/tracing/sitecustomize.py     # engine: journals every PVE HTTP call
 filter_plugins/pve.py                  # engine: canonicalisation filters used by the macros
@@ -24,7 +25,7 @@ configure/audit.yml                    # layer 2: read-only inspection of a gues
 configure/site.yml                     # layer 2: converges the inside of managed guests
 configure/tasks/                       # layer 2: shared target building, access policy + the path
 configure/roles/<app>/                 # layer 2: one role per application, or per kind of guest
-logs/                                  # run logs and the API journal (gitignored, kept via .gitkeep)
+logs/                                  # run logs, the API journal and their archive (gitignored)
 ```
 
 Layer 1 is a fixed engine with a handful of verbs — `preflight` (read-only), `apply` (converge), `connect` (the path) and `remove` (the deliberate destroy) — all reading the same declared state. A change request is an edit to `inventory/group_vars/all.yml` on a new branch, not a new playbook: adding a playbook per change would scatter the real state across files that overwrite each other. `connect` owns the one thing that is not a guest, the control node's network path to the guest LAN (see [The path layer 2 runs on](#the-path-layer-2-runs-on)); `remove` owns the one thing the engine will not do on its own (see [Adding and removing a guest](#adding-and-removing-a-guest)).
@@ -568,9 +569,11 @@ Only the drifted keys are sent on the update path: `community.proxmox.proxmox` P
 
 ## Logging and API observability
 
-Every run writes two files under `logs/` (gitignored — it describes real infrastructure and this repository is public):
+Every run writes under `logs/` (gitignored — it describes real infrastructure and this repository is public):
 
 **`logs/ansible.log`** — the full human-readable play output, appended by Ansible (`log_path` in `ansible.cfg`). Task results coming from the API tasks stay censored because they carry `no_log`.
+
+**`logs/framework-check.log`** — where `playbooks/tools/framework_check.py` sends the output of the verbs *it* runs. It must not share the human log: that script runs a verb with the JSON callback, which emits two to three orders of magnitude more bytes than the human output, and mixing the two is how `ansible.log` reached **78 MB of which 99.4% was machine output nobody reads**. In its own file the JSON stays on disk to debug a failed check, and the human log stays readable.
 
 **`logs/pve-api.jsonl`** — the machine-readable journal of the traffic that actually crossed the wire, one JSON object per line:
 
@@ -605,7 +608,34 @@ grep '"method": "PUT"' logs/pve-api.jsonl | python3 -m json.tool --json-lines
 grep -E '"status": 4[0-9][0-9]|"status": 5[0-9][0-9]' logs/pve-api.jsonl
 ```
 
-Both files grow without bound; Ansible never rotates them and neither does the engine. Trim them when they get large — the response bodies of cluster-wide reads are the bulk of it.
+### Retention
+
+Ansible only ever **appends** to its `log_path` — it never rotates it — so `logs/` is the one directory in this repository that grows on its own. It is bounded by a declared policy rather than by an operator remembering:
+
+```yaml
+pve_log_retention:
+  live_max_mb: 8    # a live file over this is rotated into logs/archive/ and emptied
+  keep_days: 14     # archives older than this are deleted
+  keep_count: 10    # ...and no more than this many are kept, newest first
+```
+
+**Every verb applies it before it does anything**, through `playbooks/tasks/prune_logs.yml`, so a lab driven only through the verbs never needs anyone to remember. The same script runs standalone for the opposite case — nobody runs the framework for days:
+
+```bash
+python3 playbooks/tools/logs_prune.py --dry-run   # say what would happen, change nothing
+python3 playbooks/tools/logs_prune.py             # do it
+```
+
+Four things about it are deliberate:
+
+- **It copies to the archive and then empties the live file**, rather than renaming it. Ansible holds the log file open for the whole run, so a rename would leave Ansible writing into the archive while the live path stayed empty. The journal is opened per write and would tolerate a rename — both take the same path on purpose, one behaviour to reason about.
+- **The newest archive is never deleted**, whatever `keep_count` says: it is the file someone would actually reach for, and "keep zero" is not a policy.
+- **It only deletes files it recognises**, by prefix against the three live names. A retention tool that deletes by wildcard in a directory is how someone loses the one file that was not a log.
+- **The task never reports `changed`.** Log retention is not convergence, and the framework's central guarantee — a run over a converged lab changes nothing — must not depend on how many megabytes earlier runs happened to write. Were the change reported, the rotation would fire on its own every ~96 runs and the invariant check would fail with nothing actually wrong, which is precisely the false positive that teaches an operator to ignore the check. What matters is kept: if the script cannot do its job, the task fails on its exit code.
+
+The one wart, stated so nobody has to discover it: the rotation happens while the current run is already appending, so the **play header of the run in progress lands at the end of the archive**. Runs that have already finished are archived whole, which is the part that matters. To rotate with no split at all, run the script between runs.
+
+The cap bounds the file **between** runs, not within one: a single heavy run can write more than `live_max_mb` — a `drill` is four verbs, and one of them writes a ~16 MB JSON log — and the next verb's check is what rotates it. The bound is on the steady state, which is the thing that grows without one.
 
 The `logs/` directory must exist before Ansible starts (`log_path` cannot create it), which is why `logs/.gitkeep` is committed.
 
