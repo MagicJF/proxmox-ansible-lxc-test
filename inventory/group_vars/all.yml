@@ -95,33 +95,7 @@ pve_tunnel:
 # automated: a segment that already exists is left alone, because recreating a
 # bridge under a running lab would cut its guests off.
 # ============================================================================
-pve_bridges:
-  # ---- sede 1: cuatro workstations tras dos switches, y el núcleo ----------
-  - iface: vmbr4
-    comments: "sede1: chr-a1 <-> ws1"
-  - iface: vmbr5
-    comments: "sede1: chr-a1 <-> ws2"
-  - iface: vmbr6
-    comments: "sede1: chr-a2 <-> ws3"
-  - iface: vmbr7
-    comments: "sede1: chr-a2 <-> ws4"
-  - iface: vmbr8
-    comments: "sede1: chr-a1 <-> chr-a3 (uplink, L2)"
-  - iface: vmbr9
-    comments: "sede1: chr-a2 <-> chr-a3 (uplink, L2)"
-  # ---- sede 2 y sede 3: dos workstations tras un switch cada una ----------
-  - iface: vmbr10
-    comments: "sede2: chr-b <-> ws5"
-  - iface: vmbr11
-    comments: "sede2: chr-b <-> ws6"
-  - iface: vmbr12
-    comments: "sede3: chr-c <-> ws7"
-  - iface: vmbr13
-    comments: "sede3: chr-c <-> ws8"
-  # ---- la WAN: los tres routers de sede, y nadie más ----------------------
-  - iface: vmbr14
-    comments: "WAN: chr-a3, chr-b, chr-c"
-
+pve_bridges: []
 pve_defaults:
   # ---- creation-time: PVE cannot change these on an existing container ------
   # Drift here is refused, not converged: the container would have to be
