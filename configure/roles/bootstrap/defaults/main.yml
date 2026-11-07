@@ -26,3 +26,8 @@ bootstrap_answer_timeout: 240
 # The port that proves the router HAS the address. Its REST API is the first
 # thing that can answer, so `www` (80) is the check.
 bootstrap_answer_port: 80
+
+# Las redes a las que este contenedor tiene que saber volver, y quién se lo
+# enseña. Vacío por defecto: sin declararlas, el rol no toca rutas.
+bootstrap_routes: []
+bootstrap_route_gateway: ""

@@ -156,6 +156,8 @@
       vars:
         bootstrap_interface: "{{ (l2_config.bootstrap | default({})).interface | default('eth0') }}"
         bootstrap_hosts: "{{ (l2_config.bootstrap | default({})).hosts | default([]) }}"
+        bootstrap_routes: "{{ (l2_config.bootstrap | default({})).routes | default([]) }}"
+        bootstrap_route_gateway: "{{ (l2_config.bootstrap | default({})).route_gateway | default('') }}"
       when:
         - l2_manage | bool
         - l2_config.bootstrap is defined

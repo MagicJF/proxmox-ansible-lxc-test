@@ -509,6 +509,16 @@ pve_containers:
     config:
       bootstrap:
         interface: eth0
+        # A qué tiene que saber VOLVER este contenedor: las redes de las tres
+        # sedes. Sin esto recibe los pings de una workstation y no puede
+        # contestarlos, porque su ruta por defecto va al host, y el host no
+        # enruta hacia el interior del lab.
+        routes:
+          - "{{ lab_site1_network }}"
+          - "{{ lab_site2_network }}"
+          - "{{ lab_site3_network }}"
+        # Se lo enseña el router de la central, por su dirección de gestión.
+        route_gateway: "10.10.10.162"
         hosts: >-
           {%- set out = [] -%}
           {%- for v in pve_vms | selectattr('chr', 'defined') -%}
@@ -672,6 +682,13 @@ pve_vms:
         # Un CHR de fábrica trae un cliente DHCP en ether1. Con una dirección
         # estática declarada, ese cliente es drift y se elimina.
         dhcp_client: false
+        # La puerta de enlace de GESTIÓN, que es lo que lleva un switch de verdad.
+        # Sin ella, el switch recibe los pings de su sede y no puede contestarlos:
+        # su tabla de rutas sólo conoce la red de gestión. Apunta al router de su
+        # sede por su dirección de gestión — y ese router ya sabe volver a la sede.
+        routes:
+          - dst_address: "0.0.0.0/0"
+            gateway: "10.10.10.162"
 
   # sw2: el segundo switch de acceso de la central. Cuelga de sw1 por el troncal
   # (mismo dominio L2, que es lo que hace que las cuatro workstations de la sede
@@ -694,6 +711,11 @@ pve_vms:
           - name: lan
             ports: [ether2, ether3, ether4]
         dhcp_client: false
+        # Misma razón que en sw1: la puerta de enlace de gestión, al router de su
+        # sede. Es lo que convierte al switch en un equipo gestionable de verdad.
+        routes:
+          - dst_address: "0.0.0.0/0"
+            gateway: "10.10.10.162"
 
   # rt1: el router de la central y el núcleo de la WAN. Es la puerta de enlace de
   # su sede y el único que conoce las redes remotas; rt2 y rt3 dependen de él.
@@ -773,6 +795,10 @@ pve_vms:
           - name: lan
             ports: [ether2, ether3, ether4]
         dhcp_client: false
+        # Puerta de enlace de gestión hacia el router de SU sede (rt2).
+        routes:
+          - dst_address: "0.0.0.0/0"
+            gateway: "10.10.10.164"
 
   # rt2: el router de la delegación. Una pata a su switch, una a la WAN 1, y una
   # ruta POR DEFECTO hacia rt1 — la configuración real de una delegación.
@@ -842,6 +868,10 @@ pve_vms:
           - name: lan
             ports: [ether2, ether3, ether4]
         dhcp_client: false
+        # Puerta de enlace de gestión hacia el router de SU sede (rt3).
+        routes:
+          - dst_address: "0.0.0.0/0"
+            gateway: "10.10.10.166"
 
   - vmid: 166
     name: rt3

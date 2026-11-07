@@ -2,6 +2,45 @@
 
 Declarative IaC for the LXC containers and QEMU VMs on Proxmox VE, driven entirely over the HTTPS API. No playbook connects to the Proxmox host over SSH.
 
+---
+
+## El laboratorio: una empresa de tres sedes
+
+Lo que este repositorio despliega es un laboratorio de red que simula **una
+empresa con una central y dos delegaciones**: ocho workstations, siete equipos de
+red MikroTik (RouterOS) y los cables que los unen, todo declarado en un solo
+fichero y gobernado **exclusivamente por la API**.
+
+```
+        SEDE 1 — LA CENTRAL                    SEDE 2                 SEDE 3
+   ┌──────────────────────────────────┐   ┌───────────────┐    ┌───────────────┐
+   │   ws1     ws2      ws3     ws4   │   │   ws5    ws6  │    │   ws7    ws8  │
+   │    │       │        │       │    │   │    │       │  │    │    │       │  │
+   │  ether2 ether3   ether4 ether5   │   │ ether2 ether3 │    │ ether2 ether3 │
+   │    └───┬───┴────────┴───────┘    │   │    └──┬───┘   │    │    └──┬───┘   │
+   │       sw1 ══════════ sw2         │   │      sw3      │    │      sw4      │
+   │        │          (troncal)      │   │       │       │    │       │       │
+   │        │                         │   │       │       │    │       │       │
+   │       rt1 ───────────────────────┼───┼───── rt2      │    │       │       │
+   │        │                         │   │               │    │       │       │
+   │        └─────────────────────────┼───┼───────────────┼────┼────── rt3     │
+   └──────────────────────────────────┘   └───────────────┘    └───────────────┘
+                                        ╰── WAN 1 ──╯  ╰───── WAN 2 ─────╯
+```
+
+En una frase: **cuatro switches y tres routers** RouterOS. Los switches lo son
+por su configuración —sus patas de datos van a un puente sin dirección, que es
+lo que los distingue de un router—, las **ocho workstations no tienen ninguna vía
+de gestión** (una sola interfaz, dirección por DHCP, como un PC de verdad), y la
+red se verifica **desde dentro de los propios routers**, que es como lo haría un
+ingeniero.
+
+**Guía completa, en castellano: [`EL-LABORATORIO.md`](EL-LABORATORIO.md)** — la
+topología explicada, el direccionamiento, por dónde va un paquete, las dos capas
+del despliegue, el orden de montaje y cómo se verifica.
+
+---
+
 ## Structure
 
 ```text

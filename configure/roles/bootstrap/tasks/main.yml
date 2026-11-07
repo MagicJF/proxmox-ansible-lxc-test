@@ -74,6 +74,28 @@
     state: "{{ 'restarted' if bootstrap_conf.changed else 'started' }}"
   register: bootstrap_dnsmasq
 
+# --- el camino de vuelta -----------------------------------------------------
+# Este contenedor tiene su ruta por defecto hacia el host, y el host no enruta
+# hacia el interior del lab: así que sin esto recibe los pings de una
+# workstation y no puede contestarlos. Un servidor DHCP de verdad sabría volver
+# a las redes que sirve, y es lo que se declara aquí.
+- name: Read the routes this container already has
+  ansible.builtin.command: ip -4 route show
+  register: bootstrap_live_routes
+  changed_when: false
+  when: bootstrap_routes | length > 0
+
+- name: Route the declared networks back through the site router
+  ansible.builtin.command: >-
+    ip route replace {{ item }} via {{ bootstrap_route_gateway }}
+  loop: "{{ bootstrap_routes }}"
+  when:
+    - bootstrap_routes | length > 0
+    # `ip route replace` es idempotente en efecto pero no lo declara, así que el
+    # `when` es lo que mantiene honesto el informe: sin él, cada convergencia
+    # diría que ha cambiado algo.
+    - item not in bootstrap_live_routes.stdout
+
 # --- the proof ------------------------------------------------------------
 - name: Read the interface's offload settings
   ansible.builtin.command:
