@@ -1,0 +1,312 @@
+---
+# ===========================================================================
+# remove.yml — the ONLY verb that destroys. Convergence never deletes: a guest
+# that disappears from the declaration keeps running, untouched, and that is
+# deliberate. Destruction is therefore explicit, guarded and verified:
+#
+#   1. it REFUSES while the guest is still declared in the manifest, because the
+#      next apply would recreate it — "I deleted it and it came back" is exactly
+#      that loop;
+#   2. it needs -e confirm=<hostname or vmid> so a typo cannot delete a guest;
+#   3. it looks the guest up BY HOSTNAME: community.proxmox.proxmox matches
+#      `vm["vmid"] == vmid` against the cluster's integer vmid, so a VMID alone
+#      never matches and the module answers "already absent" while touching
+#      nothing (learned the hard way);
+#   4. it refuses to delete a RUNNING guest unless -e force=true is given;
+#   5. it proves the result by re-reading the platform: the guest must be gone and
+#      — unless -e keep_disks=true — no volume of it may remain in any storage.
+#
+# Usage:
+#   ansible-playbook playbooks/remove.yml -e hostname=old-guest -e confirm=old-guest
+#   ansible-playbook playbooks/remove.yml -e vmid=130 -e confirm=130 -e force=true
+#   ansible-playbook playbooks/remove.yml -e hostname=old-guest -e confirm=old-guest -e keep_disks=true
+#
+# To only STOP a guest, do not use this verb: declare `status: stopped` and run
+# apply.yml. That is a state change, not a removal.
+# ===========================================================================
+- name: Destroy one guest, deliberately
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pve_api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
+    pve_api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+    pve_api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+    pve_api_ca_path: "{{ lookup('env', 'PROXMOX_CA_PATH') }}"
+    pve_api: "https://{{ pve_api_host }}:8006/api2/json"
+    pve_token_header: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    pve_auth: &pve_auth
+      api_host: "{{ pve_api_host }}"
+      api_port: 8006
+      api_user: root@pam
+      api_token_id: "{{ pve_api_token_id }}"
+      api_token_secret: "{{ pve_api_token_secret }}"
+      ca_path: "{{ pve_api_ca_path }}"
+      validate_certs: true
+      api_timeout: 300
+    pve_journal: "{{ playbook_dir }}/../logs/pve-api.jsonl"
+    target_hostname: "{{ hostname | default('') }}"
+    target_vmid: "{{ vmid | default('') }}"
+    do_force: "{{ force | default(false) | bool }}"
+    keep_disks: "{{ keep_disks | default(false) | bool }}"
+  environment:
+    PYTHONPATH: "{{ playbook_dir }}/tracing"
+    PVE_HTTP_TRACE: "{{ playbook_dir }}/../logs/pve-api.jsonl"
+  pre_tasks:
+    - name: Refuse an unconfirmed or ambiguous destruction
+      ansible.builtin.assert:
+        that:
+          - (target_hostname | length > 0) or (target_vmid | length > 0)
+          - (confirm | default('')) == (target_hostname if target_hostname | length > 0 else target_vmid)
+        fail_msg: >-
+          Destruction needs an explicit target and a confirmation:
+          `-e hostname=<name> -e confirm=<name>` (or `-e vmid=<id> -e confirm=<id>`).
+          Given: hostname='{{ target_hostname }}' vmid='{{ target_vmid }}' confirm='{{ confirm | default('') }}'.
+          Nothing was changed.
+        success_msg: "Target {{ target_hostname or target_vmid }} confirmed."
+
+    # A guest that is still declared would be recreated by the next apply, so
+    # deleting it now would only produce a confusing resurrection later.
+    - name: Refuse to destroy a guest the declaration still owns
+      ansible.builtin.assert:
+        that:
+          - declared_matches | from_json | length == 0
+        fail_msg: >-
+          {{ target_hostname or target_vmid }} is still declared in
+          inventory/group_vars/all.yml ({{ declared_matches | from_json | join(', ') }}).
+          Remove its entry from pve_containers / pve_vms / pve_config_targets first — otherwise
+          the next `apply` recreates it. Nothing was changed.
+        success_msg: "The declaration no longer owns this guest."
+      vars:
+        declared_all: >-
+          {{ (pve_containers | default([])) + (pve_vms | default([])) + (pve_config_targets | default([])) }}
+        declared_matches: >-
+          {%- set out = [] -%}
+          {%- for g in declared_all -%}
+          {%- if ((target_vmid | length > 0) and ((g.vmid | string) == (target_vmid | string)))
+                 or ((target_hostname | length > 0) and ((g.hostname | default(g.name | default(''))) == target_hostname)) -%}
+          {%- set _ = out.append((g.vmid | string) ~ ' ' ~ (g.hostname | default(g.name | default('')))) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{- out | to_json -}}
+
+    - name: Look for the local credentials file
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/vars/secrets.yml"
+      register: rem_secrets_file
+
+    - name: Load the hardcoded local credentials when present (gitignored)
+      ansible.builtin.include_vars:
+        file: vars/secrets.yml
+      when: rem_secrets_file.stat.exists
+
+    - name: Remember the journal size so this run can prove it was traced
+      ansible.builtin.stat:
+        path: "{{ pve_journal }}"
+      register: rem_journal_start
+
+  tasks:
+    - name: Read the live platform, so the decision is based on reality
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/{{ item }}"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token_header }}"
+        validate_certs: true
+        ca_path: "{{ pve_api_ca_path }}"
+        status_code: 200
+        return_content: true
+      loop: [lxc, qemu]
+      register: rem_listing
+      no_log: true
+
+    # Two tasks, not two keys of one set_fact: keys of a single set_fact are
+    # resolved from the same context, so `found` cannot see `all_guests` there.
+    - name: Flatten what the platform reports
+      ansible.builtin.set_fact:
+        all_guests: "{{ (rem_listing.results[0].json.data | default([]) | map('combine', {'kind': 'lxc'}) | list)
+                       + (rem_listing.results[1].json.data | default([]) | map('combine', {'kind': 'qemu'}) | list) }}"
+
+    - name: Identify exactly one guest
+      ansible.builtin.set_fact:
+        found: >-
+          {%- set out = [] -%}
+          {%- for g in all_guests -%}
+          {%- if ((target_vmid | length > 0) and ((g.vmid | string) == (target_vmid | string)))
+                 or ((target_hostname | length > 0) and (g.name | default('') == target_hostname)) -%}
+          {%- set _ = out.append(g) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{- out | to_json -}}
+
+    - name: The guest must exist, and be exactly one
+      ansible.builtin.assert:
+        that:
+          - (found | from_json) | length == 1
+        fail_msg: >-
+          Expected exactly one guest matching hostname='{{ target_hostname }}' vmid='{{ target_vmid }}',
+          found {{ (found | from_json) | length }}: {{ (found | from_json) | map(attribute='vmid') | list | to_json }}.
+          Nothing was changed.
+        success_msg: "Found VMID {{ (found | from_json)[0].vmid }} ({{ (found | from_json)[0].name }}, {{ (found | from_json)[0].kind }})."
+
+    - name: Show what is about to be destroyed
+      ansible.builtin.debug:
+        msg: >-
+          {{ t.name }} (VMID {{ t.vmid }}, {{ t.kind }}): currently {{ t.status }}.
+          {{ 'Disk volumes are KEPT (keep_disks=true).' if keep_disks else 'Its disk volumes will be destroyed too.' }}
+          This cannot be undone.
+      vars:
+        t: "{{ (found | from_json)[0] }}"
+
+    - name: A running guest needs an explicit force
+      ansible.builtin.fail:
+        msg: >-
+          {{ t.name }} (VMID {{ t.vmid }}) is running. Either stop it first — declare `status: stopped`
+          and run apply.yml — or pass `-e force=true` to let this verb stop and destroy it. Nothing
+          was changed.
+      vars:
+        t: "{{ (found | from_json)[0] }}"
+      when:
+        - t.status == 'running'
+        - not do_force
+
+    - name: Destroy the container
+      community.proxmox.proxmox:
+        <<: *pve_auth
+        node: "{{ pve_node }}"
+        # By hostname on purpose: the module matches the cluster's INTEGER vmid
+        # against the parameter, so a VMID never matches and it would report
+        # "already absent" while deleting nothing.
+        hostname: "{{ t.name }}"
+        state: absent
+        force: "{{ do_force }}"
+        purge: true
+        destroy_unreferenced_disks: "{{ not keep_disks }}"
+        timeout: 300
+      vars:
+        t: "{{ (found | from_json)[0] }}"
+      when: t.kind == 'lxc'
+      register: rem_ct
+      no_log: true
+
+    - name: Destroy the VM
+      community.proxmox.proxmox_kvm:
+        <<: *pve_auth
+        node: "{{ pve_node }}"
+        name: "{{ t.name }}"
+        state: absent
+        force: "{{ do_force }}"
+        purge: true
+        destroy_unreferenced_disks: "{{ not keep_disks }}"
+        timeout: 300
+      vars:
+        t: "{{ (found | from_json)[0] }}"
+      when: t.kind == 'qemu'
+      register: rem_vm
+      no_log: true
+
+    - name: Report what the platform answered
+      ansible.builtin.debug:
+        msg: >-
+          {{ (rem_ct.msg | default('')) if t.kind == 'lxc' else (rem_vm.msg | default('')) }}
+          (changed={{ (rem_ct.changed | default(false)) if t.kind == 'lxc' else (rem_vm.changed | default(false)) }})
+      vars:
+        t: "{{ (found | from_json)[0] }}"
+
+    # ---- verification: prove it, by reading the platform again ------------
+    - name: Re-read the live platform
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/{{ item }}"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token_header }}"
+        validate_certs: true
+        ca_path: "{{ pve_api_ca_path }}"
+        status_code: 200
+        return_content: true
+      loop: [lxc, qemu]
+      register: rem_after
+      no_log: true
+
+    - name: The guest must be gone
+      ansible.builtin.assert:
+        that:
+          - remaining | length == 0
+        fail_msg: "VMID {{ target_vmid or (found | from_json)[0].vmid }} is still listed by the API: {{ remaining | to_json }}."
+        success_msg: "VMID {{ target_vmid or (found | from_json)[0].vmid }} is gone from the platform."
+      vars:
+        remaining: >-
+          {{ ((rem_after.results[0].json.data | default([])) + (rem_after.results[1].json.data | default([])))
+             | selectattr('vmid', 'equalto', ((found | from_json)[0].vmid | int)) | list
+             | map(attribute='vmid') | list }}
+
+    - name: List the node's storages
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/storage"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token_header }}"
+        validate_certs: true
+        ca_path: "{{ pve_api_ca_path }}"
+        status_code: 200
+        return_content: true
+      register: rem_storages
+      when: not keep_disks
+      no_log: true
+
+    - name: Read what each storage still holds
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/storage/{{ item.storage }}/content"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token_header }}"
+        validate_certs: true
+        ca_path: "{{ pve_api_ca_path }}"
+        status_code: [200]
+        return_content: true
+      loop: "{{ rem_storages.json.data | default([]) }}"
+      loop_control:
+        label: "{{ item.storage }}"
+      register: rem_contents
+      when: not keep_disks
+      failed_when: false
+      no_log: true
+
+    - name: No volume of the guest may remain
+      ansible.builtin.assert:
+        that:
+          - leftovers | length == 0
+        fail_msg: >-
+          These volumes of VMID {{ (found | from_json)[0].vmid }} still exist: {{ leftovers | join(', ') }}.
+          Remove them by hand or re-run with the same flags (the module's
+          destroy_unreferenced_disks only removes what is unreferenced).
+        success_msg: "No volume of VMID {{ (found | from_json)[0].vmid }} remains (disks: destroyed)."
+      vars:
+        leftovers: >-
+          {{ rem_contents.results | default([])
+             | map(attribute='json.data', default=[]) | flatten
+             | map(attribute='volid', default='') | select('search', 'vm-' ~ ((found | from_json)[0].vmid | string) ~ '-')
+             | list }}
+      when: not keep_disks
+
+    - name: Say plainly what was kept
+      ansible.builtin.debug:
+        msg: >-
+          VMID {{ (found | from_json)[0].vmid }} was destroyed but its disk volumes were KEPT
+          (keep_disks=true). Review the storage listings before leaving them behind.
+      when: keep_disks
+
+    - name: Observability is only real if it is checked
+      ansible.builtin.stat:
+        path: "{{ pve_journal }}"
+      register: rem_journal_end
+
+    - name: Assert this run was traced to the journal
+      ansible.builtin.assert:
+        that:
+          - rem_journal_end.stat.size | int > rem_journal_start.stat.size | int
+        fail_msg: >-
+          {{ pve_journal }} did not grow during this run, so the deletion was NOT traced.
+          Check playbooks/tracing/sitecustomize.py and the play-level PYTHONPATH.
+        success_msg: >-
+          API trace OK: the journal grew by
+          {{ (rem_journal_end.stat.size | int) - (rem_journal_start.stat.size | int) }} bytes.
