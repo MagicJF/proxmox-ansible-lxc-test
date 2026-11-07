@@ -123,6 +123,20 @@
         - l2_manage | bool
         - l2_config.apache is defined
 
+    # The network lab: a guest on an isolated segment can only reach the other
+    # segment through the router VM, which needs a route its own network
+    # configuration does not provide. The role installs the declared routes and
+    # then proves the connectivity from inside the guest.
+    - name: Converge the declared routes of the network lab
+      ansible.builtin.include_role:
+        name: netlab
+      vars:
+        netlab_routes: "{{ (l2_config.netlab | default({})).routes | default([]) }}"
+        netlab_peers: "{{ (l2_config.netlab | default({})).peers | default([]) }}"
+      when:
+        - l2_manage | bool
+        - l2_config.netlab is defined
+
     - name: "Nothing to converge: the declaration is read-only for this guest"
       ansible.builtin.debug:
         msg: >-
@@ -130,6 +144,64 @@
           audits it (configure/audit.yml). Set manage true in the declaration when
           you are ready for it to be converged.
       when: not (l2_manage | bool)
+
+# ---------------------------------------------------------------------------
+# Guests that speak their own API instead of a POSIX shell (RouterOS). The role
+# runs on the control node and drives the guest's API; there is no SSH path.
+# ---------------------------------------------------------------------------
+- name: Layer 2 - converge the guests that speak their own API
+  hosts: pve_api_targets
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Converge the declared RouterOS state
+      ansible.builtin.include_role:
+        name: routeros
+      when: l2_config.routeros is defined
+
+    - name: "Nothing to converge: the declaration is read-only for this guest"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is declared with manage false, so layer 2 only
+          audits it. Set manage true in the declaration when you are ready for it
+          to be converged.
+      when: not (l2_manage | bool)
+
+# ---------------------------------------------------------------------------
+# Verification from INSIDE the guests: the network lab exists so that a packet
+# can leave one segment, cross the router VM and come back from the other. That
+# proof needs EVERY guest converged, so it is a pass of its own — the play above
+# converges one guest at a time, and the first guest's peer is not configured
+# until the last one has run.
+# ---------------------------------------------------------------------------
+- name: Layer 2 - verify the network lab from inside every guest
+  hosts: pve_config_targets
+  gather_facts: false
+  tasks:
+    - name: Probe every declared peer from inside this guest
+      ansible.builtin.command:
+        cmd: "ping -c 2 -W 2 {{ item }}"
+      register: l2_netlab_ping
+      changed_when: false
+      failed_when: false
+      loop: "{{ (l2_config.netlab | default({})).peers | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Assert every declared peer answers through the router
+      ansible.builtin.assert:
+        that:
+          - item.rc | int == 0
+        fail_msg: >-
+          {{ item.item }} did not answer from inside {{ inventory_hostname }}:
+          {{ item.stdout | default('') | trim }}. The route is installed, so the
+          break is further along: the router's leg on this segment, its route to
+          the peer's network, or the peer's own route back.
+        success_msg: "{{ item.item }} answered from {{ inventory_hostname }} through the router."
+      loop: "{{ l2_netlab_ping.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: l2_netlab_ping.results | length > 0
 
 # ---------------------------------------------------------------------------
 # Verification from OUTSIDE the guest: the declaration says what Caddy should

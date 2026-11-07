@@ -28,11 +28,14 @@
       by hand, and point pve_ssh_key_path at it in playbooks/vars/secrets.yml.
     success_msg: "Automation key found at {{ pve_ssh_key_path }}."
 
-# Targets come from two places, and each guest is declared in exactly one:
+# Targets come from three places, and each guest is declared in exactly one:
 #   pve_config_targets  guests whose PVE shape layer 1 does NOT manage (partial
 #                       adoption, stated explicitly)
 #   pve_containers      guests layer 1 creates; any of them may carry a `config:`
 #                       block, in which case layer 2 owns the inside
+#   pve_vms             same, for VMs. A VM's address lives inside its own OS, so
+#                       it cannot be derived from the `net` string: it declares
+#                       an explicit `address:` next to its shape.
 - name: Assemble the configuration targets from the declared state
   ansible.builtin.set_fact:
     l2_targets: "{{ (l2_targets | default([])) + [entry] }}"
@@ -43,13 +46,19 @@
     derived: "{{ (src.netif | default({}, true)) | pve_declared_ipv4 }}"
     entry:
       vmid: "{{ src.vmid }}"
-      hostname: "{{ src.hostname }}"
+      hostname: "{{ src.hostname | default(src.name) }}"
       address: "{{ derived if derived is not none else (src.address | default('')) }}"
       manage: "{{ src.manage | default(false) | bool }}"
       config: "{{ src.config | default({}) }}"
-  loop: "{{ (pve_config_targets | default([])) + (pve_containers | selectattr('config', 'defined') | list) }}"
+      # A guest that speaks its own API (RouterOS) is not an SSH target: its
+      # role runs on the control node and talks to the address directly.
+      kind: "{{ 'api' if (src.config.routeros is defined) else 'ssh' }}"
+  loop: >-
+    {{ (pve_config_targets | default([]))
+       + (pve_containers | selectattr('config', 'defined') | list)
+       + (pve_vms | selectattr('config', 'defined') | list) }}
   loop_control:
-    label: "{{ item.hostname }} (VMID {{ item.vmid }})"
+    label: "{{ item.hostname | default(item.name) }} (VMID {{ item.vmid }})"
 
 - name: Assert every target declares a reachable address
   ansible.builtin.assert:
@@ -64,7 +73,7 @@
   loop_control:
     label: "{{ item.hostname }}"
 
-- name: Add every target to the inventory
+- name: Add every SSH target to the inventory
   ansible.builtin.add_host:
     name: "{{ item.hostname }}"
     groups: pve_config_targets
@@ -85,11 +94,27 @@
     # guest play as a host var, so it is never re-declared per play.
     l2_ssh_key_path: "{{ pve_ssh_key_path }}"
     l2_config: "{{ item.config }}"
-  loop: "{{ l2_targets }}"
+  loop: "{{ l2_targets | selectattr('kind', 'equalto', 'ssh') | list }}"
   loop_control:
     label: "{{ item.hostname }}"
   # inventory bookkeeping, not infrastructure state: keep the changed count
   # meaningful for the guests themselves.
+  changed_when: false
+
+# A guest that speaks its own API (RouterOS) is not an SSH target: there is no
+# shell to land in, so the role runs HERE and talks to the address directly.
+- name: Add every API target to the inventory
+  ansible.builtin.add_host:
+    name: "{{ item.hostname }}"
+    groups: pve_api_targets
+    ansible_host: "{{ item.address }}"
+    ansible_connection: local
+    pve_vmid: "{{ item.vmid }}"
+    l2_manage: "{{ item.manage }}"
+    l2_config: "{{ item.config }}"
+  loop: "{{ l2_targets | selectattr('kind', 'equalto', 'api') | list }}"
+  loop_control:
+    label: "{{ item.hostname }}"
   changed_when: false
 
 - name: Report the plan

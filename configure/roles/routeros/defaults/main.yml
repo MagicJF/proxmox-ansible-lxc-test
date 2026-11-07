@@ -1,0 +1,10 @@
+---
+# The tool that drives the RouterOS API. Stdlib only, like pve_read.py: a
+# collection would add librouteros (and pip) to the control node.
+routeros_tool: "{{ role_path }}/../../tools/routeros_apply.py"
+routeros_user: admin
+# A CHR image ships with the factory-empty password. Declare
+# pve_routeros_password in playbooks/vars/secrets.yml to set one: the first run
+# then logs in with the factory password and sets the declared one, and every
+# run after that uses it.
+routeros_password: "{{ pve_routeros_password | default('') }}"

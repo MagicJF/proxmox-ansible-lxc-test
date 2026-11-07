@@ -48,6 +48,9 @@
     pve_tool: "{{ playbook_dir }}/tools/pve_read.py"
     pve_manifest: "{{ playbook_dir }}/../inventory/group_vars/all.yml"
     pve_secrets: "{{ playbook_dir }}/vars/secrets.yml"
+    # The API base for the two things no module covers: node networking
+    # (pve_bridges) and growing an imported disk.
+    pve_api: "https://{{ pve_api_host }}:8006/api2/json"
   # Arming the tracer: PYTHONPATH makes CPython import playbooks/tracing/sitecustomize.py
   # in every module process, which then journals each HTTP call to PVE. The
   # reader tool inherits it too, so its reads land in the journal as well.
@@ -173,6 +176,10 @@
           {%- for k, v in pve_read_meta.platform.isos_present.items() | list if not v -%}{%- set _ = out.append('missing ISO: ' ~ k) -%}{%- endfor -%}
           {{- out | join('; ') -}}
 
+    # ---- host network, before any guest attaches to it --------------------
+    - name: Converge the declared host segments (pve_bridges)
+      ansible.builtin.include_tasks: tasks/bridges.yml
+
     # ---- mutate, only what drifted ---------------------------------------
     - name: Create the containers that do not exist yet
       community.proxmox.proxmox:
@@ -286,7 +293,11 @@
         tags: "{{ ct.tags | default(omit, true) }}"
         kvm: true
         net: "{{ ct.net }}"
-        scsi: "{{ ct.scsi }}"
+        # A disk that comes from a vendor image is rewritten here into the API's
+        # creation-time import syntax; its declared size is applied afterwards
+        # (tasks/disk_import.yml), because PVE creates the volume at the image's
+        # size.
+        scsi: "{{ ct.scsi | pve_disk_specs(ct.disk_import | default([])) }}"
         # A VM has no `pubkey`; the key at birth travels through cloud-init: the
         # same key as the containers (single source: pve_ssh_pubkey_path), plus
         # the cloud-init drive and its user. The drive claims ide2, so a guest
@@ -343,6 +354,10 @@
       register: vm_power
       no_log: true
       when: pve_plan[ct.vmid | string].power_drift
+
+    # ---- imported disks, once the VMs exist ------------------------------
+    - name: Grow the imported disk images to their declared size
+      ansible.builtin.include_tasks: tasks/disk_import.yml
 
     # ---- verify from a fresh read, once ----------------------------------
     - name: Re-read every declared guest (one process, one task)

@@ -1,0 +1,19 @@
+# {{ ansible_managed | default('managed by proxmox-ansible-lxc-test') }}
+#
+# The routes that make this guest reach the other segment of the network lab.
+# Rendered from the guest's `config.netlab.routes` declaration; `ip route
+# replace` is idempotent, so re-running the unit never doubles a route.
+[Unit]
+Description=Routes declared for the network lab (netlab)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+{% for route in netlab_routes %}
+ExecStart=ip route replace {{ route.to }} via {{ route.via }} dev {{ route.dev }}
+{% endfor %}
+
+[Install]
+WantedBy=multi-user.target

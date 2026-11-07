@@ -1,0 +1,88 @@
+---
+# ===========================================================================
+# Imported disk images (a VM's `disk_import` list).
+#
+# Why this exists at all: proxmox_kvm can only build a disk from a SIZE, and
+# the PVE API cannot decompress. A vendor image (MikroTik's CHR, for instance)
+# therefore has to be uploaded already raw to a storage that accepts `import`,
+# and attached with the API's special syntax `<storage>:0,import-from=<volid>`.
+# The engine does that at creation (filter pve_disk_specs), which is the only
+# moment PVE accepts it — and it creates the volume at the IMAGE's size, not at
+# the declared one. Growing it afterwards is a separate API call, and that is
+# what this file does.
+#
+# Called by apply.yml after the VMs exist and before anything is verified, so
+# the final verification compares the declared size against the real one.
+# ===========================================================================
+- name: Read the config of every VM that imports a disk
+  ansible.builtin.uri:
+    url: "{{ pve_api }}/nodes/{{ pve_node }}/qemu/{{ item.vmid }}/config"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    validate_certs: true
+    ca_path: "{{ pve_api_ca_path }}"
+    status_code: 200
+    return_content: true
+  loop: "{{ pve_vm_specs | selectattr('disk_import', 'defined') | list }}"
+  loop_control:
+    label: "VMID {{ item.vmid }}"
+  register: disk_vm_configs
+  no_log: true
+  # A VM that failed to be created is reported by the verification at the end
+  # of the run; here it only means there is nothing to resize.
+  failed_when: false
+
+- name: Fail loudly when a declared image was never attached
+  ansible.builtin.fail:
+    msg: >-
+      VMID {{ item.0.vmid }}: the declared disk {{ item.1.key }} does not exist.
+      An imported image can only be attached while the VM is created — PVE
+      accepts `import-from` at creation and nothing else — so this VM has to be
+      recreated: remove it from inventory/group_vars/all.yml, run apply.yml to
+      delete it, declare it again and run apply.yml once more.
+  loop: "{{ pve_vm_specs | selectattr('disk_import', 'defined') | list | subelements('disk_import') }}"
+  loop_control:
+    label: "VMID {{ item.0.vmid }} {{ item.1.key }}"
+  when:
+    - live_by_vmid[item.0.vmid | string] is defined
+    - item.1.key not in live_by_vmid[item.0.vmid | string]
+  vars:
+    live_by_vmid: >-
+      {{ dict(disk_vm_configs.results | default([]) | selectattr('json', 'defined')
+              | map(attribute='item.vmid') | map('string') | list
+              | zip(disk_vm_configs.results | default([]) | selectattr('json', 'defined')
+                    | map(attribute='json.data') | list)) }}
+
+- name: Grow the imported disks to their declared size
+  ansible.builtin.uri:
+    url: "{{ pve_api }}/nodes/{{ pve_node }}/qemu/{{ item.0.vmid }}/resize"
+    method: PUT
+    headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    body_format: form-urlencoded
+    body:
+      disk: "{{ item.1.key }}"
+      # The declared value is `<storage>:<size>`; PVE wants `<size>G`.
+      size: "{{ item.0.scsi[item.1.key] | split(':') | last }}G"
+    validate_certs: true
+    ca_path: "{{ pve_api_ca_path }}"
+    status_code: 200
+  loop: "{{ pve_vm_specs | selectattr('disk_import', 'defined') | list | subelements('disk_import') }}"
+  loop_control:
+    label: "VMID {{ item.0.vmid }} {{ item.1.key }}"
+  register: disk_resized
+  no_log: true
+  vars:
+    live_by_vmid: >-
+      {{ dict(disk_vm_configs.results | default([]) | selectattr('json', 'defined')
+              | map(attribute='item.vmid') | map('string') | list
+              | zip(disk_vm_configs.results | default([]) | selectattr('json', 'defined')
+                    | map(attribute='json.data') | list)) }}
+  when:
+    - live_by_vmid[item.0.vmid | string] is defined
+    - live_by_vmid[item.0.vmid | string][item.1.key] is defined
+    # Only when it is actually smaller: resizing to the same size is an error.
+    - >-
+      (live_by_vmid[item.0.vmid | string][item.1.key] | split('size=') | last | split('G') | first | int)
+      < (item.0.scsi[item.1.key] | split(':') | last | int)

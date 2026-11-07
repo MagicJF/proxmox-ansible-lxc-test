@@ -108,6 +108,47 @@ def pve_canon_attachments(mapping):
     return canonical
 
 
+def pve_disk_specs(scsi, disk_import):
+    """Turn the disks that come from a vendor image into the API's import syntax.
+
+    proxmox_kvm can only build a disk from a SIZE, and the PVE API cannot
+    decompress an image. A guest that boots a vendor image therefore declares
+    the disk as what it must END UP being (`local-zfs:8`) plus a `disk_import`
+    entry naming the uploaded image, and this filter rewrites that one key into
+    the creation-time syntax `<storage>:0,import-from=<volid>`. PVE creates the
+    volume at the IMAGE's size, so the declared size is applied afterwards by
+    playbooks/tasks/disk_import.yml.
+
+    A key without an import entry is returned untouched, so a VM can mix an
+    imported image with ordinary disks.
+    """
+    if not isinstance(scsi, dict):
+        raise AnsibleFilterError("pve_disk_specs expects a dict of disks")
+    imports = {}
+    for entry in disk_import or []:
+        if not isinstance(entry, dict) or "key" not in entry or "source" not in entry:
+            raise AnsibleFilterError(
+                "pve_disk_specs: every disk_import entry needs a `key` and a `source`"
+            )
+        if entry["key"] not in scsi:
+            raise AnsibleFilterError(
+                f"pve_disk_specs: disk_import names {entry['key']}, "
+                f"which is not declared in the guest's disks ({sorted(scsi)})"
+            )
+        imports[entry["key"]] = entry["source"]
+    if not imports:
+        return scsi
+    rewritten = {}
+    for key, value in scsi.items():
+        source = imports.get(key)
+        # `<storage>:<size>` -> `<storage>:0,import-from=<volid>`: size 0 means
+        # "take the image's size", which is what the import writes.
+        rewritten[key] = (
+            f"{str(value).split(':')[0]}:0,import-from={source}" if source else value
+        )
+    return rewritten
+
+
 def pve_declared_ipv4(netif):
     """Return the first static IPv4 declared in a container's netif mapping.
 
@@ -133,4 +174,5 @@ class FilterModule(object):
             "pve_attachments": pve_attachments,
             "pve_canon_attachments": pve_canon_attachments,
             "pve_declared_ipv4": pve_declared_ipv4,
+            "pve_disk_specs": pve_disk_specs,
         }
