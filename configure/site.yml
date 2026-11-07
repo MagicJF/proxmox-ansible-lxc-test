@@ -52,6 +52,12 @@
         file: tasks/tunnel.yml
         apply:
           become: true
+      # "NOTHING answers", not "any target is out of reach": with guests in their
+      # own networks the routers answer while the workstations behind them do
+      # not, and being eager here means the tunnel's own verification probes a
+      # network the endpoint cannot route yet — so it fails the whole run. Reaching
+      # those networks needs routes ON THE ENDPOINT (the one manual half), which
+      # is documented in playbooks/tools/wg_endpoint_setup.sh.
       when: not (l2_path_up | bool)
 
     - name: An unreachable guest LAN with no declared tunnel is a hard stop

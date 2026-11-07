@@ -36,21 +36,34 @@
 #   pve_vms             same, for VMs. A VM's address lives inside its own OS, so
 #                       it cannot be derived from the `net` string: it declares
 #                       an explicit `address:` next to its shape.
+- name: Build the effective VM specs (the CHR defaults merged, as apply.yml does)
+  # The declaration of a router merges pve_chr_defaults over pve_vm_defaults, and
+  # `manage: true` lives there — so a target scan that reads the RAW entries sees
+  # a router as unmanaged. One extra task is cheaper than a second copy of the
+  # merge rule.
+  ansible.builtin.set_fact:
+    l2_vm_specs: >-
+      {% set out = [] %}{% for i in pve_vms %}{% set _ = out.append(pve_vm_defaults | combine(pve_chr_defaults if (i.chr | default(false)) else {}) | combine(i)) %}{% endfor %}{{ out }}
+
 - name: Assemble the configuration targets from the declared state
   ansible.builtin.set_fact:
     l2_targets: "{{ (l2_targets | default([])) + [entry] }}"
   vars:
     src: "{{ item }}"
-    # A container's address is derived from its interface declaration; a router
-    # has no `netif` (its address lives inside RouterOS), so it is read from the
-    # address it declares on ether1, its management port. One source of truth
-    # either way, and never a second copy to drift.
+    # A router's management address, stripped of its prefix. Empty for anything
+    # that is not a router.
+    routeros_address: >-
+      {{ ((src.config.routeros.addresses | default([]) | selectattr('interface', 'equalto', 'ether1')
+           | map(attribute='address') | first | default('', true)) | split('/') | first)
+         if (src.config.routeros is defined) else '' }}
+    # A container's address comes from its interface declaration; a router has no
+    # `netif` (its address lives inside RouterOS). `none` — NOT an empty string —
+    # when neither applies, because the caller falls back to an explicit
+    # `address:` on `is not none`, and '' is not none.
     derived: >-
-      {{ (src.netif | default({}, true)) | pve_declared_ipv4
+      {{ ((src.netif | default({}, true)) | pve_declared_ipv4)
          if (src.netif | default({}, true))
-         else ((src.config.routeros.addresses | default([])
-                | selectattr('interface', 'equalto', 'ether1')
-                | map(attribute='address') | first | default('')) | split('/') | first) }}
+         else (routeros_address if routeros_address | length > 0 else none) }}
     entry:
       vmid: "{{ src.vmid }}"
       hostname: "{{ src.hostname | default(src.name) }}"
@@ -63,7 +76,7 @@
   loop: >-
     {{ (pve_config_targets | default([]))
        + (pve_containers | selectattr('config', 'defined') | list)
-       + (pve_vms | selectattr('config', 'defined') | list) }}
+       + (l2_vm_specs | selectattr('config', 'defined') | list) }}
   loop_control:
     label: "{{ item.hostname | default(item.name) }} (VMID {{ item.vmid }})"
 
