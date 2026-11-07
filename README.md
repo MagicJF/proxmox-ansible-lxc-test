@@ -259,29 +259,31 @@ Two decisions worth knowing:
   in the manifest and the guest is expected to sit behind a network that is not
   public.
 
-### A worked example: three sites, five routers, eight workstations
+### A worked example: two workstations and a switch
 
-The point of this one is that **every cable is a point-to-point link and all the
-switching and routing happens inside the MikroTik CHRs**, as it would on real
-hardware — the lab must not behave like a virtualised network.
+The point of this one is that **each workstation is a PC**: one NIC, no management
+leg, and every bit of switching and addressing done by a MikroTik CHR, as it
+would be on real hardware. The lab must not behave like a virtualised network.
 
 ```
-SEDE 1                                    SEDE 2              SEDE 3
-  ws1 ─┐                                    ws5 ─┐              ws7 ─┐
-       ├─ chr-a1 ─┐                          ├─ chr-b ──┐        ├─ chr-c ──┐
-  ws2 ─┘          │                          ws6 ─┘       │        ws8 ─┘       │
-                  ├─ chr-a3 ───────────[ WAN ]───────────┴────────────────────┘
-  ws3 ─┐          │       10.99.0.0/24
-       ├─ chr-a2 ─┘
-  ws4 ─┘
+          vmbr1  (gestión, 10.10.10.0/24)
+            │
+         ether1
+      ┌───────────┐
+      │  lab-chr  │  ether2 ──── vmbr2 ──── ws1     ← el "latiguillo RJ45"
+      │  (switch) │  ether3 ──── vmbr3 ──── ws2
+      └───────────┘
+
+      bridge "lan" = ether2 + ether3      ← esto ES el switch
+      10.30.0.1/24 + DHCP con una reserva por MAC
 ```
 
 Three declarations carry it:
 
 ```yaml
-pve_bridges:                      # 11 LINKS, one bridge each, no ports
-  - {iface: vmbr4, comments: "sede1: chr-a1 <-> ws1"}
-  # ... 10 more, including the WAN
+pve_bridges:                      # un cable por bridge, sin puertos
+  - {iface: vmbr2, comments: "lab cable: lab-chr ether2 <-> ws1"}
+  - {iface: vmbr3, comments: "lab cable: lab-chr ether3 <-> ws2"}
 
 # in pve_chr_defaults (merged only for entries declaring `chr: true`)
 pve_chr_defaults:
@@ -295,43 +297,88 @@ pve_chr_defaults:
   scsi: {scsi0: "local-zfs:8"}
   disk_import: [{key: scsi0, source: "local:import/chr-7.25.1.raw"}]
 
-# in pve_vms, one of the five
-  - vmid: 147
-    name: chr-a1
+# in pve_vms — el switch
+  - vmid: 140
+    name: lab-chr
     chr: true
     net:
-      net0: "virtio,bridge=vmbr1"   # ether1: gestión
-      net1: "virtio,bridge=vmbr4"   # ether2: a ws1
-      net2: "virtio,bridge=vmbr5"   # ether3: a ws2
-      net3: "virtio,bridge=vmbr8"   # ether4: uplink a chr-a3
+      net0: "virtio={{ lab_router_mac }},bridge=vmbr1"   # ether1: gestión
+      net1: "virtio,bridge=vmbr2"                        # ether2: a ws1
+      net2: "virtio,bridge=vmbr3"                        # ether3: a ws2
     config:
       routeros:
-        identity: chr-a1
+        identity: lab-chr
         dhcp_client: false
-        addresses: [{address: "10.10.10.50/24", interface: ether1}]
-        bridges: [{name: lan, ports: [ether2, ether3, ether4]}]   # sin IP: es un switch
+        addresses:
+          - {address: "{{ lab_router_mgmt }}/24", interface: ether1}
+          - {address: "{{ lab_gateway }}/24",     interface: "{{ lab_bridge_name }}"}
+        bridges: [{name: "{{ lab_bridge_name }}", ports: [ether2, ether3]}]
+        dhcp_servers:
+          - name: lab
+            interface: "{{ lab_bridge_name }}"
+            address_pool: "10.30.0.10-10.30.0.254"
+            network: "{{ lab_network }}"
+            gateway: "{{ lab_gateway }}"
+            dns_server: "{{ lab_gateway }}"
+            # derivado de las workstations: su `address:` y la MAC de su net0
+            leases: "{{ ... }}"
 
-# in pve_containers, one of the eight: UNA sola interfaz, y es la del lab
-  - vmid: 150
+# in pve_containers — una workstation: UNA sola interfaz, y es la del lab
+  - vmid: 141
     hostname: ws1
-    netif: {net0: "name=eth0,bridge=vmbr4,gw=10.21.0.1,ip=10.21.0.11/24"}
+    address: "10.30.0.11"        # la reserva que el CHR deriva de aquí
+    netif: {net0: "name=eth0,bridge=vmbr2,hwaddr=BC:24:11:00:00:51,ip=dhcp"}
 ```
 
-`chr-a3` is the layer-3 switch of site 1: it bridges its two uplinks **and** holds
-the site's gateway on the bridge (`10.21.0.1/24`), with static routes to the other
-sites over the WAN. `chr-b` and `chr-c` do the same for their sites, with a
-default route to `10.99.0.1`.
+**The switch is a bridge inside RouterOS**, not a Proxmox one: `ether2` and
+`ether3` are ports of the same RouterOS bridge, so the frames are switched by the
+CHR. `ether1` stays outside it — the management port of a switch, with the
+management address of a switch.
 
-Two consequences worth stating plainly:
+**The router is converged over its REST API**, with `ansible.builtin.uri`
+(`configure/roles/routeros`). It reads every table it can touch, computes an
+explicit list of REST calls, prints that plan before sending anything, sends one
+call per change, and then re-reads the router: a 200 is not proof that the router
+stored what was declared. A router already in the declared state costs **zero**
+calls.
 
-- **The workstations have no management leg on a Proxmox bridge.** The framework
-  reaches them *through the lab* (tunnel → site router → switch), so their SSH
-  address is their lab address, and a dead router means its workstations are
-  unreachable — exactly as in a real network. The fix is the router's serial
-  console, not an out-of-band cable.
-- **A bridge per link is not decoration.** If two guests shared one bridge,
-  Proxmox would be doing the switching and the routers would be a picture of a
+The workstation declares `ip=dhcp` and the CHR derives its reservation from the
+workstation's own entry — its `address:` and the MAC on its `net0` — so no value
+is written twice. That is what a real switch does with a DHCP reservation.
+
+Three consequences worth stating plainly:
+
+- **The workstations have no management leg.** Layer 2 reaches them *through the
+  lab*, so the control node's traffic has to be ROUTED to the network behind the
+  router: `pve_tunnel.endpoint_routes` declares it and
+  `playbooks/tools/wg_endpoint_setup.sh` applies it, in the same one-time paste
+  that already exists. It is the only manual step left, because the PVE API
+  cannot configure the host's routing table. Until it exists, a workstation
+  declared `manage: true` fails its reachability check — and with `serial: 1`,
+  one such guest stops every batch queued behind it.
+- **A bridge per cable is not decoration.** If two guests shared one bridge,
+  Proxmox would be doing the switching and the router would be a picture of a
   network. One bridge = one cable.
+- **A CHR has no address at all when it boots**, so its API does not exist yet
+  and nothing about it can be declared. See the next section.
+
+### The one thing the API cannot do: a router's first address
+
+A freshly imported CHR boots with a DHCP client on `ether1` and **no address**,
+and as a VM it cannot take one from the host's DHCP server: the offer arrives
+with an unresolved UDP checksum and the guest's kernel drops it. Without an
+address its API does not exist, so there is nothing to configure it with.
+
+`lab-bootstrap` (vmid 143) is the machine that hands over that single address. It
+lives on the same segment as the router's management leg and runs dnsmasq bound to
+that one MAC, with `ethtool -K eth0 tx off gso off tso off` — without which its
+own offer would carry the same broken checksum.
+
+The same defect that blocks the host's server is what makes this deterministic:
+the router only ever sees this one offer, so there is no race between two DHCP
+servers. After the router has taken the address, the container never intervenes
+again — everything else is REST. It is a bootstrap, not a second configuration
+path.
 
 ### Why not the community-scripts installers
 
@@ -415,6 +462,56 @@ Two measurement traps, both hit for real while building this:
   expression and *messages* from the text blocks.
 - **`for k, v in x | dict2items` is wrong.** `dict2items` yields items, so that unpacks the
   item's own `key`/`value` names and `v` becomes the string `"value"`. Use `x.items()`.
+
+## Checking the framework itself
+
+Four checks exist, and each answers a question the others cannot.
+
+**The declared state has to make sense as a whole.** `filter_plugins/state.py`
+validates the manifest's cross-references — that a RouterOS interface exists,
+that an endpoint route is also in `guest_network`, that a DHCP reservation names a
+declared machine, that a guest is not in both `pve_containers` and
+`pve_config_targets` — and `playbooks/tasks/validate_state.yml` makes BOTH verbs
+fail on it, before anything is read or written.
+
+This is the highest-value check here, because the platform does not catch a
+dangling reference: **RouterOS accepts an address on an interface that does not
+exist and simply does not create it.** The API answers 200, the run is green, and
+the router silently lacks the address. The failure then surfaces two layers later,
+in a connectivity test, looking like a network problem.
+
+The checks live in a filter rather than inside `playbooks/tools/pve_read.py` on
+purpose: the reader parses the manifest RAW, so it sees `"{{ lab_bridge_name }}"`
+as a literal string and every templated value would be a false positive. Ansible
+resolves the Jinja before it calls a filter.
+
+**Is it still convergent?** `framework_check.py invariant` runs a verb twice and
+requires the second run to report `changed=0` and to cover the same hosts. It
+reads Ansible's JSON callback instead of the human recap, because from a formatted
+table you can read a count but not trust a LIST of hosts — and telling "the guest
+was skipped" apart from "the guest was never in the play" is the whole point. Use
+`--verb configure/site.yml` for the host-coverage half: the plays of `apply` and
+`preflight` run on the control node, so their recap cannot show the guests, and
+the script says so rather than claiming a coverage it did not check.
+
+**Does it still see and repair a difference?** `framework_check.py drill` mutates
+one guest out of band through the PVE API and requires the full sequence:
+preflight clean → preflight reports DRIFT → apply repairs it → preflight clean
+again. `changed=0` alone proves neither half of that. The mutation is a
+`description`, which the declaration converges back, so the drill cleans up after
+itself.
+
+**`ansible-lint` stays green.** `.ansible-lint` forces the rules that matter and
+records why each of the others is skipped. A linter with standing findings teaches
+you to ignore it, which is worse than not running one. It is a convention ratchet,
+not a correctness gate: it cannot see inside a `lookup('template')`, so it does
+not catch the class of bug that actually costs a run here.
+
+```
+ansible-lint
+python3 playbooks/tools/framework_check.py invariant --verb configure/site.yml
+python3 playbooks/tools/framework_check.py drill
+```
 
 ## How the engine behaves
 
