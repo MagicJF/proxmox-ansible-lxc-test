@@ -46,6 +46,10 @@ import yaml
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MANIFEST = os.path.join(REPO, "inventory/group_vars/all.yml")
 SECRETS = os.path.join(REPO, "playbooks/vars/secrets.yml")
+# Where this script's own runs log. They must not share logs/ansible.log: the
+# JSON callback is orders of magnitude larger than the human output, and mixing
+# the two is what made that file unreadable. See run_verb().
+FRAMEWORK_LOG = os.path.join(REPO, "logs/framework-check.log")
 
 # `141: IN SYNC | exists` / `142: DRIFT | ...` — the line both verbs print per
 # guest. The drill reads the framework's own verdict instead of re-deriving it.
@@ -72,6 +76,13 @@ def run_verb(verb):
     env = dict(os.environ)
     env["ANSIBLE_STDOUT_CALLBACK"] = "json"
     env["ANSIBLE_LOAD_CALLBACK_PLUGINS"] = "1"
+    # Do NOT inherit the human run log. The JSON callback emits megabytes per run,
+    # and this script already reads that output from stdout — so letting it land
+    # in logs/ansible.log (append-only, never rotated by Ansible) is how that file
+    # reached 78 MB, 99% of it machine output nobody reads. Send it to its own
+    # file instead: the human log stays readable, and a failed run is still on
+    # disk to debug. The file is covered by pve_log_retention like the others.
+    env["ANSIBLE_LOG_PATH"] = FRAMEWORK_LOG
     proc = subprocess.run(
         ["ansible-playbook", verb], cwd=REPO, env=env, capture_output=True, text=True
     )
