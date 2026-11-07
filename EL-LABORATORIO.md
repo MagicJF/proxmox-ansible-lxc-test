@@ -57,7 +57,7 @@ Leído en palabras:
 | `ws1`…`ws4` | 150-153 | Las cuatro workstations de la central | `10.11.0.11` … `.14` |
 | `ws5`, `ws6` | 154-155 | Las dos workstations de la delegación 2 | `10.12.0.11`, `.12` |
 | `ws7`, `ws8` | 156-157 | Las dos workstations de la delegación 3 | `10.13.0.11`, `.12` |
-| `lab-bootstrap` | 143 | Herramienta de despliegue: da a cada router su primera dirección | `10.10.10.143` |
+| `lab-bootstrap` | 143 | Herramienta de despliegue: da a cada router su primera dirección | `10.10.10.53` |
 
 Los siete equipos de red son **RouterOS CHR** (la versión virtual de RouterOS, la
 que corre en los equipos de MikroTik). Las ocho workstations son **contenedores

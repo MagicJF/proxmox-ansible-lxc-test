@@ -22,7 +22,7 @@ LAB="ws1 10.11.0.11 1 pc;ws2 10.11.0.12 1 pc;ws3 10.11.0.13 1 pc;ws4 10.11.0.14 
 LAB="$LAB;ws5 10.12.0.11 2 pc;ws6 10.12.0.12 2 pc;ws7 10.13.0.11 3 pc;ws8 10.13.0.12 3 pc"
 LAB="$LAB;sw1 10.10.10.160 0 sw;sw2 10.10.10.161 0 sw;rt1 10.10.10.162 0 rt"
 LAB="$LAB;sw3 10.10.10.163 0 sw;rt2 10.10.10.164 0 rt;sw4 10.10.10.165 0 sw"
-LAB="$LAB;rt3 10.10.10.166 0 rt;boot 10.10.10.143 0 boot"
+LAB="$LAB;rt3 10.10.10.166 0 rt;boot 10.10.10.53 0 boot"
 
 # --- la topología: quién es quién y por dónde se cruza -----------------------
 GW_1=10.11.0.1; GW_2=10.12.0.1; GW_3=10.13.0.1   # la puerta de cada sede
