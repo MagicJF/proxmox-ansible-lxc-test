@@ -159,11 +159,15 @@ if [ -n "$anomalias" ]; then
   echo "  caminos distintos al predicho:"
   printf '%s' "$anomalias" | sed 's/^/    - /'
 fi
-echo
-echo "  NOTA: los switches no llevan ruta de vuelta hacia las sedes (su tabla de"
-echo "  rutas sólo tiene redes conectadas), así que RECIBEN el ping pero no pueden"
-echo "  contestarlo. Si salen en NO es la topología, no el script: los 3 routers"
-echo "  sí contestan porque tienen rutas a las tres sedes."
+# La nota sólo aparece si algo NO contestó. En un lab sano no hay nada que
+# explicar, y una nota fija contradiría al propio resultado en cuanto los
+# switches llevaran su puerta de enlace de gestión.
+if [ "$ok_reach" != "$total" ]; then
+  echo
+  echo "  NOTA: lo que sale en NO suele ser falta de ruta de VUELTA, no de ida —"
+  echo "  el paquete llega y la respuesta no encuentra por dónde salir. Es lo que"
+  echo "  le pasaba a los switches antes de llevar puerta de enlace de gestión."
+fi
 
 echo
 echo "### PEGA ESTO ###"
