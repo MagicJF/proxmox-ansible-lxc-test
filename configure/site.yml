@@ -17,8 +17,74 @@
     pve_ssh_user: root
     pve_ssh_key_path: "/home/hermes/.hermes/profiles/hermione/secrets/pve-automation_ed25519"
   tasks:
+    - name: Keep logs/ bounded (the policy in the declared state)
+      ansible.builtin.include_tasks: ../playbooks/tasks/prune_logs.yml
+
     - name: Build the configuration targets
       ansible.builtin.include_tasks: tasks/build_targets.yml
+
+    # ---- the PATH layer 2 runs on -----------------------------------------
+    # Layer 2 is SSH. If this node is not on the guest LAN, every guest looks
+    # unreachable for a reason no key can fix, and the run would die with a
+    # message about SSH access. The tunnel is declared, so detect the situation
+    # and converge it here instead of reporting it.
+    - name: Probe the SSH port of every configuration target
+      ansible.builtin.wait_for:
+        host: "{{ item.address }}"
+        port: 22
+        timeout: 4
+      loop: "{{ l2_targets }}"
+      loop_control:
+        label: "{{ item.hostname }} ({{ item.address }})"
+      register: l2_path_probe
+      # Not `failed_when: false`: that hides the failure and `wait_for` still
+      # reports `elapsed` on timeout, so the result cannot tell success from
+      # expiry. `ignore_errors` keeps `failed=True` in the per-item result,
+      # which is the discriminator the two tasks below rely on.
+      ignore_errors: true
+
+    - name: Note whether the guest LAN answers at all
+      ansible.builtin.set_fact:
+        l2_path_up: >-
+          {{ l2_path_probe.results | rejectattr('failed') | list | length > 0 }}
+
+    - name: Converge the declared tunnel when nothing answers
+      # `apply:` rather than a task-level keyword: this ansible-core refuses
+      # `become` as a direct attribute of a TaskInclude.
+      ansible.builtin.include_tasks:
+        file: tasks/tunnel.yml
+        apply:
+          become: true
+      # "NOTHING answers", not "any target is out of reach": with guests in their
+      # own networks the routers answer while the workstations behind them do
+      # not, and being eager here means the tunnel's own verification probes a
+      # network the endpoint cannot route yet — so it fails the whole run. Reaching
+      # those networks needs routes ON THE ENDPOINT (the one manual half), which
+      # is documented in playbooks/tools/wg_endpoint_setup.sh.
+      when: not (l2_path_up | bool)
+
+    - name: An unreachable guest LAN with no declared tunnel is a hard stop
+      ansible.builtin.fail:
+        msg: >-
+          No configuration target answers on :22 and pve_tunnel is not declared with
+          manage true, so layer 2 has no path to the guests. Declare pve_tunnel in
+          inventory/group_vars/all.yml (endpoint, endpoint_public_key, address,
+          guest_network, private_key_path) and run this verb again, or run it from a
+          node that is already on the guest LAN. Nothing was changed on the guests.
+      when:
+        - not (l2_path_up | bool)
+        - not (pve_tunnel.manage | default(false) | bool)
+
+    - name: Report the layer 2 path
+      ansible.builtin.debug:
+        msg: >-
+          Layer 2 path: as found, {{ l2_answered | length }}/{{ l2_targets | length }} target(s)
+          answered on :22
+          {{ '-> this run converged the declared tunnel ' ~ (pve_tunnel.name | default(''))
+             if not (l2_path_up | bool) else '(guest LAN reachable directly)' }}
+      vars:
+        l2_answered: >-
+          {{ l2_path_probe.results | rejectattr('failed') | map(attribute='item') | list }}
 
 - name: Layer 2 - converge the inside of every managed guest
   hosts: pve_config_targets
@@ -66,6 +132,35 @@
         - l2_manage | bool
         - l2_config.apache is defined
 
+    # The network lab: a guest on an isolated segment can only reach the other
+    # segment through the router VM, which needs a route its own network
+    # configuration does not provide. The role installs the declared routes and
+    # then proves the connectivity from inside the guest.
+    - name: Converge the declared routes of the network lab
+      ansible.builtin.include_role:
+        name: netlab
+      vars:
+        netlab_routes: "{{ (l2_config.netlab | default({})).routes | default([]) }}"
+        netlab_peers: "{{ (l2_config.netlab | default({})).peers | default([]) }}"
+      when:
+        - l2_manage | bool
+        - l2_config.netlab is defined
+
+    # The router's first address. A RouterOS guest cannot be configured until it
+    # has one, and it cannot take one from the host's DHCP server (its kernel
+    # drops offers whose UDP checksum a veth left unfinished). This guest is the
+    # machine that hands that one address over — and then never intervenes again.
+    - name: Converge the declared router bootstrap
+      ansible.builtin.include_role:
+        name: bootstrap
+      vars:
+        bootstrap_interface: "{{ (l2_config.bootstrap | default({})).interface | default('eth0') }}"
+        bootstrap_lease_mac: "{{ (l2_config.bootstrap | default({})).lease_mac | default('') }}"
+        bootstrap_lease_address: "{{ (l2_config.bootstrap | default({})).lease_address | default('') }}"
+      when:
+        - l2_manage | bool
+        - l2_config.bootstrap is defined
+
     - name: "Nothing to converge: the declaration is read-only for this guest"
       ansible.builtin.debug:
         msg: >-
@@ -73,6 +168,64 @@
           audits it (configure/audit.yml). Set manage true in the declaration when
           you are ready for it to be converged.
       when: not (l2_manage | bool)
+
+# ---------------------------------------------------------------------------
+# Guests that speak their own API instead of a POSIX shell (RouterOS). The role
+# runs on the control node and drives the guest's API; there is no SSH path.
+# ---------------------------------------------------------------------------
+- name: Layer 2 - converge the guests that speak their own API
+  hosts: pve_api_targets
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Converge the declared RouterOS state
+      ansible.builtin.include_role:
+        name: routeros
+      when: l2_config.routeros is defined
+
+    - name: "Nothing to converge: the declaration is read-only for this guest"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is declared with manage false, so layer 2 only
+          audits it. Set manage true in the declaration when you are ready for it
+          to be converged.
+      when: not (l2_manage | bool)
+
+# ---------------------------------------------------------------------------
+# Verification from INSIDE the guests: the network lab exists so that a packet
+# can leave one segment, cross the router VM and come back from the other. That
+# proof needs EVERY guest converged, so it is a pass of its own — the play above
+# converges one guest at a time, and the first guest's peer is not configured
+# until the last one has run.
+# ---------------------------------------------------------------------------
+- name: Layer 2 - verify the network lab from inside every guest
+  hosts: pve_config_targets
+  gather_facts: false
+  tasks:
+    - name: Probe every declared peer from inside this guest
+      ansible.builtin.command:
+        cmd: "ping -c 2 -W 2 {{ item }}"
+      register: l2_netlab_ping
+      changed_when: false
+      failed_when: false
+      loop: "{{ (l2_config.netlab | default({})).peers | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Assert every declared peer answers through the router
+      ansible.builtin.assert:
+        that:
+          - item.rc | int == 0
+        fail_msg: >-
+          {{ item.item }} did not answer from inside {{ inventory_hostname }}:
+          {{ item.stdout | default('') | trim }}. The route is installed, so the
+          break is further along: the router's leg on this segment, its route to
+          the peer's network, or the peer's own route back.
+        success_msg: "{{ item.item }} answered from {{ inventory_hostname }} through the router."
+      loop: "{{ l2_netlab_ping.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: l2_netlab_ping.results | length > 0
 
 # ---------------------------------------------------------------------------
 # Verification from OUTSIDE the guest: the declaration says what Caddy should

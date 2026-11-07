@@ -41,9 +41,59 @@ except ImportError:  # pragma: no cover
 ISO_RE = re.compile(r"([^,:]+):iso/[^,]+")
 VOLID_RE = re.compile(r"^([^:]+):")
 
+# Every credential, under every name the two documented sources use.
+CRED_ALIASES = {
+    "host": ("PROXMOX_HOST", "host", "pve_api_host"),
+    "token_id": ("PROXMOX_TOKEN_ID", "token_id", "pve_api_token_id"),
+    "token_secret": ("PROXMOX_TOKEN_SECRET", "token_secret", "pve_api_token_secret"),
+    "ca_path": ("PROXMOX_CA_PATH", "ca_path", "pve_api_ca_path"),
+}
+
+
+class StrictLoader(yaml.SafeLoader):
+    """SafeLoader that REFUSES duplicate mapping keys.
+
+    YAML keeps the last value of a duplicated key without saying so, which turns
+    a half-deleted list item into a silent reconfiguration of its neighbour: the
+    entry above inherits the orphaned `manage:`/`config:` block and the next run
+    converges the wrong application on the wrong guest. The declared state is the
+    human interface to the infrastructure, so a duplicate key is a hard error
+    naming the line, not a warning to scroll past.
+    """
+
+
+def _no_duplicate_keys(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                None, None,
+                f"duplicate key {key!r} in the declared state (line {key_node.start_mark.line + 1}). "
+                "A guest entry was probably deleted only halfway, leaving its block attached to the "
+                "entry above; delete the whole entry, or none of it",
+                key_node.start_mark)
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+def _strict_mapping(loader, node):
+    loader.flatten_mapping(node)
+    return _no_duplicate_keys(loader, node)
+
+
+StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _strict_mapping)
+
 
 def load_credentials(args):
-    """Resolve credentials without ever echoing them."""
+    """Resolve credentials without ever echoing them.
+
+    Each credential is accepted under several names because the two documented
+    sources spell them differently: the environment uses PROXMOX_*, the secrets
+    file uses pve_api_*. Accepting only one spelling is how the file path can
+    look correct for months while the reader has never actually used it.
+    """
     creds = {
         "host": os.environ.get("PROXMOX_HOST", ""),
         "token_id": os.environ.get("PROXMOX_TOKEN_ID", ""),
@@ -55,13 +105,20 @@ def load_credentials(args):
             data = yaml.safe_load(open(args.secrets)) or {}
         except Exception as exc:
             sys.exit(f"pve_read.py: cannot parse {args.secrets}: {exc}")
-        for key in ("host", "token_id", "token_secret", "ca_path"):
-            value = data.get(key) or data.get(key.upper())
-            if value:
-                creds[key] = str(value)  # the secrets file wins over the environment
+        for key, names in CRED_ALIASES.items():
+            for name in names:
+                value = data.get(name)
+                if value:
+                    creds[key] = str(value)  # the secrets file wins over the environment
+                    break
     missing = [k for k, v in creds.items() if not v]
     if missing:
-        sys.exit("pve_read.py: missing credentials: " + ", ".join(missing))
+        accepted = "; ".join(f"{k} = {' | '.join(CRED_ALIASES[k])}" for k in missing)
+        sys.exit(
+            "pve_read.py: missing credentials: " + ", ".join(missing)
+            + f". Looked in the environment and in {args.secrets or '(no --secrets given)'}"
+            + f". Accepted names: {accepted}"
+        )
     return creds
 
 
@@ -94,14 +151,28 @@ def revision(cwd):
 
 
 def declared(manifest):
-    """The guests layer 1 manages. pve_config_targets is deliberately NOT read."""
-    data = yaml.safe_load(open(manifest)) or {}
+    """The guests layer 1 manages. pve_config_targets is deliberately NOT read.
+
+    Parsed with StrictLoader, so a duplicated key (the fingerprint of a
+    half-deleted entry) stops the run instead of silently reconfiguring the guest
+    above it, and every entry is required to carry its identity.
+    """
+    try:
+        data = yaml.load(open(manifest), Loader=StrictLoader) or {}
+    except yaml.YAMLError as exc:
+        sys.exit(f"pve_read.py: {manifest} is not a valid declared state: {exc}")
     guests = []
-    for kind, key, default_key in (("lxc", "pve_containers", "pve_defaults"),
-                                   ("qemu", "pve_vms", "pve_vm_defaults")):
+    for kind, key, default_key, identity in (("lxc", "pve_containers", "pve_defaults", "hostname"),
+                                             ("qemu", "pve_vms", "pve_vm_defaults", "name")):
         defaults = data.get(default_key) or {}
         for item in data.get(key) or []:
+            if not isinstance(item, dict) or "vmid" not in item:
+                sys.exit(f"pve_read.py: every entry of {key} needs a vmid; found {item!r}. "
+                         "A half-deleted entry is not state — delete the whole entry or none of it.")
             spec = {**defaults, **item}
+            if not spec.get(identity):
+                sys.exit(f"pve_read.py: {key} entry vmid {item['vmid']} declares no {identity}, "
+                         "which is the identity the platform is matched against. Nothing was changed.")
             guests.append({"kind": kind, "vmid": item.get("vmid"), "spec": spec,
                            "identifier": spec.get("hostname") or spec.get("name")})
     return data, guests
@@ -196,7 +267,7 @@ def platform_facts(session, base, node, data, guests):
 def main():
     ap = argparse.ArgumentParser(description="Read the declared state, every guest, and the platform facts.")
     ap.add_argument("--manifest", required=True, help="declared-state file (group_vars/all.yml)")
-    ap.add_argument("--secrets", help="YAML with host/token_id/token_secret/ca_path")
+    ap.add_argument("--secrets", help="YAML with the credentials (pve_api_host, pve_api_token_id, pve_api_token_secret, pve_api_ca_path, or the PROXMOX_* spellings)")
     ap.add_argument("--journal", help="append run_start/run_end markers here")
     ap.add_argument("--playbook", default="unknown")
     ap.add_argument("--phase", default="read", choices=["read", "verify"])

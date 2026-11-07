@@ -48,6 +48,9 @@
     pve_tool: "{{ playbook_dir }}/tools/pve_read.py"
     pve_manifest: "{{ playbook_dir }}/../inventory/group_vars/all.yml"
     pve_secrets: "{{ playbook_dir }}/vars/secrets.yml"
+    # The API base for the two things no module covers: node networking
+    # (pve_bridges) and growing an imported disk.
+    pve_api: "https://{{ pve_api_host }}:8006/api2/json"
   # Arming the tracer: PYTHONPATH makes CPython import playbooks/tracing/sitecustomize.py
   # in every module process, which then journals each HTTP call to PVE. The
   # reader tool inherits it too, so its reads land in the journal as well.
@@ -74,6 +77,9 @@
       when: ansible_check_mode
 
   tasks:
+    - name: Keep logs/ bounded (the policy in the declared state)
+      ansible.builtin.include_tasks: tasks/prune_logs.yml
+
     # ---- read everything, once -------------------------------------------
     - name: Read every declared guest (one process, one task)
       ansible.builtin.command:
@@ -92,9 +98,15 @@
         pve_cts: >-
           {% set out = [] %}{% for i in pve_containers %}{% set _ = out.append(pve_defaults | combine(i)) %}{% endfor %}{{ out }}
         pve_vm_specs: >-
-          {% set out = [] %}{% for i in pve_vms %}{% set _ = out.append(pve_vm_defaults | combine(i)) %}{% endfor %}{{ out }}
+          {% set out = [] %}{% for i in pve_vms %}{% set _ = out.append(pve_vm_defaults | combine(pve_chr_defaults if (i.chr | default(false)) else {}) | combine(i)) %}{% endfor %}{{ out }}
         pve_read_meta: "{{ pve_read_before.stdout | from_json }}"
         pve_live_before: "{{ (pve_read_before.stdout | from_json).guests }}"
+
+    # Before anything is analysed or written: the declared state has to make
+    # sense as a whole. See playbooks/tasks/validate_state.yml for why a
+    # dangling reference is worth a task of its own.
+    - name: Refuse a declared state that points at something that does not exist
+      ansible.builtin.include_tasks: tasks/validate_state.yml
 
     # ---- analyse everything, once ----------------------------------------
     - name: Analyse every declared guest in one templating pass
@@ -172,6 +184,10 @@
           {%- for k, v in pve_read_meta.platform.templates_present.items() | list if not v -%}{%- set _ = out.append('missing template: ' ~ k) -%}{%- endfor -%}
           {%- for k, v in pve_read_meta.platform.isos_present.items() | list if not v -%}{%- set _ = out.append('missing ISO: ' ~ k) -%}{%- endfor -%}
           {{- out | join('; ') -}}
+
+    # ---- host network, before any guest attaches to it --------------------
+    - name: Converge the declared host segments (pve_bridges)
+      ansible.builtin.include_tasks: tasks/bridges.yml
 
     # ---- mutate, only what drifted ---------------------------------------
     - name: Create the containers that do not exist yet
@@ -280,13 +296,26 @@
         machine: "{{ ct.machine }}"
         scsihw: "{{ ct.scsihw }}"
         vga: "{{ ct.vga }}"
+        # The VNC console's keymap. It is a property of the VM, not of the
+        # guest's OS, so a Spanish keyboard has to be declared here or every
+        # console session types the wrong characters.
+        keyboard: "{{ ct.keyboard | default(omit, true) }}"
         onboot: "{{ ct.onboot | bool }}"
         boot: "{{ ct.boot }}"
         description: "{{ ct.description | default(omit, true) }}"
         tags: "{{ ct.tags | default(omit, true) }}"
         kvm: true
         net: "{{ ct.net }}"
-        scsi: "{{ ct.scsi }}"
+        # A serial port declared as `socket` is what gives PVE's UI a console
+        # that carries CHARACTERS instead of scancodes — the only console that
+        # respects a non-US keyboard when the guest's own console layout cannot
+        # be changed (RouterOS, for instance).
+        serial: "{{ ct.serial | default(omit, true) }}"
+        # A disk that comes from a vendor image is rewritten here into the API's
+        # creation-time import syntax; its declared size is applied afterwards
+        # (tasks/disk_import.yml), because PVE creates the volume at the image's
+        # size.
+        scsi: "{{ ct.scsi | pve_disk_specs(ct.disk_import | default([])) }}"
         # A VM has no `pubkey`; the key at birth travels through cloud-init: the
         # same key as the containers (single source: pve_ssh_pubkey_path), plus
         # the cloud-init drive and its user. The drive claims ide2, so a guest
@@ -316,6 +345,9 @@
         memory: "{{ ct.memory if 'memory' in a.to_set else omit }}"
         cpu: "{{ ct.cpu if 'cpu' in a.to_set else omit }}"
         vga: "{{ ct.vga if 'vga' in a.to_set else omit }}"
+        keyboard: "{{ ct.keyboard if 'keyboard' in a.to_set else omit }}"
+        serial: >-
+          {{ ct.serial if ((ct.serial | default({}, true)).keys() | list | intersect(a.to_set) | length > 0) else omit }}
         boot: "{{ ct.boot if 'boot' in a.to_set else omit }}"
         onboot: "{{ (ct.onboot | bool) if 'onboot' in a.to_set else omit }}"
         description: "{{ ct.description if 'description' in a.to_set else omit }}"
@@ -343,6 +375,10 @@
       register: vm_power
       no_log: true
       when: pve_plan[ct.vmid | string].power_drift
+
+    # ---- imported disks, once the VMs exist ------------------------------
+    - name: Grow the imported disk images to their declared size
+      ansible.builtin.include_tasks: tasks/disk_import.yml
 
     # ---- verify from a fresh read, once ----------------------------------
     - name: Re-read every declared guest (one process, one task)

@@ -3,7 +3,7 @@
 #
 # This is the only file that changes when a change is requested: edit it, open a
 # branch, run preflight -> apply. The playbooks under playbooks/ are a fixed
-# engine (two verbs) and never grow one file per request.
+# engine (preflight, apply, connect, remove) and never grow one file per request.
 #
 # It is a group_vars FILE for the group "all", so variables sit at the top level.
 # Nesting them under an "all:" key would define one variable named "all" and
@@ -15,6 +15,33 @@
 # ============================================================================
 
 pve_node: Proxmox
+
+# ============================================================================
+# Identidad del laboratorio de conectividad — UNA sola verdad.
+#
+# Tres consumidores distintos necesitan estos mismos cuatro valores: la
+# declaración del CHR (su dirección de gestión y la del segmento del lab), el
+# contenedor de bootstrap (la dirección que le concede al CHR en el primer
+# arranque), el servidor DHCP del propio CHR (la red y la puerta de enlace) y la
+# ruta que el endpoint necesita para llegar al lab. Declararlos una vez aquí es
+# lo que evita que se separen.
+#
+# Las direcciones de las WORKSTATIONS no están aquí: cada una declara la suya en
+# su propia entrada (es su identidad en el segmento) y el CHR las deriva.
+# ============================================================================
+# La pata de gestión del CHR: en la LAN 10.10.10.0/24, como la IP de
+# administración de cualquier switch real.
+lab_router_mgmt: "10.10.10.50"
+# La MAC de su ether1. Fijada porque el bootstrap ata la concesión a ella: es lo
+# que hace determinista la primera dirección de un CHR que aún no tiene ninguna.
+lab_router_mac: "BC:24:11:00:00:40"
+# El segmento del lab, detrás del router.
+lab_network: "10.30.0.0/24"
+lab_gateway: "10.30.0.1"
+# El nombre del bridge de RouterOS: los puertos del switch. Se declara una vez
+# porque la dirección del segmento y el servidor DHCP viven EN él, y "bridge" no
+# es un nombre de interfaz — la interfaz se llama como se llame este bridge.
+lab_bridge_name: "lan"
 
 # ============================================================================
 # The automation key every guest is born with — a framework default, not a
@@ -35,6 +62,83 @@ pve_node: Proxmox
 # ============================================================================
 pve_ssh_pubkey_path: "/home/hermes/.hermes/profiles/hermione/secrets/pve-automation_ed25519.pub"
 
+# ============================================================================
+# The control node's PATH into the guest LAN — the precondition layer 2 runs on.
+#
+# The PVE API answers on the public address from anywhere, but the guests live on
+# an internal bridge (vmbr1) the control node is not attached to. Layer 2 is SSH,
+# so without a path every guest is "unreachable" for a reason that has nothing to
+# do with its key. The path is therefore declared here and converged like any
+# other resource:
+#
+#   ansible-playbook playbooks/connect.yml      # converge the path on its own
+#   ansible-playbook configure/site.yml         # brings it up AUTOMATICALLY when
+#                                               # no guest answers on :22
+#
+# Keys follow the same rule as the SSH automation key: the private half is a file
+# outside the repository (generated here if absent, never printed) and only the
+# PUBLIC half travels. Set `manage: false` to get layer 2's plain behaviour when
+# this node already routes to the guest LAN.
+# ============================================================================
+pve_tunnel:
+  manage: true
+  # Interface name on this node; also the unit name (wg-quick@<name>).
+  name: wg-lab
+  # The endpoint lives on the lab side. The API cannot configure the Proxmox
+  # host, so that half is bootstrapped once with
+  # playbooks/tools/wg_endpoint_setup.sh (connect.yml prints the exact command
+  # WITH this node's public key when there is no handshake).
+  endpoint: "54.36.168.83:51820"
+  # The endpoint's public key — public, safe to commit. It is what authenticates
+  # the lab side of the tunnel.
+  endpoint_public_key: "3+bBS+GqR4EtWUFst+2s49rneVguWquuRBGINt/tZXQ="
+  # This node's address inside the tunnel (own /24, never the guest LAN).
+  address: "10.99.99.2/24"
+  # Only the lab's networks are routed through the tunnel; everything else (the
+  # API on its public address) keeps using the normal path. It is a LIST because
+  # the lab's guests no longer share one subnet: the workstations live in their
+  # sites' networks and are reachable only THROUGH the MikroTik topology, so the
+  # control node needs a route into each of them.
+  guest_network:
+    - "10.10.10.0/24"   # la LAN de gestión (el host y el CHR)
+    - "10.30.0.0/24"    # la red del lab: vive DETRÁS del CHR, así que el
+                        # endpoint necesita una ruta para ella (abajo)
+  # Rutas que el ENDPOINT (el host Proxmox) necesita para entregar el tráfico del
+  # túnel a una red que no tiene conectada. Sin ellas el control node alcanza al
+  # CHR pero no a las workstations que están detrás: el endpoint manda esos
+  # paquetes por su ruta por defecto y mueren en el camino.
+  #
+  # Es la única línea que hay que pegar a mano, y la aplica el MISMO script que
+  # ya se pega una vez (playbooks/tools/wg_endpoint_setup.sh), que la recibe como
+  # último argumento. `via` es la dirección de gestión del router de esa red.
+  endpoint_routes:
+    - to: "{{ lab_network }}"
+      via: "{{ lab_router_mgmt }}"
+  # No extension, like an SSH key: the public half is this path plus `.pub`.
+  private_key_path: "/home/hermes/.hermes/profiles/hermione/secrets/wg-lab-client"
+  keepalive: 25
+
+# ============================================================================
+# Host-level network segments, created through the PVE API.
+#
+# These are LINKS, not a switching fabric: each one is a bridge with no ports
+# that carries exactly one point-to-point cable between two guests, and nothing
+# else. All the switching and routing happens inside the MikroTik CHRs, exactly
+# as it would on real hardware — if two guests shared a bridge, Proxmox would be
+# doing the switching and the routers would be decoration.
+#
+# `bridge_ports` empty is what makes a link isolated. Only creation is
+# automated: a segment that already exists is left alone, because recreating a
+# bridge under a running lab would cut its guests off.
+# ============================================================================
+pve_bridges:
+  # Un cable RJ45, y nada más: cada bridge lleva UN enlace punto a punto entre el
+  # router y una workstation. Sin puertos físicos y sin dirección, así que quien
+  # conmuta y quien reparte las direcciones es el RouterOS, no Proxmox.
+  - iface: vmbr2
+    comments: "lab cable: lab-chr ether2 <-> ws1 (isolated, no ports)"
+  - iface: vmbr3
+    comments: "lab cable: lab-chr ether3 <-> ws2 (isolated, no ports)"
 pve_defaults:
   # ---- creation-time: PVE cannot change these on an existing container ------
   # Drift here is refused, not converged: the container would have to be
@@ -157,55 +261,96 @@ pve_containers:
           expect_status: 200
           expect_body: "TiddlyWiki"
 
-  # Apache web server. Layer 1 owns the guest's shape; layer 2 owns Apache, the
-  # vhosts and the content they serve.
-  - vmid: 132
-    hostname: web-apache
+  # ---------------------------------------------------------------------------
+  # El laboratorio de conectividad: dos workstations y el switch que las une.
+  #
+  # Cada workstation es un PC: UNA sola NIC, sin interfaz de gestión, en su
+  # propio bridge aislado — el latiguillo RJ45 que la une al switch. Su dirección
+  # la reparte el propio RouterOS por DHCP, como en cualquier red real, y por eso
+  # layer 2 no puede derivarla de un `net0` estático: se declara aquí como la
+  # dirección que el switch le RESERVA, y el CHR la deriva de esta entrada.
+  #
+  # La MAC va declarada en el net0 porque es lo que ata la reserva a la interfaz:
+  # una sola verdad, no dos. PVE la respeta al crear la LXC.
+  # ---------------------------------------------------------------------------
+  - vmid: 141
+    hostname: ws1
     cores: 1
     memory: 512
-    swap: 512
-    rootfs_size: 4
+    rootfs_size: 6
+    swap: 256
     status: started
-    tags: [web, apache, lab]
-    description: "Apache web server: shape owned by layer 1, Apache and its declared vhosts owned by layer 2."
+    tags: [netlab, workstation, lab]
+    description: "Workstation 1: una sola NIC en el cable hacia el CHR. Sin interfaz de gestión, como un PC."
+    # La dirección que el CHR le reserva por MAC. La usan el servidor DHCP del
+    # router (la concesión) y layer 2 (dónde hablarle por SSH).
+    address: "10.30.0.11"
     netif:
-      # Static on the LAN bridge, like the wiki guest: layer 2 derives the SSH
-      # target from here (pve_declared_ipv4) and the HTTP probe needs an address
-      # it can name once.
-      # NOT vmbr0: that is the public uplink (54.36.168.83/24 on eno3) and would
-      # expose an unauthenticated web server to the internet. A container NIC is
-      # creation-time, so getting this wrong means recreating the guest.
-      net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.32/24,ip6=auto"
-    # nameserver stays at the default (null = inherit the host's resolv.conf):
-    # that is the path already proven to reach the Debian mirrors from this LAN,
-    # and installing Apache needs exactly that.
+      net0: "name=eth0,bridge=vmbr2,hwaddr=BC:24:11:00:00:51,ip=dhcp"
+    # Sin bloque `config`: layer 2 NO entra en esta workstation. No tiene interfaz
+    # de gestión a propósito — es un PC — así que sólo se llega a ella cruzando el
+    # switch, y eso necesita una ruta en el ENDPOINT que la API de PVE no puede
+    # añadir (está declarada en pve_tunnel.endpoint_routes y la aplica el script
+    # del túnel). Mientras esa ruta no exista, declararla `manage: true` no la
+    # convergería: haría fallar su comprobación de alcanzabilidad y, con `serial`,
+    # abortaría también los invitados que van detrás en la lista.
+    #
+    # Su dirección la reparte el CHR por DHCP con una reserva por MAC. El
+    # `address:` de arriba ES esa reserva: el CHR la deriva de aquí, y la MAC de
+    # su net0 es lo que ata la concesión a esta interfaz. Una sola verdad.
 
-    # ---- layer 2 (configure/). Layer 1 ignores the `config` block. -----------
+  - vmid: 142
+    hostname: ws2
+    cores: 1
+    memory: 512
+    rootfs_size: 6
+    swap: 256
+    status: started
+    tags: [netlab, workstation, lab]
+    description: "Workstation 2: una sola NIC en el cable hacia el CHR. Sin interfaz de gestión, como un PC."
+    address: "10.30.0.12"
+    netif:
+      net0: "name=eth0,bridge=vmbr3,hwaddr=BC:24:11:00:00:52,ip=dhcp"
+
+  # ---------------------------------------------------------------------------
+  # El bootstrap del CHR: el único punto que la API de PVE no puede resolver.
+  #
+  # Un CHR recién importado arranca SIN dirección (sólo un cliente DHCP en
+  # ether1) y, al ser una VM, no puede tomar una concesión del DHCP del host: la
+  # oferta llega con un checksum de UDP que el kernel del invitado descarta (está
+  # medido en este lab). Sin dirección no hay API REST, así que hace falta algo
+  # que le dé la primera.
+  #
+  # Este contenedor es ese algo: vive en la MISMA pata de gestión que el CHR,
+  # corre dnsmasq atado a la MAC de su ether1 y con el offload de TX desactivado
+  # (sin eso su propia oferta tendría el mismo checksum roto), y concede
+  # exactamente una dirección: la de gestión del CHR. A partir de ahí todo lo
+  # demás lo hace la API REST, y este contenedor no vuelve a intervenir.
+  #
+  # Dirección estática a propósito: es infraestructura, no una workstation, y
+  # layer 2 tiene que poder entrar a configurarla antes de que el lab exista.
+  # ---------------------------------------------------------------------------
+  - vmid: 143
+    hostname: lab-bootstrap
+    cores: 1
+    # 1 GiB, not 256 MiB: apt on Debian 13 gets OOM-killed below ~512 MiB, and
+    # this guest exists to install dnsmasq once and then sit still.
+    memory: 1024
+    rootfs_size: 4
+    swap: 256
+    status: started
+    tags: [netlab, bootstrap, lab]
+    description: "Concede al CHR su primera dirección por DHCP (atada a su MAC) para que la API REST exista. No hace nada más."
+    netif:
+      net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.53/24"
     manage: true
     config:
-      apache:
-        # One vhost per declared entry. `port` is explicit because the role
-        # renders /etc/apache2/ports.conf FROM these values: exposure is an
-        # exposure decision that belongs in the manifest.
-        sites:
-          - name: lab-web
-            port: 80
-            root: /srv/www/lab-web
-            index_html: |
-              <!doctype html>
-              <html lang="es">
-                <head><meta charset="utf-8"><title>web-apache</title></head>
-                <body>
-                  <h1>web-apache</h1>
-                  <p>Contenedor LXC 132 del laboratorio Proxmox, servido por Apache.
-                  La forma del invitado la declara la capa 1; Apache y este vhost, la capa 2.</p>
-                </body>
-              </html>
-      # Proof from OUTSIDE the guest, after convergence.
-      http:
-        - address: ":80"
-          expect_status: 200
-          expect_body: "web-apache"
+      bootstrap:
+        interface: eth0
+        # La MAC que pide la dirección y la dirección que se le concede salen de
+        # la identidad del lab (arriba): no se repiten.
+        lease_mac: "{{ lab_router_mac }}"
+        lease_address: "{{ lab_router_mgmt }}"
 
 # ============================================================================
 # QEMU VMs — same declarative rules as the containers, with one important
@@ -259,26 +404,132 @@ pve_vm_defaults:
   # framework keeps addressing where it already lives (the `net` value) to have
   # one home for it.
 
+# ---- CHR (MikroTik RouterOS) defaults ---------------------------------------
+# Shared by every router of the network lab. They sit ON TOP of pve_vm_defaults
+# (which describe the nested PVE guest) and apply only to entries declaring
+# `chr: true`, so the vendor image, the boot order and the console live in one
+# block instead of five copies.
+pve_chr_defaults:
+  cores: 2
+  memory: 512
+  status: started
+  manage: true
+  # The vendor image has no cloud-init, so the drive would be dead weight.
+  cloudinit: false
+  # CHR is an i440fx-era image: it boots on the PC chipset, not on q35.
+  machine: pc
+  # The imported image is the only disk, so it must be the boot device (the
+  # default order expects the cloud-init drive this VM does not have).
+  boot: "order=scsi0"
+  tags: [netlab, routeros, lab]
+  scsi:
+    scsi0: "local-zfs:8"
+  # The vendor image, imported instead of created: proxmox_kvm can only build a
+  # disk from a size, so the raw image is uploaded to a storage that accepts
+  # `import` and attached with the API's creation-time import-from syntax (see
+  # playbooks/tasks/disk_import.yml). `key` is the disk the image fills.
+  disk_import:
+    - key: scsi0
+      source: "local:import/chr-7.25.1.raw"
+  # The console that respects a non-US keyboard: it carries CHARACTERS, not
+  # scancodes. `vga: serial0` is what makes PVE's Console button open it — with
+  # a VGA adapter the button opens noVNC and the port is only reachable from a
+  # node shell. The trade-off, stated plainly: no screen, so the boot phase
+  # shows nothing until RouterOS prints its prompt.
+  serial:
+    serial0: socket
+  vga: serial0
+  # NO `keyboard:` — deliberately. It only sets how the VNC server turns the
+  # browser's keys into scancodes, and the LAST translation is the guest's own
+  # console keymap, which in RouterOS is US with no setting to change it.
+
 # The VMs this repository manages — and nothing else.
 pve_vms:
-  - vmid: 120
-    name: pve-nested
-    cores: 4
-    memory: 4096
-    # Boots the Proxmox VE installer from the ISO already on the node.
-    status: started
-    # Opt-out, and the reason the default had to be overridable: the installer
-    # ISO does not run cloud-init, so a cloud-init drive would be dead weight.
-    cloudinit: false
+  # ---------------------------------------------------------------------------
+  # El switch/router del lab: un MikroTik RouterOS CHR.
+  #
+  # Tres puertos, y cada uno es un cable:
+  #   ether1 -> vmbr1   la pata de GESTIÓN. Todo switch real tiene su dirección
+  #                     de administración; sin ella no habría forma de
+  #                     configurarlo ni de llegar al lab.
+  #   ether2 -> vmbr2   el cable hacia ws1
+  #   ether3 -> vmbr3   el cable hacia ws2
+  # ether2 y ether3 van al MISMO bridge de RouterOS: eso ES el switch. ether1
+  # queda fuera, como el puerto de consola/gestión de un switch.
+  #
+  # Todo lo de dentro (bridge, direcciones, DHCP con reservas) se declara en
+  # `config.routeros` y lo converge configure/roles/routeros hablando con la API
+  # REST del router — nunca por SSH ni por la API binaria.
+  #
+  # Las NICs de una VM son creation-time (proxmox_kvm no las actualiza), así que
+  # las MACs quedan fijadas aquí: la de ether1 es la que el bootstrap usa para
+  # concederle la primera dirección.
+  # ---------------------------------------------------------------------------
+  - vmid: 140
+    name: lab-chr
+    chr: true
     net:
-      # vmbr1 is the internal LAN (10.10.10.0/24) where every other lab guest
-      # lives. vmbr0 is the PUBLIC bridge (54.36.168.83/24 on eno3): do not put
-      # a lab guest there unless you mean to expose it to the internet.
-      net0: "virtio,bridge=vmbr1"
-    scsi:
-      scsi0: "local-zfs:32"
-    ide:
-      ide2: "local:iso/proxmox-ve_9.2-1.iso,media=cdrom"
+      net0: "virtio={{ lab_router_mac }},bridge=vmbr1"
+      net1: "virtio=BC:24:11:00:00:41,bridge=vmbr2"
+      net2: "virtio=BC:24:11:00:00:42,bridge=vmbr3"
+    config:
+      routeros:
+        identity: lab-chr
+        # Direcciones estáticas. La de ether1 es la de gestión — la misma que el
+        # bootstrap le concede por DHCP en el primer arranque, para que la API
+        # REST exista. La del bridge es la puerta de enlace del lab.
+        addresses:
+          - address: "{{ lab_router_mgmt }}/24"
+            interface: ether1
+          - address: "{{ lab_gateway }}/24"
+            interface: "{{ lab_bridge_name }}"
+        # El switch: estos dos puertos van al mismo bridge de RouterOS.
+        bridges:
+          - name: "{{ lab_bridge_name }}"
+            ports: [ether2, ether3]
+        # Un CHR de fábrica trae un cliente DHCP en ether1. Con una dirección
+        # estática declarada, ese cliente es drift y se elimina.
+        dhcp_client: false
+        dhcp_servers:
+          - name: lab
+            interface: "{{ lab_bridge_name }}"
+            address_pool: "10.30.0.10-10.30.0.254"
+            network: "{{ lab_network }}"
+            gateway: "{{ lab_gateway }}"
+            dns_server: "{{ lab_gateway }}"
+            # Una reserva por workstation. La dirección y la MAC salen de la
+            # declaración de la propia workstation (arriba): la MAC de su net0 y
+            # su `address:`. Aquí no se repite ningún valor.
+            leases: >-
+              {%- set out = [] -%}
+              {%- for c in pve_containers
+                     | selectattr('address', 'defined')
+                     | selectattr('netif', 'defined') -%}
+              {%- set _ = out.append({
+                    'address': c.address,
+                    'mac_address': c.netif.net0 | regex_replace('^.*hwaddr=([0-9A-Fa-f:]{17}).*$', '\\1'),
+                    'comment': c.hostname }) -%}
+              {%- endfor -%}
+              {{ out }}
+  # ---- plantilla de VM (sin declarar) --------------------------------------
+  # - vmid: 120
+  #   name: pve-nested
+  #   cores: 4
+  #   memory: 4096
+  #   # Boots the Proxmox VE installer from the ISO already on the node.
+  #   status: started
+  #   # Opt-out, and the reason the default had to be overridable: the installer
+  #   # ISO does not run cloud-init, so a cloud-init drive would be dead weight.
+  #   cloudinit: false
+  #   net:
+  #     # vmbr1 is the internal LAN (10.10.10.0/24) where every other lab guest
+  #     # lives. vmbr0 is the PUBLIC bridge (54.36.168.83/24 on eno3): do not put
+  #     # a lab guest there unless you mean to expose it to the internet.
+  #     net0: "virtio,bridge=vmbr1"
+  #   scsi:
+  #     scsi0: "local-zfs:32"
+  #   ide:
+  #     ide2: "local:iso/proxmox-ve_9.2-1.iso,media=cdrom"
 
 # ============================================================================
 # Layer 2 — configuration targets (guest-side, over SSH).
@@ -299,3 +550,27 @@ pve_config_targets:
     hostname: caddy
     address: 10.10.10.2
     manage: false
+
+# ============================================================================
+# Retención de logs/ — el ÚNICO directorio del repositorio que crece solo.
+#
+# Ansible solo sabe AÑADIR a su `log_path`: nunca lo rota, así que un fichero
+# acumula todas las ejecuciones para siempre. La política tiene dos mitades, y
+# hacen falta las dos: un fichero vivo que pasa de `live_max_mb` se rota a
+# logs/archive/ y se vacía (acota cada fichero), y los archivos con más de
+# `keep_days` o más allá de `keep_count` se borran (acota el directorio).
+#
+# La aplica el propio framework, en cada verbo y antes de tocar nada, así que un
+# lab que solo se maneja con los verbos nunca necesita un operador. Para el caso
+# contrario —nadie ejecuta el framework en días— el mismo script vale suelto:
+#
+#   python3 playbooks/tools/logs_prune.py --dry-run
+#   python3 playbooks/tools/logs_prune.py
+#
+# El archivo más reciente NUNCA se borra, diga lo que diga `keep_count`: es el
+# que alguien iría a mirar. Con los valores de abajo el techo es 10 × 8 MB.
+# ============================================================================
+pve_log_retention:
+  live_max_mb: 8
+  keep_days: 14
+  keep_count: 10

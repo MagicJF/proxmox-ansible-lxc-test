@@ -1,0 +1,76 @@
+---
+# ===========================================================================
+# netlab — the inside of a guest that lives on an isolated segment.
+#
+# The declaration says which networks this guest must reach and through which
+# router, and which peer addresses prove it. The role converges the routes and
+# then proves the connectivity from INSIDE the guest: a task exit status is not
+# proof that a packet can leave the segment.
+# ===========================================================================
+- name: Refuse a malformed route declaration
+  ansible.builtin.assert:
+    that:
+      - item.to is defined and item.via is defined and item.dev is defined
+    fail_msg: >-
+      Every netlab route needs `to`, `via` and `dev` (got {{ item | to_json }}).
+      `to` is the remote network, `via` the router's address on THIS segment and
+      `dev` the local interface that segment is on.
+    success_msg: "Route {{ item.to }} via {{ item.via }} dev {{ item.dev }} is well formed."
+  loop: "{{ netlab_routes }}"
+  loop_control:
+    label: "{{ item.to | default('?') }}"
+  when: netlab_routes | length > 0
+
+- name: Install the unit that applies the declared routes
+  ansible.builtin.template:
+    src: netlab-routes.service.j2
+    dest: "/etc/systemd/system/{{ netlab_unit_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: netlab_unit
+  # A guest that declares only peers (a workstation that gets its default gateway
+  # from DHCP, for instance) has no routes of its own, and a unit with nothing to
+  # run is noise: what it needs is the connectivity proof, not a service.
+  when: netlab_routes | length > 0
+
+- name: Apply the declared routes now and on every boot
+  ansible.builtin.systemd_service:
+    name: "{{ netlab_unit_name }}"
+    enabled: true
+    state: "{{ 'restarted' if netlab_unit.changed else 'started' }}"
+    daemon_reload: true
+  register: netlab_unit_state
+  when: netlab_routes | length > 0
+
+- name: The declared routes must be the routes the kernel actually has
+  ansible.builtin.command:
+    cmd: "ip -4 route show {{ item.to }}"
+  register: netlab_route_live
+  changed_when: false
+  failed_when: false
+  loop: "{{ netlab_routes }}"
+  loop_control:
+    label: "{{ item.to }}"
+
+- name: Assert every declared route is installed with the declared gateway
+  ansible.builtin.assert:
+    that:
+      - item.item.to in item.stdout
+      - ('via ' ~ item.item.via) in item.stdout
+      - ('dev ' ~ item.item.dev) in item.stdout
+    fail_msg: >-
+      The kernel does not have the declared route {{ item.item.to }} via
+      {{ item.item.via }} dev {{ item.item.dev }}: `ip route show` answered
+      "{{ item.stdout | default('') | trim }}". The unit may have failed — check
+      `systemctl status {{ netlab_unit_name }}` inside the guest.
+    success_msg: "Route {{ item.item.to }} via {{ item.item.via }} dev {{ item.item.dev }} is installed."
+  loop: "{{ netlab_route_live.results }}"
+  loop_control:
+    label: "{{ item.item.to }}"
+  when: netlab_routes | length > 0
+
+# The connectivity proof (does a packet actually reach the peer?) is NOT here:
+# it can only pass once EVERY guest on the lab has its route, and this role runs
+# one guest at a time. It lives in the verification play of configure/site.yml,
+# which runs after every guest has been converged.

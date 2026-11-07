@@ -1,0 +1,134 @@
+---
+# ===========================================================================
+# Host-level network segments (pve_bridges) — created through the PVE API.
+#
+# Why this is not a module call: PVE has no Ansible module for node networking,
+# and the operation is a two-step API dance — POST stages the change (it shows
+# up as "pending"), PUT applies it and reloads the network stack. Only creation
+# is automated: a segment that already exists is left exactly as it is, because
+# recreating a bridge under a running lab would cut its guests off the network.
+#
+# Called by apply.yml before the guests are touched, so a guest can attach to a
+# segment that did not exist yet.
+# ===========================================================================
+- name: Read the node's network configuration
+  ansible.builtin.uri:
+    url: "{{ pve_api }}/nodes/{{ pve_node }}/network"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    validate_certs: true
+    ca_path: "{{ pve_api_ca_path }}"
+    status_code: 200
+    return_content: true
+  register: net_before
+  no_log: true
+
+- name: Create the declared segments that do not exist yet
+  ansible.builtin.uri:
+    url: "{{ pve_api }}/nodes/{{ pve_node }}/network"
+    method: POST
+    headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    body_format: form-urlencoded
+    body:
+      iface: "{{ item.iface }}"
+      type: bridge
+      autostart: 1
+      # No ports: that is what makes the segment isolated. A bridge with an
+      # uplink port would let its guests bypass the router.
+      bridge_ports: ""
+      comments: "{{ item.comments | default('managed by proxmox-ansible-lxc-test') }}"
+    validate_certs: true
+    ca_path: "{{ pve_api_ca_path }}"
+    status_code: 200
+  loop: "{{ pve_bridges | default([]) }}"
+  loop_control:
+    label: "{{ item.iface }}"
+  register: net_created
+  # `uri` reports `ok` for a 200, whatever the method did, so without this a POST
+  # that created an interface counts as "no change" — which is exactly how the
+  # apply step below gets skipped and the bridges stay pending.
+  changed_when: true
+  no_log: true
+  # Only the missing ones: POSTing an interface that already exists is an error.
+  when: item.iface not in (net_before.json.data | map(attribute='iface') | list)
+
+# The condition is deliberately NOT "did this run create something": a bridge can
+# be pending from an earlier run (or from a hand-made change), and what needs
+# applying is whatever the NODE has staged, not what this task did.
+- name: Apply the staged network changes (this reloads the node's network)
+  ansible.builtin.uri:
+    url: "{{ pve_api }}/nodes/{{ pve_node }}/network"
+    method: PUT
+    headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    validate_certs: true
+    ca_path: "{{ pve_api_ca_path }}"
+    status_code: 200
+  register: net_applied
+  changed_when: true
+  no_log: true
+  when: pending_segments | length > 0
+  vars:
+    pending_segments: >-
+      {{ pve_bridges | default([]) | map(attribute='iface') | list
+         | reject('in', net_before.json.data | selectattr('active', 'defined')
+                  | selectattr('active', 'equalto', 1) | map(attribute='iface') | list) | list }}
+
+- name: Wait for the network reload to finish
+  ansible.builtin.uri:
+    url: "{{ pve_api }}/nodes/{{ pve_node }}/tasks/{{ net_applied.json.data }}/status"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    validate_certs: true
+    ca_path: "{{ pve_api_ca_path }}"
+    status_code: 200
+  register: net_task
+  until: net_task.json.data.status == 'stopped'
+  retries: 30
+  delay: 2
+  no_log: true
+  when: net_applied.changed | default(false)
+
+- name: Re-read the node's network configuration
+  ansible.builtin.uri:
+    url: "{{ pve_api }}/nodes/{{ pve_node }}/network"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    validate_certs: true
+    ca_path: "{{ pve_api_ca_path }}"
+    status_code: 200
+    return_content: true
+  register: net_after
+  no_log: true
+
+# A bridge is only useful to the lab if it exists, is up, and carries no ports.
+# The comment is cosmetic and is not asserted.
+- name: Verify every declared segment exists, is active and carries no ports
+  ansible.builtin.assert:
+    that:
+      - missing | length == 0
+      - not_active | length == 0
+      - with_ports | length == 0
+    fail_msg: >-
+      {%- set parts = [] -%}
+      {%- if missing | length > 0 -%}{%- set _ = parts.append('missing: ' ~ (missing | join(', '))) -%}{%- endif -%}
+      {%- if not_active | length > 0 -%}{%- set _ = parts.append('not active: ' ~ (not_active | join(', '))) -%}{%- endif -%}
+      {%- if with_ports | length > 0 -%}{%- set _ = parts.append('carries ports (a segment must be isolated): ' ~ (with_ports | join(', '))) -%}{%- endif -%}
+      Declared segments did not converge: {{ parts | join('; ') }}.
+    success_msg: >-
+      Every declared segment exists, is active and carries no ports
+      ({{ pve_bridges | default([]) | map(attribute='iface') | join(', ') }}).
+  vars:
+    live: "{{ net_after.json.data }}"
+    declared: "{{ pve_bridges | default([]) | map(attribute='iface') | list }}"
+    missing: "{{ declared | reject('in', live | map(attribute='iface') | list) | list }}"
+    not_active: >-
+      {{ declared | reject('in', live | selectattr('active', 'defined')
+         | selectattr('active', 'equalto', 1) | map(attribute='iface') | list) | list }}
+    with_ports: >-
+      {{ live | selectattr('iface', 'in', declared) | selectattr('bridge_ports', 'defined')
+         | rejectattr('bridge_ports', 'equalto', '') | map(attribute='iface') | list }}

@@ -1,0 +1,233 @@
+---
+# ---------------------------------------------------------------------------
+# configure/tasks/tunnel.yml — the control node's PATH into the guest LAN.
+#
+# Layer 2 is SSH. The PVE API answers on the public address from anywhere, but
+# the guests live on an internal bridge the control node is not attached to, so
+# without a path every guest is "unreachable" for a reason that has nothing to
+# do with its key. That path is infrastructure: it is DECLARED (pve_tunnel in
+# inventory/group_vars/all.yml) and converged here, exactly like the SSH key is
+# declared and injected by layer 1.
+#
+# Two entry points, one implementation:
+#   playbooks/connect.yml   the explicit verb
+#   configure/site.yml      automatically, when its probe says no guest answers
+#
+# Keys follow the same rule as the automation key: the private half is a file
+# OUTSIDE the repository, is never printed, and is generated here when absent —
+# so a clone of this repository needs no manual step to get its own identity.
+# Only the public half travels (to the endpoint).
+#
+# Idempotent: the interface is only created when it is missing, and a changed
+# declaration is applied with `wg syncconf` instead of bouncing a live tunnel.
+#
+# Needs root on this node (interface + /etc/wireguard): callers pass become.
+# ---------------------------------------------------------------------------
+
+- name: Every field the tunnel needs must be declared
+  # No defaults for these: guessing an endpoint or a subnet would build a
+  # tunnel to nowhere and then report a mystery. The framework refuses instead.
+  ansible.builtin.assert:
+    that:
+      - pve_tunnel.name | default('') | length > 0
+      - pve_tunnel.endpoint | default('') | length > 0
+      - pve_tunnel.endpoint_public_key | default('') | length > 0
+      - pve_tunnel.address | default('') | length > 0
+      - pve_tunnel.guest_network | default('') | length > 0
+      - pve_tunnel.private_key_path | default('') | length > 0
+    fail_msg: >-
+      pve_tunnel in inventory/group_vars/all.yml is incomplete ({{ pve_tunnel | default({}) | to_json }}).
+      Layer 2 reaches the guests through this tunnel; the framework will not invent an endpoint,
+      a subnet or a key path. Nothing was changed.
+    success_msg: >-
+      Tunnel {{ pve_tunnel.name }}: {{ pve_tunnel.address }} -> {{ pve_tunnel.endpoint }},
+      routing {{ pve_tunnel.guest_network | join(', ') }}.
+
+- name: Look for this node's tunnel private key
+  ansible.builtin.stat:
+    path: "{{ pve_tunnel.private_key_path }}"
+  register: tunnel_key_file
+
+- name: Generate the tunnel key pair when it does not exist yet
+  # Same convention as the SSH automation key, one step further: the framework
+  # creates it, keeps the private half in a 0600 file outside the repository,
+  # and exposes only the public half. A clone therefore has its own identity
+  # without asking the operator for anything.
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      umask 077
+      wg genkey > {{ pve_tunnel.private_key_path | quote }}
+      wg pubkey < {{ pve_tunnel.private_key_path | quote }} > {{ (pve_tunnel.private_key_path ~ '.pub') | quote }}
+    creates: "{{ pve_tunnel.private_key_path }}"
+
+- name: Read the tunnel private key
+  # no_log: this is the one secret in this file. It is never printed and never
+  # leaves the 0600 rendering below.
+  ansible.builtin.slurp:
+    src: "{{ pve_tunnel.private_key_path }}"
+  register: tunnel_private
+  no_log: true
+
+- name: Read this node's tunnel public key
+  # Public keys are not secrets: this line is what the endpoint must allow, and
+  # the failure message below prints it so the operator never has to hunt for it.
+  ansible.builtin.command: "cat {{ (pve_tunnel.private_key_path ~ '.pub') | quote }}"
+  register: tunnel_public
+  changed_when: false
+
+- name: Declare the tunnel interface from the declared state
+  ansible.builtin.copy:
+    dest: "/etc/wireguard/{{ pve_tunnel.name }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      # Managed by layer 2 — configure/tasks/tunnel.yml, rendered from pve_tunnel
+      # in inventory/group_vars/all.yml. Editing this file on the control node is
+      # drift and is reverted on the next run.
+      [Interface]
+      Address = {{ pve_tunnel.address }}
+      PrivateKey = {{ tunnel_private.content | b64decode | trim }}
+      Table = auto
+
+      [Peer]
+      PublicKey = {{ pve_tunnel.endpoint_public_key }}
+      Endpoint = {{ pve_tunnel.endpoint }}
+      AllowedIPs = {{ pve_tunnel.guest_network | join(', ') }}
+      PersistentKeepalive = {{ pve_tunnel.keepalive | default(25) }}
+  register: tunnel_conf
+  no_log: true
+
+- name: Read whether the tunnel interface already exists
+  ansible.builtin.command: "ip link show {{ pve_tunnel.name }}"
+  register: tunnel_link
+  changed_when: false
+  failed_when: false
+
+- name: Bring the declared tunnel up
+  ansible.builtin.command: "wg-quick up {{ pve_tunnel.name }}"
+  when: tunnel_link.rc != 0
+  changed_when: true
+
+- name: Re-sync the running interface when the declared configuration changed
+  # wg-quick has no `apply`. Dumping the stripped config and syncing it updates
+  # the peer set in place, so a declaration change does not drop a live tunnel.
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      tmp=$(mktemp)
+      wg-quick strip {{ pve_tunnel.name }} > "$tmp"
+      wg syncconf {{ pve_tunnel.name }} "$tmp"
+      rm -f "$tmp"
+    executable: /bin/sh
+  when:
+    - tunnel_link.rc == 0
+    - tunnel_conf.changed
+  # It only runs when the declared configuration differs from the running one,
+  # so a run of it is a change by definition. Saying so keeps the module's
+  # unconditional `changed` from being the thing that decides.
+  changed_when: true
+
+- name: Route every declared network through the tunnel
+  # `wg-quick up` installs the routes derived from AllowedIPs, but `wg syncconf`
+  # above only rewrites the peer list: it never touches the kernel's routing
+  # table. When the declaration GROWS, the interface ends up allowing the new
+  # prefixes while the kernel still sends them out the default route — the
+  # tunnel reports itself healthy, `wg show` lists every network, and every added
+  # one answers `Timeout` because its packets never entered the tunnel. Reconcile
+  # the routes explicitly, which is exactly what wg-quick's `Table = auto` would
+  # have done at `up`, and report `changed` from the difference in the table so a
+  # run that adds nothing stays quiet.
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      before=$(ip -o route show dev {{ pve_tunnel.name | quote }} | awk '{print $1}' | sort)
+      for prefix in {{ pve_tunnel.guest_network | join(' ') }}; do
+        ip route replace "$prefix" dev {{ pve_tunnel.name | quote }}
+      done
+      after=$(ip -o route show dev {{ pve_tunnel.name | quote }} | awk '{print $1}' | sort)
+      [ "$before" = "$after" ] || echo changed
+    executable: /bin/sh
+  register: tunnel_routes
+  changed_when: "'changed' in tunnel_routes.stdout"
+
+- name: Keep the tunnel up across reboots
+  ansible.builtin.systemd_service:
+    name: "wg-quick@{{ pve_tunnel.name }}"
+    enabled: true
+
+- name: Wait for the endpoint to complete a handshake
+  ansible.builtin.shell:
+    cmd: "wg show {{ pve_tunnel.name }} latest-handshakes | awk '$2 > 0' | wc -l"
+    executable: /bin/sh
+  register: tunnel_hs
+  changed_when: false
+  retries: 8
+  delay: 3
+  until: tunnel_hs.stdout | trim | int > 0
+  failed_when: false
+
+- name: The endpoint must accept this node, or layer 2 has no path
+  ansible.builtin.fail:
+    msg: |
+      The tunnel {{ pve_tunnel.name }} is up HERE but {{ pve_tunnel.endpoint }} never completed a
+      handshake: the endpoint is missing, holds a different public key, or the UDP port is
+      firewalled. Nothing else was changed.
+
+      The PVE API cannot run commands on the Proxmox host (exec answers 501 and the framework
+      never uses SSH or pct to configure the host), so this half is the one step it cannot do.
+      On the lab host, as root, run — the argument is this node's PUBLIC key, printed here for
+      that purpose:
+
+          sh playbooks/tools/wg_endpoint_setup.sh {{ tunnel_public.stdout | trim }}
+
+      It generates the endpoint's own private key there (it never leaves that host), allows this
+      node on {{ pve_tunnel.address }}, NATs the tunnel subnet onto the guest bridge and prints
+      the endpoint's public key, which goes into pve_tunnel.endpoint_public_key.
+  when: tunnel_hs.stdout | trim | int == 0
+
+- name: Derive the layer-2 guest addresses from the declaration
+  # One expression, so the value stays a list instead of rendered text.
+  ansible.builtin.set_fact:
+    tunnel_guest_addresses: >-
+      {{ pve_containers | selectattr('config', 'defined')
+         | map(attribute='netif', default={}) | map('pve_declared_ipv4')
+         | reject('none') | list }}
+
+- name: Probe every layer-2 guest over the tunnel
+  # ignore_errors, not failed_when false: a guest that is legitimately stopped
+  # must not turn a healthy path into a failure, but the per-item `failed` flag
+  # has to survive so the assertion below can tell "answered" from "expired"
+  # (wait_for reports `elapsed` in both cases).
+  ansible.builtin.wait_for:
+    host: "{{ item }}"
+    port: 22
+    timeout: 4
+  loop: "{{ tunnel_guest_addresses }}"
+  register: tunnel_probe
+  ignore_errors: true
+
+- name: The path must reach at least one guest
+  ansible.builtin.assert:
+    that:
+      - answered | length > 0
+    fail_msg: >-
+      The handshake succeeded but no layer-2 guest answered on :22 ({{ tunnel_guest_addresses | join(', ') }}).
+      The endpoint is probably missing the NAT rule
+      (iptables -t nat -A POSTROUTING -s <tunnel subnet> -o the-guest-bridge -j MASQUERADE)
+      or net.ipv4.ip_forward is off on it. Nothing on the guests was changed.
+    success_msg: >-
+      {{ answered | length }}/{{ tunnel_guest_addresses | length }} layer-2 guest(s) answer over
+      the tunnel: {{ answered | join(', ') }}.
+  vars:
+    answered: >-
+      {{ tunnel_probe.results | rejectattr('failed') | map(attribute='item') | list }}
+
+- name: Report the converged path
+  ansible.builtin.debug:
+    msg: >-
+      Tunnel {{ pve_tunnel.name }} {{ 'up' if tunnel_link.rc != 0 else 'converged' }}:
+      {{ pve_tunnel.address }} -> {{ pve_tunnel.endpoint }}, handshake OK,
+      routing {{ pve_tunnel.guest_network | join(', ') }}.
+      This node's public key (declare it on the endpoint): {{ tunnel_public.stdout | trim }}

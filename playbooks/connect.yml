@@ -1,0 +1,39 @@
+---
+# ===========================================================================
+# connect.yml — the third verb: converge the control node's PATH into the guest
+# LAN. It touches no guest.
+#
+# Why it exists: layer 2 is SSH, and the PVE API can be reached from anywhere
+# while the guests sit on an internal bridge. The path is infrastructure, so it
+# is declared (pve_tunnel in inventory/group_vars/all.yml) and converged here —
+# and configure/site.yml includes the SAME task file automatically when its
+# probe finds no guest answering, so a normal run never needs this verb.
+#
+# Run it to fix the path on its own, or to print this node's public key when an
+# endpoint has to allow it:
+#     ansible-playbook playbooks/connect.yml
+# ===========================================================================
+- name: Converge the control node's path into the guest LAN
+  hosts: localhost
+  gather_facts: false
+  # The tunnel is an interface on this node plus a file under /etc/wireguard:
+  # this play needs root here, and only here.
+  become: true
+  tasks:
+    - name: Keep logs/ bounded (the policy in the declared state)
+      ansible.builtin.include_tasks: tasks/prune_logs.yml
+
+    - name: A tunnel that is not declared is not converged
+      ansible.builtin.assert:
+        that:
+          - pve_tunnel.manage | default(false) | bool
+        fail_msg: >-
+          pve_tunnel is undeclared or has manage false in inventory/group_vars/all.yml,
+          so there is nothing to converge. Layer 2 then relies on this node already
+          routing to the guest LAN. Nothing was changed.
+        success_msg: "Tunnel declared and enabled: {{ pve_tunnel.name }}."
+
+    - name: Converge the declared tunnel
+      # Same task file configure/site.yml uses when it finds no guest answering:
+      # one implementation, two entry points.
+      ansible.builtin.include_tasks: ../configure/tasks/tunnel.yml

@@ -1,0 +1,27 @@
+---
+# One GET per table, in one pass. Each answer is kept whole: the run has to be
+# able to say what the router HAD, not only what it did.
+- name: Read every table the declaration can touch
+  ansible.builtin.uri:
+    url: "{{ routeros_base }}/{{ item.path }}"
+    method: GET
+    url_username: "{{ routeros_user }}"
+    url_password: "{{ routeros_login_password }}"
+    force_basic_auth: true
+    status_code: 200
+    return_content: true
+    timeout: "{{ routeros_timeout }}"
+  loop: "{{ routeros_tables }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: routeros_read
+  changed_when: false
+
+# RouterOS answers a menu with one record either as an object or as a
+# single-element list depending on the endpoint, so `identity` is normalised
+# here: everything downstream can then assume a list.
+- name: Index what the router answered, by table
+  ansible.builtin.set_fact:
+    routeros_read_index: >-
+      {{ dict(routeros_read.results | map(attribute='item.key') | list
+              | zip(routeros_read.results | map(attribute='json') | list)) }}

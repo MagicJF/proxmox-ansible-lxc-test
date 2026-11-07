@@ -1,0 +1,16 @@
+[Unit]
+Description=Disable TX checksum offload on {{ bootstrap_interface }} (a DHCP offer from a veth must carry a valid UDP checksum)
+# The offer has to leave this container with the checksum already computed: the
+# veth marks it CHECKSUM_PARTIAL, the bridge does not resolve it, and the
+# router's kernel validates and drops the frame. Measured, not assumed.
+After=network-online.target
+Before=dnsmasq.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ethtool -K {{ bootstrap_interface }} tx off gso off tso off'
+
+[Install]
+WantedBy=multi-user.target

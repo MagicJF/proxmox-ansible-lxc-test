@@ -49,6 +49,9 @@
       when: pve_secrets_file.stat.exists
 
   tasks:
+    - name: Keep logs/ bounded (the policy in the declared state)
+      ansible.builtin.include_tasks: tasks/prune_logs.yml
+
     - name: Read every declared guest and the platform facts (one process, one task)
       ansible.builtin.command:
         cmd: >-
@@ -66,8 +69,14 @@
         pve_cts: >-
           {% set out = [] %}{% for i in pve_containers %}{% set _ = out.append(pve_defaults | combine(i)) %}{% endfor %}{{ out }}
         pve_vm_specs: >-
-          {% set out = [] %}{% for i in pve_vms %}{% set _ = out.append(pve_vm_defaults | combine(i)) %}{% endfor %}{{ out }}
+          {% set out = [] %}{% for i in pve_vms %}{% set _ = out.append(pve_vm_defaults | combine(pve_chr_defaults if (i.chr | default(false)) else {}) | combine(i)) %}{% endfor %}{{ out }}
         pve_read_meta: "{{ pve_read.stdout | from_json }}"
+
+    # Same check as apply.yml, and for the same reason: preflight is the verb you
+    # run when you suspect something, so it must refuse a declared state that
+    # points at something that does not exist rather than report on it.
+    - name: Refuse a declared state that points at something that does not exist
+      ansible.builtin.include_tasks: tasks/validate_state.yml
 
     - name: Analyse every declared guest in one templating pass
       ansible.builtin.set_fact:
@@ -161,3 +170,41 @@
           {{ pve_journal }} did not grow during this read, so the PVE API traffic was NOT traced.
           Check playbooks/tracing/sitecustomize.py and the play-level PYTHONPATH.
         success_msg: "API trace OK: the journal grew during this read."
+
+    # ---- the layer 2 PATH, reported here and never changed here ----------
+    # Layer 1 can be perfectly in sync while layer 2 has no route to a single
+    # guest; that is worth knowing BEFORE running the configure verb, and this
+    # verb stays read-only.
+    - name: Read whether the declared tunnel interface exists
+      ansible.builtin.command: "ip link show {{ pve_tunnel.name | default('wg-lab') }}"
+      register: pf_tunnel_link
+      changed_when: false
+      failed_when: false
+      when: pve_tunnel is defined
+
+    - name: Probe every layer-2 guest on :22
+      ansible.builtin.wait_for:
+        host: "{{ item }}"
+        port: 22
+        timeout: 3
+      loop: >-
+        {{ pve_containers | selectattr('config', 'defined')
+           | map(attribute='netif', default={}) | map('pve_declared_ipv4')
+           | reject('none') | list }}
+      register: pf_path
+      # ignore_errors so the per-item `failed` survives: wait_for reports
+      # `elapsed` on timeout as well, so it cannot be used as the success key.
+      ignore_errors: true
+
+    - name: Report the layer 2 path
+      ansible.builtin.debug:
+        msg: >-
+          Layer 2 path: tunnel {{ pve_tunnel.name | default('(none declared)') }}
+          {{ 'up' if (pf_tunnel_link.rc | default(1)) == 0 else 'DOWN' }}
+          | {{ pf_answered | length }}/{{ pf_path.results | length }} guest(s) answer on :22
+          {{ '-> configure/site.yml will converge the declared tunnel before it needs it'
+             if (pf_answered | length == 0 and (pve_tunnel.manage | default(false) | bool))
+             else '' }}
+      vars:
+        pf_answered: >-
+          {{ pf_path.results | rejectattr('failed') | map(attribute='item') | list }}

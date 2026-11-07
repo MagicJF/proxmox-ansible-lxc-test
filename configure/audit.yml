@@ -17,6 +17,9 @@
     pve_ssh_user: root
     pve_ssh_key_path: "/home/hermes/.hermes/profiles/hermione/secrets/pve-automation_ed25519"
   tasks:
+    - name: Keep logs/ bounded (the policy in the declared state)
+      ansible.builtin.include_tasks: ../playbooks/tasks/prune_logs.yml
+
     - name: Build the configuration targets
       ansible.builtin.include_tasks: tasks/build_targets.yml
 
