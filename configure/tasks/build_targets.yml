@@ -41,9 +41,16 @@
     l2_targets: "{{ (l2_targets | default([])) + [entry] }}"
   vars:
     src: "{{ item }}"
-    # The SSH address is derived from the interface declaration (pve_declared_ipv4)
-    # so there is no second copy of it to drift.
-    derived: "{{ (src.netif | default({}, true)) | pve_declared_ipv4 }}"
+    # A container's address is derived from its interface declaration; a router
+    # has no `netif` (its address lives inside RouterOS), so it is read from the
+    # address it declares on ether1, its management port. One source of truth
+    # either way, and never a second copy to drift.
+    derived: >-
+      {{ (src.netif | default({}, true)) | pve_declared_ipv4
+         if (src.netif | default({}, true))
+         else ((src.config.routeros.addresses | default([])
+                | selectattr('interface', 'equalto', 'ether1')
+                | map(attribute='address') | first | default('')) | split('/') | first) }}
     entry:
       vmid: "{{ src.vmid }}"
       hostname: "{{ src.hostname | default(src.name) }}"

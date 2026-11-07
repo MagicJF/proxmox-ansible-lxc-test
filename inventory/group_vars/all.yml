@@ -67,9 +67,17 @@ pve_tunnel:
   endpoint_public_key: "3+bBS+GqR4EtWUFst+2s49rneVguWquuRBGINt/tZXQ="
   # This node's address inside the tunnel (own /24, never the guest LAN).
   address: "10.99.99.2/24"
-  # Only the guest LAN is routed through the tunnel; everything else (the API on
-  # its public address) keeps using the normal path.
-  guest_network: "10.10.10.0/24"
+  # Only the lab's networks are routed through the tunnel; everything else (the
+  # API on its public address) keeps using the normal path. It is a LIST because
+  # the lab's guests no longer share one subnet: the workstations live in their
+  # sites' networks and are reachable only THROUGH the MikroTik topology, so the
+  # control node needs a route into each of them.
+  guest_network:
+    - "10.10.10.0/24"   # la LAN de gestión (los CHR y el host)
+    - "10.21.0.0/24"    # sede 1
+    - "10.22.0.0/24"    # sede 2
+    - "10.23.0.0/24"    # sede 3
+    - "10.99.0.0/24"    # la WAN del lab
   # No extension, like an SSH key: the public half is this path plus `.pub`.
   private_key_path: "/home/hermes/.hermes/profiles/hermione/secrets/wg-lab-client"
   keepalive: 25
@@ -77,21 +85,42 @@ pve_tunnel:
 # ============================================================================
 # Host-level network segments, created through the PVE API.
 #
-# A lab whose two containers must reach each other THROUGH a router needs each
-# of them on its own segment: a bridge with no ports, where the only other
-# device is the router VM. `bridge_ports` empty is what makes it isolated — a
-# bridge with an uplink port would let the guests bypass the router, which is
-# exactly what this lab is meant to demonstrate.
+# These are LINKS, not a switching fabric: each one is a bridge with no ports
+# that carries exactly one point-to-point cable between two guests, and nothing
+# else. All the switching and routing happens inside the MikroTik CHRs, exactly
+# as it would on real hardware — if two guests shared a bridge, Proxmox would be
+# doing the switching and the routers would be decoration.
 #
-# Only creation is automated. A segment that already exists with different
-# attributes is reported as drift and left alone: recreating a bridge under a
-# running lab would cut its guests off the network.
+# `bridge_ports` empty is what makes a link isolated. Only creation is
+# automated: a segment that already exists is left alone, because recreating a
+# bridge under a running lab would cut its guests off.
 # ============================================================================
 pve_bridges:
-  - iface: vmbr2
-    comments: "netlab segment A (isolated, no ports)"
-  - iface: vmbr3
-    comments: "netlab segment B (isolated, no ports)"
+  # ---- sede 1: cuatro workstations tras dos switches, y el núcleo ----------
+  - iface: vmbr4
+    comments: "sede1: chr-a1 <-> ws1"
+  - iface: vmbr5
+    comments: "sede1: chr-a1 <-> ws2"
+  - iface: vmbr6
+    comments: "sede1: chr-a2 <-> ws3"
+  - iface: vmbr7
+    comments: "sede1: chr-a2 <-> ws4"
+  - iface: vmbr8
+    comments: "sede1: chr-a1 <-> chr-a3 (uplink, L2)"
+  - iface: vmbr9
+    comments: "sede1: chr-a2 <-> chr-a3 (uplink, L2)"
+  # ---- sede 2 y sede 3: dos workstations tras un switch cada una ----------
+  - iface: vmbr10
+    comments: "sede2: chr-b <-> ws5"
+  - iface: vmbr11
+    comments: "sede2: chr-b <-> ws6"
+  - iface: vmbr12
+    comments: "sede3: chr-c <-> ws7"
+  - iface: vmbr13
+    comments: "sede3: chr-c <-> ws8"
+  # ---- la WAN: los tres routers de sede, y nadie más ----------------------
+  - iface: vmbr14
+    comments: "WAN: chr-a3, chr-b, chr-c"
 
 pve_defaults:
   # ---- creation-time: PVE cannot change these on an existing container ------
@@ -215,55 +244,118 @@ pve_containers:
           expect_status: 200
           expect_body: "TiddlyWiki"
 
-  # ---- the network lab: two containers that reach each other ONLY through the
-  # RouterOS VM (VMID 140). Each one sits on its own isolated segment (vmbr2 /
-  # vmbr3) and finds the other's network through the router — not through a
-  # Proxmox bridge, which is the point of the exercise.
-  - vmid: 141
-    hostname: netlab-a
+  # ---- la red del lab: ocho workstations -----------------------------------
+  # Cada una tiene UNA sola interfaz, y es la del lab: no hay pata de gestión en
+  # un bridge de Proxmox. El framework las alcanza ATRAVESANDO la topología
+  # MikroTik (túnel -> chr del sitio -> switch -> workstation), que es también
+  # por lo que su dirección SSH es su dirección de lab.
+  #
+  # No llevan `config` de aplicación: su gateway lo pone PVE desde el propio
+  # `netif` (`gw=`), así que no necesitan rol de capa 2. El `config: {}` vacío
+  # es lo que las declara como objetivos gestionados.
+  - vmid: 150
+    hostname: ws1
     cores: 1
-    memory: 512
-    rootfs_size: 4
+    memory: 256
+    rootfs_size: 3
     status: started
     tags: [netlab, lab]
-    description: "Segmento A del lab de red: su ruta al segmento B pasa por el CHR."
+    description: "Sede 1, workstation 1: una NIC, al switch chr-a1."
     netif:
-      # Management leg: how the framework reaches the guest (SSH arrives over
-      # the tunnel, which routes 10.10.10.0/24).
-      net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.51/24,ip6=auto"
-      # Data leg: the isolated segment. No gateway on purpose — the way out of
-      # this segment is the route declared in layer 2, through the router.
-      net1: "name=eth1,bridge=vmbr2,ip=10.20.1.10/24"
-
-    # ---- layer 2 (configure/). Layer 1 ignores the `config` block. -----------
+      net0: "name=eth0,bridge=vmbr4,gw=10.21.0.1,ip=10.21.0.11/24"
     manage: true
-    config:
-      netlab:
-        # The route that makes the two containers reach each other: without it
-        # a packet for the other segment has nowhere to go.
-        routes:
-          - {to: "10.20.2.0/24", via: "10.20.1.1", dev: eth1}
-        # Proof from INSIDE the guest, asserted after convergence: the peer's
-        # data address must answer. This is what the lab is for.
-        peers: ["10.20.2.10"]
+    config: {}
 
-  - vmid: 142
-    hostname: netlab-b
+  - vmid: 151
+    hostname: ws2
     cores: 1
-    memory: 512
-    rootfs_size: 4
+    memory: 256
+    rootfs_size: 3
     status: started
     tags: [netlab, lab]
-    description: "Segmento B del lab de red: su ruta al segmento A pasa por el CHR."
+    description: "Sede 1, workstation 2: una NIC, al switch chr-a1."
     netif:
-      net0: "name=eth0,bridge=vmbr1,gw=10.10.10.1,ip=10.10.10.52/24,ip6=auto"
-      net1: "name=eth1,bridge=vmbr3,ip=10.20.2.10/24"
+      net0: "name=eth0,bridge=vmbr5,gw=10.21.0.1,ip=10.21.0.12/24"
     manage: true
-    config:
-      netlab:
-        routes:
-          - {to: "10.20.1.0/24", via: "10.20.2.1", dev: eth1}
-        peers: ["10.20.1.10"]
+    config: {}
+
+  - vmid: 152
+    hostname: ws3
+    cores: 1
+    memory: 256
+    rootfs_size: 3
+    status: started
+    tags: [netlab, lab]
+    description: "Sede 1, workstation 3: una NIC, al switch chr-a2."
+    netif:
+      net0: "name=eth0,bridge=vmbr6,gw=10.21.0.1,ip=10.21.0.13/24"
+    manage: true
+    config: {}
+
+  - vmid: 153
+    hostname: ws4
+    cores: 1
+    memory: 256
+    rootfs_size: 3
+    status: started
+    tags: [netlab, lab]
+    description: "Sede 1, workstation 4: una NIC, al switch chr-a2."
+    netif:
+      net0: "name=eth0,bridge=vmbr7,gw=10.21.0.1,ip=10.21.0.14/24"
+    manage: true
+    config: {}
+
+  - vmid: 154
+    hostname: ws5
+    cores: 1
+    memory: 256
+    rootfs_size: 3
+    status: started
+    tags: [netlab, lab]
+    description: "Sede 2, workstation 1: una NIC, al switch chr-b."
+    netif:
+      net0: "name=eth0,bridge=vmbr10,gw=10.22.0.1,ip=10.22.0.11/24"
+    manage: true
+    config: {}
+
+  - vmid: 155
+    hostname: ws6
+    cores: 1
+    memory: 256
+    rootfs_size: 3
+    status: started
+    tags: [netlab, lab]
+    description: "Sede 2, workstation 2: una NIC, al switch chr-b."
+    netif:
+      net0: "name=eth0,bridge=vmbr11,gw=10.22.0.1,ip=10.22.0.12/24"
+    manage: true
+    config: {}
+
+  - vmid: 156
+    hostname: ws7
+    cores: 1
+    memory: 256
+    rootfs_size: 3
+    status: started
+    tags: [netlab, lab]
+    description: "Sede 3, workstation 1: una NIC, al switch chr-c."
+    netif:
+      net0: "name=eth0,bridge=vmbr12,gw=10.23.0.1,ip=10.23.0.11/24"
+    manage: true
+    config: {}
+
+  - vmid: 157
+    hostname: ws8
+    cores: 1
+    memory: 256
+    rootfs_size: 3
+    status: started
+    tags: [netlab, lab]
+    description: "Sede 3, workstation 2: una NIC, al switch chr-c."
+    netif:
+      net0: "name=eth0,bridge=vmbr13,gw=10.23.0.1,ip=10.23.0.12/24"
+    manage: true
+    config: {}
 
 # ============================================================================
 # QEMU VMs — same declarative rules as the containers, with one important
@@ -317,6 +409,45 @@ pve_vm_defaults:
   # framework keeps addressing where it already lives (the `net` value) to have
   # one home for it.
 
+# ---- CHR (MikroTik RouterOS) defaults ---------------------------------------
+# Shared by every router of the network lab. They sit ON TOP of pve_vm_defaults
+# (which describe the nested PVE guest) and apply only to entries declaring
+# `chr: true`, so the vendor image, the boot order and the console live in one
+# block instead of five copies.
+pve_chr_defaults:
+  cores: 2
+  memory: 512
+  status: started
+  manage: true
+  # The vendor image has no cloud-init, so the drive would be dead weight.
+  cloudinit: false
+  # CHR is an i440fx-era image: it boots on the PC chipset, not on q35.
+  machine: pc
+  # The imported image is the only disk, so it must be the boot device (the
+  # default order expects the cloud-init drive this VM does not have).
+  boot: "order=scsi0"
+  tags: [netlab, routeros, lab]
+  scsi:
+    scsi0: "local-zfs:8"
+  # The vendor image, imported instead of created: proxmox_kvm can only build a
+  # disk from a size, so the raw image is uploaded to a storage that accepts
+  # `import` and attached with the API's creation-time import-from syntax (see
+  # playbooks/tasks/disk_import.yml). `key` is the disk the image fills.
+  disk_import:
+    - key: scsi0
+      source: "local:import/chr-7.25.1.raw"
+  # The console that respects a non-US keyboard: it carries CHARACTERS, not
+  # scancodes. `vga: serial0` is what makes PVE's Console button open it — with
+  # a VGA adapter the button opens noVNC and the port is only reachable from a
+  # node shell. The trade-off, stated plainly: no screen, so the boot phase
+  # shows nothing until RouterOS prints its prompt.
+  serial:
+    serial0: socket
+  vga: serial0
+  # NO `keyboard:` — deliberately. It only sets how the VNC server turns the
+  # browser's keys into scancodes, and the LAST translation is the guest's own
+  # console keymap, which in RouterOS is US with no setting to change it.
+
 # The VMs this repository manages — and nothing else.
 pve_vms:
   # - vmid: 120
@@ -338,89 +469,127 @@ pve_vms:
   #   ide:
   #     ide2: "local:iso/proxmox-ve_9.2-1.iso,media=cdrom"
 
-  # The router of the network lab: MikroTik's CHR (RouterOS in a QEMU VM),
-  # deployed from the vendor image instead of from an ISO. It is the only
-  # device on both segments, so it is what makes the two containers reach each
-  # other — a Proxmox bridge does not route between vmbr2 and vmbr3.
-  - vmid: 140
-    name: routeros-chr
-    cores: 2
-    memory: 512
-    status: started
-    # The vendor image has no cloud-init, so the drive would be dead weight.
-    cloudinit: false
-    # CHR is an i440fx-era image: it boots on the PC chipset, not on q35.
-    machine: pc
-    # NO `keyboard:` here, deliberately — it cannot do what it looks like it
-    # does. That option only tells the VNC server how to turn the browser's keys
-    # into SCANCODES; the last translation is the guest's own console keymap,
-    # and RouterOS's console is US with no setting to change it. So every value
-    # of `keyboard` renders the US character for that key position: a Spanish
-    # `/` (Shift+7) comes out as `&` whichever way it is set, and setting it to
-    # `es` merely breaks the one workaround that does work (typing the US key
-    # for the character you want).
-    #
-    # The console you actually want is the serial one: it carries CHARACTERS,
-    # not scancodes, so the browser's layout survives all the way to the guest.
-    # Declaring the port is not enough to USE it — PVE's web console only offers
-    # the serial terminal when the VM's display IS that port, which is what
-    # `vga: serial0` does (it turns the VGA adapter off and redirects the
-    # Console button to the serial one). RouterOS detects the port on boot and
-    # creates its own console on it (`/port`: used-by "Serial Console(#0)";
-    # `/system/console`: port=serial0, term=vt102).
-    #
-    # The trade-off, stated plainly: with no VGA there is no screen, so the boot
-    # phase shows nothing until RouterOS prints its prompt. Reverting is one
-    # line — put `vga: std` back here and run apply.
-    serial:
-      serial0: socket
-    vga: serial0
-    # The imported image is the only disk, so it must be the boot device (the
-    # default order expects the cloud-init drive this VM does not have).
-    boot: "order=scsi0"
-    description: "MikroTik CHR (RouterOS) del lab de red: segmento A (vmbr2) y B (vmbr3)."
-    tags: [netlab, routeros, lab]
+  # ---- la red del lab: cinco CHR (RouterOS) --------------------------------
+  # Un CHR por FUNCIÓN, no uno por enlace: A1 y A2 conmutan (L2) las
+  # workstations de la sede 1, A3 es el núcleo de esa sede y a la vez el borde
+  # hacia la WAN, y B y C son switch+núcleo de las sedes 2 y 3.
+  #
+  # Todos nacen de la misma imagen importada y del mismo bloque de defaults
+  # (`pve_chr_defaults`, que se combina sobre `pve_vm_defaults` porque los
+  # defaults de VM son los de la PVE anidada). La correspondencia de puertos es
+  # netN -> ether(N+1): ether1 es siempre la gestión.
+  #
+  # NO llevan `keyboard:` (no puede funcionar: el keymap final es el del
+  # invitado, y el de RouterOS es US sin ajuste posible) y SÍ consola serie con
+  # su baud rate declarado, que es la que respeta el teclado.
+  - vmid: 147
+    name: chr-a1
+    chr: true
+    description: "Sede 1, switch de ws1 y ws2: puentea sus puertos sin IP."
     net:
-      # ether1: the management LAN, where the framework reaches it.
-      net0: "virtio,bridge=vmbr1"
-      # ether2/ether3: one leg per segment, and the only device on both.
-      net1: "virtio,bridge=vmbr2"
-      net2: "virtio,bridge=vmbr3"
-    scsi:
-      scsi0: "local-zfs:8"
-    # The vendor image, imported instead of created: proxmox_kvm can only build
-    # a disk from a size, so the raw image is uploaded to a storage that accepts
-    # `import` and attached with the API's import-from syntax (see
-    # playbooks/tasks/disk_import.yml). `key` is the disk the image fills.
-    disk_import:
-      - key: scsi0
-        source: "local:import/chr-7.25.1.raw"
-    # ---- layer 2 (configure/). Layer 1 ignores the `config` block. -----------
-    # A VM's address lives inside its own OS, so layer 2 cannot derive it from
-    # the `net` string the way it does for a container: it is declared here.
-    address: 10.10.10.50
-    manage: true
+      net0: "virtio,bridge=vmbr1"    # ether1 gestión
+      net1: "virtio,bridge=vmbr4"    # ether2 -> ws1
+      net2: "virtio,bridge=vmbr5"    # ether3 -> ws2
+      net3: "virtio,bridge=vmbr8"    # ether4 -> chr-a3 (uplink L2)
     config:
       routeros:
-        identity: routeros-chr
-        # The vendor image ships with a DHCP client on ether1 and nothing else:
-        # no bridge, no firewall, no address. The declaration replaces that with
-        # a static address, which is what makes the router reachable at a known
-        # place and independent of any DHCP server (a DHCP offer that crosses a
-        # bridge into a VM arrives with a broken UDP checksum, so a VM cannot
-        # take a lease from a server running on the host or in a container).
+        identity: chr-a1
         dhcp_client: false
         addresses:
           - {address: "10.10.10.50/24", interface: ether1}
-          - {address: "10.20.1.1/24", interface: ether2}
-          - {address: "10.20.2.1/24", interface: ether3}
-        # The console's SPEED, which is not cosmetic: QEMU's emulated UART paces
-        # the guest's output at the port's baud rate, and RouterOS defaults a
-        # newly detected port to 9600 — roughly a kilobyte per second, which is
-        # exactly why this console feels sluggish next to a container's, whose
-        # pty has no UART to pace it.
-        ports:
-          - {name: serial0, baud_rate: 115200}
+        # Puentea sus tres puertos de lab y NO tiene IP en el puente: es un
+        # switch, no un router. Todo su tráfico de sede es L2.
+        bridges:
+          - {name: lan, ports: [ether2, ether3, ether4]}
+
+  - vmid: 143
+    name: chr-a2
+    chr: true
+    description: "Sede 1, switch de ws3 y ws4: puentea sus puertos sin IP."
+    net:
+      net0: "virtio,bridge=vmbr1"
+      net1: "virtio,bridge=vmbr6"    # ether2 -> ws3
+      net2: "virtio,bridge=vmbr7"    # ether3 -> ws4
+      net3: "virtio,bridge=vmbr9"    # ether4 -> chr-a3
+    config:
+      routeros:
+        identity: chr-a2
+        dhcp_client: false
+        addresses:
+          - {address: "10.10.10.51/24", interface: ether1}
+        bridges:
+          - {name: lan, ports: [ether2, ether3, ether4]}
+
+  - vmid: 144
+    name: chr-a3
+    chr: true
+    description: "Sede 1, núcleo y borde: puentea los uplinks y enruta hacia la WAN."
+    net:
+      net0: "virtio,bridge=vmbr1"
+      net1: "virtio,bridge=vmbr8"    # ether2 -> chr-a1
+      net2: "virtio,bridge=vmbr9"    # ether3 -> chr-a2
+      net3: "virtio,bridge=vmbr14"   # ether4 -> WAN (enrutado, no puenteado)
+    config:
+      routeros:
+        identity: chr-a3
+        dhcp_client: false
+        addresses:
+          - {address: "10.10.10.52/24", interface: ether1}
+          # La IP del gateway de la sede vive en el PUENTE: es lo que convierte
+          # este switch en un switch de capa 3.
+          - {address: "10.21.0.1/24", interface: lan}
+          - {address: "10.99.0.1/24", interface: ether4}
+        bridges:
+          - {name: lan, ports: [ether2, ether3]}
+        # Rutas a las otras sedes por la WAN. Estáticas y declaradas: el
+        # framework verifica exactamente lo que declara.
+        routes:
+          - {to: "10.22.0.0/24", via: "10.99.0.2"}
+          - {to: "10.23.0.0/24", via: "10.99.0.3"}
+
+  - vmid: 145
+    name: chr-b
+    chr: true
+    description: "Sede 2: switch de ws5 y ws6, y borde hacia la WAN."
+    net:
+      net0: "virtio,bridge=vmbr1"
+      net1: "virtio,bridge=vmbr10"   # ether2 -> ws5
+      net2: "virtio,bridge=vmbr11"   # ether3 -> ws6
+      net3: "virtio,bridge=vmbr14"   # ether4 -> WAN
+    config:
+      routeros:
+        identity: chr-b
+        dhcp_client: false
+        addresses:
+          - {address: "10.10.10.53/24", interface: ether1}
+          - {address: "10.22.0.1/24", interface: lan}
+          - {address: "10.99.0.2/24", interface: ether4}
+        bridges:
+          - {name: lan, ports: [ether2, ether3]}
+        routes:
+          - {to: "0.0.0.0/0", via: "10.99.0.1"}
+
+  - vmid: 146
+    name: chr-c
+    chr: true
+    description: "Sede 3: switch de ws7 y ws8, y borde hacia la WAN."
+    net:
+      net0: "virtio,bridge=vmbr1"
+      net1: "virtio,bridge=vmbr12"   # ether2 -> ws7
+      net2: "virtio,bridge=vmbr13"   # ether3 -> ws8
+      net3: "virtio,bridge=vmbr14"   # ether4 -> WAN
+    config:
+      routeros:
+        identity: chr-c
+        dhcp_client: false
+        addresses:
+          - {address: "10.10.10.54/24", interface: ether1}
+          - {address: "10.23.0.1/24", interface: lan}
+          - {address: "10.99.0.3/24", interface: ether4}
+        bridges:
+          - {name: lan, ports: [ether2, ether3]}
+        routes:
+          - {to: "0.0.0.0/0", via: "10.99.0.1"}
 
 # ============================================================================
 # Layer 2 — configuration targets (guest-side, over SSH).

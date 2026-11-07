@@ -95,7 +95,7 @@
         pve_cts: >-
           {% set out = [] %}{% for i in pve_containers %}{% set _ = out.append(pve_defaults | combine(i)) %}{% endfor %}{{ out }}
         pve_vm_specs: >-
-          {% set out = [] %}{% for i in pve_vms %}{% set _ = out.append(pve_vm_defaults | combine(i)) %}{% endfor %}{{ out }}
+          {% set out = [] %}{% for i in pve_vms %}{% set _ = out.append(pve_vm_defaults | combine(pve_chr_defaults if (i.chr | default(false)) else {}) | combine(i)) %}{% endfor %}{{ out }}
         pve_read_meta: "{{ pve_read_before.stdout | from_json }}"
         pve_live_before: "{{ (pve_read_before.stdout | from_json).guests }}"
 

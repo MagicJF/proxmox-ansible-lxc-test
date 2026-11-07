@@ -157,6 +157,22 @@ def read_state(sock):
         if sentence[0] == "!re":
             item = dict(w[1:].split("=", 1) for w in sentence[1:] if w.startswith("="))
             state["consoles"].append(item)
+    state["bridges"] = {}
+    for sentence in _command(sock, ["/interface/bridge/print"]):
+        if sentence[0] == "!re":
+            item = dict(w[1:].split("=", 1) for w in sentence[1:] if w.startswith("="))
+            state["bridges"][item.get("name")] = {"id": item.get(".id"), "ports": []}
+    for sentence in _command(sock, ["/interface/bridge/port/print"]):
+        if sentence[0] == "!re":
+            item = dict(w[1:].split("=", 1) for w in sentence[1:] if w.startswith("="))
+            bridge = state["bridges"].get(item.get("bridge"))
+            if bridge is not None:
+                bridge["ports"].append({"id": item.get(".id"), "interface": item.get("interface")})
+    state["routes"] = []
+    for sentence in _command(sock, ["/ip/route/print"]):
+        if sentence[0] == "!re":
+            item = dict(w[1:].split("=", 1) for w in sentence[1:] if w.startswith("="))
+            state["routes"].append(item)
     return state
 
 
@@ -165,6 +181,39 @@ def apply_state(sock, declared, new_password=None):
     state = read_state(sock)
     report = {"changed": [], "addresses": [], "identity": None,
               "dhcp_clients": [], "password_set": False, "errors": []}
+
+    # ---- bridges: L2 switching is declared, not assumed ---------------------
+    # This runs BEFORE the addresses, because a layer-3 switch declares the
+    # site's gateway address on the bridge itself and the interface has to exist
+    # first. A router that only bridges declares no address on it at all.
+    for bridge in declared.get("bridges", []):
+        live = state["bridges"].get(bridge["name"])
+        if live is None:
+            reply = _command(sock, ["/interface/bridge/add", f"=name={bridge['name']}"])
+            if not _ok(reply):
+                report["errors"].append(f"bridge {bridge['name']}: {reply[-1]}")
+                continue
+            report["changed"].append(f"bridge +{bridge['name']}")
+            live = {"id": None, "ports": []}
+        wanted_ports = list(bridge.get("ports", []))
+        live_ports = [p["interface"] for p in live["ports"]]
+        for interface in wanted_ports:
+            if interface not in live_ports:
+                reply = _command(sock, ["/interface/bridge/port/add",
+                                        f"=bridge={bridge['name']}", f"=interface={interface}"])
+                if _ok(reply):
+                    report["changed"].append(f"bridge {bridge['name']} port +{interface}")
+                else:
+                    report["errors"].append(
+                        f"bridge {bridge['name']} port {interface}: {reply[-1]}")
+        for port in live["ports"]:
+            if port["interface"] not in wanted_ports:
+                reply = _command(sock, ["/interface/bridge/port/remove", f"=.id={port['id']}"])
+                if _ok(reply):
+                    report["changed"].append(f"bridge {bridge['name']} port -{port['interface']}")
+                else:
+                    report["errors"].append(
+                        f"bridge {bridge['name']} port remove: {reply[-1]}")
 
     # ---- addresses: add what is missing, remove what is not declared --------
     wanted = {(a["address"], a["interface"]) for a in declared.get("addresses", [])}
@@ -228,6 +277,26 @@ def apply_state(sock, declared, new_password=None):
             else:
                 report["errors"].append(f"port {port['name']}: {reply[-1]}")
 
+    # ---- static routes ------------------------------------------------------
+    # Only the STATIC ones are ours to manage: connected routes belong to the
+    # interfaces and dynamic ones to whatever protocol produced them, so
+    # deleting either would fight the router instead of converging it.
+    wanted_routes = {(r["to"], r.get("via")) for r in declared.get("routes", [])}
+    live_routes = {(r.get("dst-address"), r.get("gateway")): r
+                   for r in state["routes"] if r.get("static") == "true"}
+    for to, via in sorted(wanted_routes - set(live_routes)):
+        reply = _command(sock, ["/ip/route/add", f"=dst-address={to}", f"=gateway={via}"])
+        if _ok(reply):
+            report["changed"].append(f"route +{to} via {via}")
+        else:
+            report["errors"].append(f"route {to} via {via}: {reply[-1]}")
+    for key in sorted(set(live_routes) - wanted_routes):
+        reply = _command(sock, ["/ip/route/remove", f"=.id={live_routes[key]['.id']}"])
+        if _ok(reply):
+            report["changed"].append(f"route -{key[0]} via {key[1]}")
+        else:
+            report["errors"].append(f"route remove {key[0]}: {reply[-1]}")
+
     # ---- password (only when the router still uses the factory-empty one) ---
     if new_password:
         reply = _command(sock, ["/user/set", "=numbers=0", f"=password={new_password}"])
@@ -243,6 +312,24 @@ def apply_state(sock, declared, new_password=None):
     report["identity"] = after["identity"]
     report["dhcp_clients"] = [c["interface"] for c in after["dhcp_clients"]]
     report["ports"] = {name: p.get("baud-rate") for name, p in after["ports"].items()}
+    report["bridges"] = {name: sorted(p["interface"] for p in b["ports"])
+                         for name, b in after["bridges"].items()}
+    report["routes"] = sorted(f"{r.get('dst-address')} via {r.get('gateway')}"
+                              for r in after["routes"] if r.get("static") == "true")
+    for bridge in declared.get("bridges", []):
+        live_bridge = after["bridges"].get(bridge["name"])
+        if live_bridge is None:
+            report["errors"].append(f"bridge {bridge['name']} still missing")
+            continue
+        live_ports = sorted(p["interface"] for p in live_bridge["ports"])
+        if live_ports != sorted(bridge.get("ports", [])):
+            report["errors"].append(
+                f"bridge {bridge['name']} ports are {live_ports}, "
+                f"declared {sorted(bridge.get('ports', []))}")
+    live_routes_after = {(r.get("dst-address"), r.get("gateway"))
+                         for r in after["routes"] if r.get("static") == "true"}
+    for to, via in sorted(wanted_routes - live_routes_after):
+        report["errors"].append(f"route {to} via {via} still missing")
     for port in declared.get("ports", []):
         if str(after["ports"].get(port["name"], {}).get("baud-rate")) != str(port["baud_rate"]):
             report["errors"].append(

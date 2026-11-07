@@ -47,7 +47,11 @@
     target_hostname: "{{ hostname | default('') }}"
     target_vmid: "{{ vmid | default('') }}"
     do_force: "{{ force | default(false) | bool }}"
-    keep_disks: "{{ keep_disks | default(false) | bool }}"
+    # Renamed on purpose: a var defined as `keep_disks: "{{ keep_disks | ... }}"`
+    # refers to ITSELF when the option is not passed on the command line, and
+    # Ansible dies with "Recursive loop detected in template" before doing
+    # anything. The `-e` name and the internal name must differ.
+    rd_keep_disks: "{{ keep_disks | default(false) | bool }}"
   environment:
     PYTHONPATH: "{{ playbook_dir }}/tracing"
     PVE_HTTP_TRACE: "{{ playbook_dir }}/../logs/pve-api.jsonl"
@@ -152,7 +156,7 @@
       ansible.builtin.debug:
         msg: >-
           {{ t.name }} (VMID {{ t.vmid }}, {{ t.kind }}): currently {{ t.status }}.
-          {{ 'Disk volumes are KEPT (keep_disks=true).' if keep_disks else 'Its disk volumes will be destroyed too.' }}
+          {{ 'Disk volumes are KEPT (keep_disks=true).' if rd_keep_disks else 'Its disk volumes will be destroyed too.' }}
           This cannot be undone.
       vars:
         t: "{{ (found | from_json)[0] }}"
@@ -180,7 +184,7 @@
         state: absent
         force: "{{ do_force }}"
         purge: true
-        destroy_unreferenced_disks: "{{ not keep_disks }}"
+        destroy_unreferenced_disks: "{{ not rd_keep_disks }}"
         timeout: 300
       vars:
         t: "{{ (found | from_json)[0] }}"
@@ -196,7 +200,7 @@
         state: absent
         force: "{{ do_force }}"
         purge: true
-        destroy_unreferenced_disks: "{{ not keep_disks }}"
+        destroy_unreferenced_disks: "{{ not rd_keep_disks }}"
         timeout: 300
       vars:
         t: "{{ (found | from_json)[0] }}"
@@ -250,7 +254,7 @@
         status_code: 200
         return_content: true
       register: rem_storages
-      when: not keep_disks
+      when: not rd_keep_disks
       no_log: true
 
     - name: Read what each storage still holds
@@ -267,7 +271,7 @@
       loop_control:
         label: "{{ item.storage }}"
       register: rem_contents
-      when: not keep_disks
+      when: not rd_keep_disks
       failed_when: false
       no_log: true
 
@@ -286,14 +290,14 @@
              | map(attribute='json.data', default=[]) | flatten
              | map(attribute='volid', default='') | select('search', 'vm-' ~ ((found | from_json)[0].vmid | string) ~ '-')
              | list }}
-      when: not keep_disks
+      when: not rd_keep_disks
 
     - name: Say plainly what was kept
       ansible.builtin.debug:
         msg: >-
           VMID {{ (found | from_json)[0].vmid }} was destroyed but its disk volumes were KEPT
           (keep_disks=true). Review the storage listings before leaving them behind.
-      when: keep_disks
+      when: rd_keep_disks
 
     - name: Observability is only real if it is checked
       ansible.builtin.stat:

@@ -41,7 +41,7 @@
       a subnet or a key path. Nothing was changed.
     success_msg: >-
       Tunnel {{ pve_tunnel.name }}: {{ pve_tunnel.address }} -> {{ pve_tunnel.endpoint }},
-      routing {{ pve_tunnel.guest_network }}.
+      routing {{ pve_tunnel.guest_network | join(', ') }}.
 
 - name: Look for this node's tunnel private key
   ansible.builtin.stat:
@@ -94,7 +94,7 @@
       [Peer]
       PublicKey = {{ pve_tunnel.endpoint_public_key }}
       Endpoint = {{ pve_tunnel.endpoint }}
-      AllowedIPs = {{ pve_tunnel.guest_network }}
+      AllowedIPs = {{ pve_tunnel.guest_network | join(', ') }}
       PersistentKeepalive = {{ pve_tunnel.keepalive | default(25) }}
   register: tunnel_conf
   no_log: true
@@ -202,5 +202,5 @@
     msg: >-
       Tunnel {{ pve_tunnel.name }} {{ 'up' if tunnel_link.rc != 0 else 'converged' }}:
       {{ pve_tunnel.address }} -> {{ pve_tunnel.endpoint }}, handshake OK,
-      routing {{ pve_tunnel.guest_network }}.
+      routing {{ pve_tunnel.guest_network | join(', ') }}.
       This node's public key (declare it on the endpoint): {{ tunnel_public.stdout | trim }}
