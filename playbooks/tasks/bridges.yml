@@ -46,9 +46,17 @@
   loop_control:
     label: "{{ item.iface }}"
   register: net_created
+  # `uri` reports `ok` for a 200, whatever the method did, so without this a POST
+  # that created an interface counts as "no change" — which is exactly how the
+  # apply step below gets skipped and the bridges stay pending.
+  changed_when: true
   no_log: true
+  # Only the missing ones: POSTing an interface that already exists is an error.
   when: item.iface not in (net_before.json.data | map(attribute='iface') | list)
 
+# The condition is deliberately NOT "did this run create something": a bridge can
+# be pending from an earlier run (or from a hand-made change), and what needs
+# applying is whatever the NODE has staged, not what this task did.
 - name: Apply the staged network changes (this reloads the node's network)
   ansible.builtin.uri:
     url: "{{ pve_api }}/nodes/{{ pve_node }}/network"
@@ -59,8 +67,14 @@
     ca_path: "{{ pve_api_ca_path }}"
     status_code: 200
   register: net_applied
+  changed_when: true
   no_log: true
-  when: net_created.changed | default(false)
+  when: pending_segments | length > 0
+  vars:
+    pending_segments: >-
+      {{ pve_bridges | default([]) | map(attribute='iface') | list
+         | reject('in', net_before.json.data | selectattr('active', 'defined')
+                  | selectattr('active', 'equalto', 1) | map(attribute='iface') | list) | list }}
 
 - name: Wait for the network reload to finish
   ansible.builtin.uri:
