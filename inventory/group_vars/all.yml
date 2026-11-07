@@ -287,13 +287,17 @@ pve_containers:
     address: "10.30.0.11"
     netif:
       net0: "name=eth0,bridge=vmbr2,hwaddr=BC:24:11:00:00:51,ip=dhcp"
-    manage: true
-    config:
-      netlab:
-        # La prueba del lab: alcanzar a la otra workstation cruzando el switch.
-        # No hay rutas que declarar — la puerta de enlace por defecto la trae el
-        # propio DHCP del CHR.
-        peers: ["10.30.0.12"]
+    # Sin bloque `config`: layer 2 NO entra en esta workstation. No tiene interfaz
+    # de gestión a propósito — es un PC — así que sólo se llega a ella cruzando el
+    # switch, y eso necesita una ruta en el ENDPOINT que la API de PVE no puede
+    # añadir (está declarada en pve_tunnel.endpoint_routes y la aplica el script
+    # del túnel). Mientras esa ruta no exista, declararla `manage: true` no la
+    # convergería: haría fallar su comprobación de alcanzabilidad y, con `serial`,
+    # abortaría también los invitados que van detrás en la lista.
+    #
+    # Su dirección la reparte el CHR por DHCP con una reserva por MAC. El
+    # `address:` de arriba ES esa reserva: el CHR la deriva de aquí, y la MAC de
+    # su net0 es lo que ata la concesión a esta interfaz. Una sola verdad.
 
   - vmid: 142
     hostname: ws2
@@ -307,10 +311,6 @@ pve_containers:
     address: "10.30.0.12"
     netif:
       net0: "name=eth0,bridge=vmbr3,hwaddr=BC:24:11:00:00:52,ip=dhcp"
-    manage: true
-    config:
-      netlab:
-        peers: ["10.30.0.11"]
 
   # ---------------------------------------------------------------------------
   # El bootstrap del CHR: el único punto que la API de PVE no puede resolver.
