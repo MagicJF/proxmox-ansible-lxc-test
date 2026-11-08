@@ -252,7 +252,8 @@
         description: "{{ ct.description if 'description' in a.to_set else omit }}"
         tags: "{{ ct.tags if 'tags' in a.to_set else omit }}"
         features: "{{ ct.features if 'features' in a.to_set else omit }}"
-        startup: "{{ ct.startup if 'startup' in a.to_set else omit }}"
+        # `startup` NO se pasa aquí a propósito: ver la tarea que lo converge justo
+        # después del bloque de contenedores.
         nameserver: "{{ ct.nameserver if 'nameserver' in a.to_set else omit }}"
         searchdomain: "{{ ct.searchdomain if 'searchdomain' in a.to_set else omit }}"
         hookscript: "{{ ct.hookscript if 'hookscript' in a.to_set else omit }}"
@@ -271,19 +272,64 @@
       no_log: true
       when: a.exists and ((a.to_set | length > 0) or (a.to_delete | length > 0))
 
-    # ---- energía: la hace Proxmox, en bloque y en el orden declarado -----------
-    # `startall`/`stopall` recogen la lista de invitados ordenada por
-    # `startup: order=N` (el mismo campo que declara el manifiesto) y no pasan a un
-    # escalón superior hasta terminar el anterior: está en el código de Proxmox, y
-    # es exactamente lo que antes hacíamos a mano. Con `vms` se limitan a los
-    # invitados de esta declaración, que es la regla de la casa — uno ausente de la
-    # lista no se toca. Comprobado contra el laboratorio: con un vmid inexistente no
-    # arranca nada, y con `vms=156` arranca ese y sólo ese.
+    - name: Converger el escalón de arranque de los contenedores donde el plan lo ve distinto
+      # Este campo se converge aquí y no en el módulo, con una comprobación real
+      # detrás y no una opinión: el módulo de contenedores DOCUMENTA `startup` y su
+      # código lo une él mismo (`",".join(kwargs.pop("startup"))`, espera una lista),
+      # pero aplicado sobre un invitado que ya existe no cambia nada — el plan ve la
+      # diferencia, la tarea corre, y el invitado se queda como estaba, con el
+      # recuento en `changed=0`. Lo delató la aserción de verificación del final, que
+      # es exactamente para lo que está.
+      #
+      # PVE sí lo acepta por su API (comprobado: `PUT .../lxc/150/config` con
+      # `startup=order=3` devuelve 200 y el valor leído de vuelta es `order=3`), así
+      # que el campo se empuja desde el plan. La lista se une con comas porque es la
+      # forma que espera PVE; una lista declarada vacía manda cadena vacía, que es lo
+      # que borra el escalón.
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/lxc/{{ ct.vmid }}/config"
+        method: PUT
+        body_format: form-urlencoded
+        body:
+          startup: "{{ ct.startup | default([], true) | join(',') }}"
+        headers:
+          Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+        ca_path: "{{ pve_api_ca_path }}"
+        validate_certs: true
+        status_code: [200]
+        timeout: 30
+      loop: "{{ pve_cts }}"
+      loop_control: *pve_loop
+      when:
+        - pve_plan[ct.vmid | string].exists
+        - "'startup' in pve_plan[ct.vmid | string].to_set"
+      changed_when: true
+
+    # ---- energía: un escalón declarado por llamada, y el margen donde importa ---
+    # `startall` acepta una lista de vmids y Proxmox la arranca ordenada por
+    # `startup: order=N`, sin pasar a un escalón superior hasta terminar el
+    # anterior. Con `vms` se limita a los invitados de esta declaración, que es la
+    # regla de la casa — uno ausente de la lista no se toca. Comprobado contra el
+    # laboratorio: con un vmid inexistente no arranca nada, y con `vms=156` arranca
+    # ese y sólo ese.
     #
-    # Lo que NO hacen es comprobar que un invitado esté listo de verdad: esperan a
-    # que termine la orden de arranque y al retardo `up=` declarado. La puerta de
-    # direcciones de más abajo sigue siendo nuestra, y es la que destapó el fallo.
-    - name: Agrupar los invitados por la energía que declaran y lo que ha divergido
+    # Pero se le pide UN escalón por llamada, en vez de una sola llamada con todo,
+    # por dos razones que se midieron:
+    #
+    #   1. El margen. `up=` lo cuenta Proxmox POR INVITADO, así que un escalón de
+    #      siete equipos de red paga la espera siete veces — entre router y router,
+    #      donde no hay ninguna dependencia. La dependencia real es ENTRE escalones:
+    #      las workstations piden su dirección al arrancar y sus routers tienen que
+    #      estar escuchando. Aquí el margen se declara una vez por escalón
+    #      (`pve_power_gap_after`) y se espera entre llamadas.
+    #   2. La espera. La llamada es asíncrona y devuelve un UPID al instante, así
+    #      que hay que esperar a que la tarea termine. Al ir por escalones, se puede
+    #      decir en el registro qué escalón va arrancando en cada momento.
+    #
+    # Lo que Proxmox NO puede dar y sigue siendo nuestro: comprobar que un invitado
+    # esté listo de verdad. La puerta de direcciones de más abajo es la que destapó
+    # el fallo del arranque en frío.
+    - name: Agrupar la energía por el escalón que declara cada invitado
       # En JSON a propósito: un `set_fact` cuyo template lleva un preámbulo
       # `{% set %}` se renderiza como CADENA, y `loop` no acepta nada que no sea una
       # lista de verdad. Ese error ya nos costó una ejecución.
@@ -299,7 +345,26 @@
           {% endif %}
           {% endif %}
           {% endfor %}
-          {{ {'arrancar': arrancar, 'parar': parar} | to_json }}
+          {% set sueltos = [] %}
+          {% for c in pve_cts + pve_vm_specs %}
+          {% if c.vmid in arrancar %}
+          {% set o = (c.startup | default([], true) | select('match', '^order=')
+                      | map('regex_replace', '^order=', '') | list | first
+                      | default('99', true)) | int %}
+          {% set _ = sueltos.append({'order': o, 'vmid': c.vmid,
+                                     'nombre': c.name | default(c.hostname)}) %}
+          {% endif %}
+          {% endfor %}
+          {% set escalones = [] %}
+          {% for o in sueltos | map(attribute='order') | list | unique | sort %}
+          {% set suyos = sueltos | selectattr('order', 'equalto', o) | list %}
+          {% set _ = escalones.append({
+                 'order': o,
+                 'vmids': suyos | map(attribute='vmid') | list,
+                 'nombres': suyos | map(attribute='nombre') | list,
+                 'espera': (pve_power_gap_after.get(o, 0) if not loop.last else 0)}) %}
+          {% endfor %}
+          {{ {'escalones': escalones, 'parar': parar} | to_json }}
 
     - name: Leerlos como lista de verdad
       ansible.builtin.set_fact:
@@ -308,8 +373,10 @@
     - name: Decir qué invitados cambian de energía en esta ejecución
       ansible.builtin.debug:
         msg: >-
-          arrancar: {{ pve_power.arrancar | join(', ') if pve_power.arrancar | length else 'nada' }}
-          | parar: {{ pve_power.parar | join(', ') if pve_power.parar | length else 'nada' }}
+          parar: {{ pve_power.parar | join(', ') if pve_power.parar | length else 'nada' }}
+          | arrancar: {{ pve_power.escalones
+                         | map(attribute='nombres') | map('join', ', ') | join('  ->  ')
+                         if pve_power.escalones | length else 'nada' }}
 
 
     # ---- the same for VMs -------------------------------------------------
@@ -408,37 +475,52 @@
 
     # ---- la energía, ya con todos los invitados creados ------------------------
     # Va después de crear ambos tipos porque la llamada en bloque es de Proxmox y
-    # necesita que existan. Y va en bloque precisamente por el orden: es él quien
-    # respeta `startup: order=N`, y quien evita que una workstation pida su
-    # dirección antes de que su router esté escuchando.
-    - name: Arrancar en bloque lo que la declaración quiere en marcha
-      ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ pve_node }}/startall"
-        method: POST
-        body_format: form-urlencoded
-        body:
-          vms: "{{ pve_power.arrancar | join(',') }}"
-        headers:
-          Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
-        ca_path: "{{ pve_api_ca_path }}"
-        validate_certs: true
-        status_code: [200]
-        timeout: 120
-      register: pve_startall
-      when: pve_power.arrancar | length > 0
-      # Proxmox responde con el UPID de una tarea: la energía la aplica él, con su
-      # propio orden, y aquí sólo se declara que algo ha cambiado.
-      changed_when: true
+    # necesita que existan. Y va por escalones precisamente por el orden: es lo que
+    # evita que una workstation pida su dirección antes de que su router escuche.
+    - name: Subir la energía escalón a escalón, con su margen entre uno y el siguiente
+      # El arranque, la espera de su tarea y el margen tienen que ir en el MISMO
+      # recorrido. Estaban en tareas distintas con `loop`, y Ansible recorre primero
+      # todas las llamadas y sólo después todos los márgenes: pedía los tres
+      # escalones seguidos y luego dormía, con las workstations arrancando a la vez
+      # que sus routers. Ver `tasks/power.yml`, donde está contado entero.
+      ansible.builtin.include_tasks: tasks/power.yml
+      loop: "{{ pve_power.escalones }}"
+      loop_control:
+        loop_var: paso
+        label: "order={{ paso.order }}: {{ paso.nombres | join(', ') }}"
 
     - name: Parar en bloque lo que la declaración quiere parado
-      # `stopall` invierte el orden por su cuenta, que es justo lo que se quiere al
-      # apagar: primero las estaciones y al final la infraestructura.
+      # Aquí SÍ una sola llamada: `stopall` invierte el orden por su cuenta, que es
+      # justo lo que se quiere al apagar (primero las estaciones y al final la
+      # infraestructura), y al apagar no hay ninguna dirección que reclamar, así que
+      # no hay margen que dar.
+      #
+      # `force-stop` porque `stopall` es amable por defecto: concede 180 s por
+      # invitado, NO fuerza, y termina la tarea diciendo `OK` aunque el invitado
+      # siga en marcha. Leído del registro de la tarea, no supuesto:
+      #
+      #     Stopping CT 156 (timeout = 180 seconds)   <- las cinco que no bajaron
+      #     ...
+      #     Stopping CT 143 (timeout = 180 seconds)
+      #     TASK OK                                    <- y seguían en pie
+      #
+      # El parámetro existe: el esquema de la API acepta `force-stop` y rechaza
+      # `force` y `forceStop`. Un laboratorio que se apaga a medias en silencio no
+      # vale, y si aun así algo quedara en pie lo caza la verificación del final.
+      #
+      # Y `timeout` porque `force-stop` NO acorta la cortesía: sigue concediendo los
+      # 180 s de fábrica por invitado antes de forzar, y con cuatro invitados a la
+      # vez son más de cinco minutos de apagado medidos. 30 s bastan para que un
+      # contenedor de este laboratorio se apague solo —y para un CHR, que no tiene
+      # servicios que cerrar—, y a partir de ahí se fuerza.
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ pve_node }}/stopall"
         method: POST
         body_format: form-urlencoded
         body:
           vms: "{{ pve_power.parar | join(',') }}"
+          force-stop: 1
+          timeout: 30
         headers:
           Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
         ca_path: "{{ pve_api_ca_path }}"
@@ -449,18 +531,26 @@
       when: pve_power.parar | length > 0
       changed_when: true
 
-    - name: Reunir las tareas en bloque que hay que esperar
-      ansible.builtin.set_fact:
-        pve_power_upids: >-
-          {{ [pve_startall.upid | default(''), pve_stopall.upid | default('')]
-             | select('ne', '') | list }}
+    - name: Dar a cada escalón, antes del siguiente, el margen que declara
+      # El margen va DESPUÉS de haber pedido el arranque del escalón, no antes: la
+      # llamada vuelve al instante, así que los segundos se cuentan desde que sus
+      # invitados han empezado a arrancar de verdad. El último escalón no espera a
+      # nadie, y eso lo decide el propio cálculo de los escalones.
+      ansible.builtin.pause:
+        seconds: "{{ item.espera }}"
+      when: item.espera | int > 0
+      loop: "{{ pve_power.escalones }}"
+      loop_control:
+        label: "margen tras order={{ item.order }}: {{ item.espera }} s"
 
-    - name: Esperar a que Proxmox termine la energía en bloque
-      # La llamada es asíncrona: devuelve un UPID al instante. Sin esperar aquí, la
-      # puerta de direcciones de abajo preguntaría antes de que nada se hubiera
-      # arrancado y daría por bueno un laboratorio que aún está apagándose.
+    - name: Esperar a que Proxmox termine de parar lo que se paró
+      # El arranque ya espera su propia tarea escalón a escalón (ver tasks/power.yml).
+      # Aquí queda la del apagado, que sí es una sola llamada. Y el UPID vive en
+      # `.json.data`, no en la raíz del resultado del módulo `uri`.
       ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ pve_node }}/tasks/{{ item | urlencode }}/status"
+        url: >-
+          {{ pve_api }}/nodes/{{ pve_node }}/tasks/{{
+             (pve_stopall.json | default({}, true)).get('data', '') | urlencode }}/status
         headers:
           Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
         ca_path: "{{ pve_api_ca_path }}"
@@ -471,9 +561,7 @@
       until: (pve_power_task.json.data.status | default('')) != 'running'
       retries: 90
       delay: 5
-      loop: "{{ pve_power_upids }}"
-      loop_control:
-        label: "tarea en bloque de energía"
+      when: (pve_stopall.json | default({}, true)).get('data', '') | length > 0
 
     # ---- and a cold start must not end green with guests off the network ------
     - name: Wait for the workstations to hold their declared addresses

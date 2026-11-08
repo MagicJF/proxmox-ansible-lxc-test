@@ -1,0 +1,61 @@
+---
+# ---------------------------------------------------------------------------
+# Un escalón de energía: pedirlo, esperar a que Proxmox lo termine, y dar el
+# margen declarado ANTES de que empiece el siguiente.
+#
+# Las tres cosas van juntas, en el mismo fichero que se recorre escalón a escalón,
+# y eso no es estilo: con la llamada en una tarea con `loop` y el margen en otra,
+# Ansible recorre primero TODAS las llamadas y sólo después todos los márgenes —
+# es decir, pide los tres escalones seguidos y luego duerme. Eso deja a las
+# workstations arrancando a la vez que sus routers, que es justo el fallo que este
+# orden existe para evitar. Visto en el laboratorio, no deducido: un
+# `include_tasks` en un `loop` sí se recorre entero, iteración a iteración.
+# ---------------------------------------------------------------------------
+- name: Arrancar este escalón en bloque
+  ansible.builtin.uri:
+    url: "{{ pve_api }}/nodes/{{ pve_node }}/startall"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      vms: "{{ paso.vmids | join(',') }}"
+      # Uno detrás de otro dentro del escalón. Sin esto se piden siete CHR a la
+      # vez —4-5 discos y 3-5 interfaces cada uno— y cinco de los siete fallan al
+      # arrancar con `qmstart ... start failed: got timeout`.
+      max-workers: 1
+    headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    ca_path: "{{ pve_api_ca_path }}"
+    validate_certs: true
+    status_code: [200]
+    timeout: 120
+  register: paso_start
+  # Proxmox responde con el UPID de una tarea y arranca por su cuenta.
+  changed_when: true
+
+- name: Esperar a que Proxmox termine de arrancar este escalón
+  # El UPID vive en `.json.data`, NO en la raíz del resultado del módulo `uri`.
+  # Leerlo de la raíz devuelve indefinido, el bucle queda vacío y la espera no
+  # ocurre sin que nada lo diga — ya pasó una vez.
+  ansible.builtin.uri:
+    url: >-
+      {{ pve_api }}/nodes/{{ pve_node }}/tasks/{{
+         (paso_start.json | default({}, true)).get('data', '') | urlencode }}/status
+    headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    ca_path: "{{ pve_api_ca_path }}"
+    validate_certs: true
+    return_content: true
+    timeout: 30
+  register: paso_task
+  until: (paso_task.json.data.status | default('')) != 'running'
+  retries: 90
+  delay: 5
+  when: (paso_start.json | default({}, true)).get('data', '') | length > 0
+
+- name: Dar a este escalón, antes del siguiente, el margen que declara
+  # `up=` de Proxmox no sirve para esto: lo cuenta POR INVITADO, así que un escalón
+  # de siete equipos de red pagaría la espera siete veces. El margen se declara una
+  # vez por escalón, y el último no espera a nadie (lo decide el propio cálculo).
+  ansible.builtin.pause:
+    seconds: "{{ paso.espera }}"
+  when: paso.espera | int > 0

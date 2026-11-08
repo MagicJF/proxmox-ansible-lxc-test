@@ -370,7 +370,7 @@ pve_containers:
     # Último escalón: su dirección se la da por DHCP el router de su sede, así
     # que arrancarla a la vez que su router es una carrera que pierde.
     onboot: true
-    startup: ["order=3", "up=10"]
+    startup: ["order=3"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -401,7 +401,7 @@ pve_containers:
     # Último escalón: su dirección se la da por DHCP el router de su sede, así
     # que arrancarla a la vez que su router es una carrera que pierde.
     onboot: true
-    startup: ["order=3", "up=10"]
+    startup: ["order=3"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -432,7 +432,7 @@ pve_containers:
     # Último escalón: su dirección se la da por DHCP el router de su sede, así
     # que arrancarla a la vez que su router es una carrera que pierde.
     onboot: true
-    startup: ["order=3", "up=10"]
+    startup: ["order=3"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -463,7 +463,7 @@ pve_containers:
     # Último escalón: su dirección se la da por DHCP el router de su sede, así
     # que arrancarla a la vez que su router es una carrera que pierde.
     onboot: true
-    startup: ["order=3", "up=10"]
+    startup: ["order=3"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -494,7 +494,7 @@ pve_containers:
     # Último escalón: su dirección se la da por DHCP el router de su sede, así
     # que arrancarla a la vez que su router es una carrera que pierde.
     onboot: true
-    startup: ["order=3", "up=10"]
+    startup: ["order=3"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -525,7 +525,7 @@ pve_containers:
     # Último escalón: su dirección se la da por DHCP el router de su sede, así
     # que arrancarla a la vez que su router es una carrera que pierde.
     onboot: true
-    startup: ["order=3", "up=10"]
+    startup: ["order=3"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -556,7 +556,7 @@ pve_containers:
     # Último escalón: su dirección se la da por DHCP el router de su sede, así
     # que arrancarla a la vez que su router es una carrera que pierde.
     onboot: true
-    startup: ["order=3", "up=10"]
+    startup: ["order=3"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -587,7 +587,7 @@ pve_containers:
     # Último escalón: su dirección se la da por DHCP el router de su sede, así
     # que arrancarla a la vez que su router es una carrera que pierde.
     onboot: true
-    startup: ["order=3", "up=10"]
+    startup: ["order=3"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -633,7 +633,7 @@ pve_containers:
     # Primer escalón: es el salto SSH hacia las tres sedes, así que tiene que
     # estar en pie antes de que la capa 2 llegue a nada que esté detrás de un router.
     onboot: true
-    startup: ["order=1", "up=5"]
+    startup: ["order=1"]
     cores: 1
     # 1 GiB, not 256 MiB: apt on Debian 13 gets OOM-killed below ~512 MiB, and
     # this guest exists to install dnsmasq once and then sit still.
@@ -734,13 +734,13 @@ pve_chr_defaults:
   # carrera que la workstation pierde. Y `onboot` es lo que hace que Proxmox
   # respete el orden siquiera: sin él deja al invitado quieto en el arranque del nodo.
   onboot: true
-  # `up` se cuenta POR INVITADO, no por escalón: con siete equipos de red, 45 s cada
-  # uno son unos cinco minutos de arranque en frío. Se baja a 10 s (~70 s en total),
-  # que basta para que los routers estén escuchando cuando llegue el escalón de las
-  # workstations, y si alguna se adelantara su cliente DHCP ya es paciente
-  # (`timeout 300`, `retry 30`) y la puerta de direcciones de `apply.yml` no da la
-  # ejecución por buena hasta que todas tienen la suya.
-  startup: ["order=2", "up=10"]
+  # SIN `up=`: se cuenta por invitado y aquí sobra. Lo que hace falta es que los
+  # siete estén escuchando ANTES de que arranque el escalón de las workstations, y
+  # eso lo declara `pve_power_gap_after` una sola vez, no siete. Si alguna
+  # workstation se adelantara, su cliente DHCP es paciente (`timeout 300`,
+  # `retry 30`) y la puerta de direcciones de `apply.yml` no da la ejecución por
+  # buena hasta que las ocho tienen la suya.
+  startup: ["order=2"]
   # 1 core y 256 MiB por router: un CHR que conmuta y enruta sin hacer más no
   # necesita más, y son SIETE. 7 x 256 MiB = 1.75 GiB, que es lo que hace que el
   # lab entero quepa en los ~7.5 GiB libres del nodo.
@@ -1126,6 +1126,23 @@ pve_config_targets:
 # El archivo más reciente NUNCA se borra, diga lo que diga `keep_count`: es el
 # que alguien iría a mirar. Con los valores de abajo el techo es 10 × 8 MB.
 # ============================================================================
+# Margen entre escalones de arranque, en segundos. La clave es el `order` del
+# escalón que ACABA de arrancar: cuánto se espera antes de empezar el siguiente.
+#
+# No se usa `up=` en la declaración de cada invitado a propósito. `up` lo cuenta
+# Proxmox POR INVITADO, así que siete equipos de red con `up=45` son cinco minutos
+# de espera entre router y router — donde no hay ninguna dependencia. La
+# dependencia real es ENTRE escalones: las workstations piden su dirección en
+# cuanto arrancan y sus routers tienen que estar escuchando. Y ahí, el margen que
+# hace falta es uno, no siete.
+#
+# El escalón del bootstrap no lo necesita (los routers reintentan su DHCP solos,
+# no dependen de que nadie espere); el de los equipos de red sí, y es el que de
+# verdad importa. Un `order` que no aparezca aquí espera 0.
+pve_power_gap_after:
+  1: 10
+  2: 45
+
 pve_log_retention:
   live_max_mb: 8
   keep_days: 14
