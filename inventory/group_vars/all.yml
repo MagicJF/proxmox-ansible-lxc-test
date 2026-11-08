@@ -367,6 +367,10 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede1]
+    # Último escalón: su dirección se la da por DHCP el router de su sede, así
+    # que arrancarla a la vez que su router es una carrera que pierde.
+    onboot: true
+    startup: ["order=3", "up=10"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -394,6 +398,10 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede1]
+    # Último escalón: su dirección se la da por DHCP el router de su sede, así
+    # que arrancarla a la vez que su router es una carrera que pierde.
+    onboot: true
+    startup: ["order=3", "up=10"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -421,6 +429,10 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede1]
+    # Último escalón: su dirección se la da por DHCP el router de su sede, así
+    # que arrancarla a la vez que su router es una carrera que pierde.
+    onboot: true
+    startup: ["order=3", "up=10"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -448,6 +460,10 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede1]
+    # Último escalón: su dirección se la da por DHCP el router de su sede, así
+    # que arrancarla a la vez que su router es una carrera que pierde.
+    onboot: true
+    startup: ["order=3", "up=10"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -475,6 +491,10 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede2]
+    # Último escalón: su dirección se la da por DHCP el router de su sede, así
+    # que arrancarla a la vez que su router es una carrera que pierde.
+    onboot: true
+    startup: ["order=3", "up=10"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -502,6 +522,10 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede2]
+    # Último escalón: su dirección se la da por DHCP el router de su sede, así
+    # que arrancarla a la vez que su router es una carrera que pierde.
+    onboot: true
+    startup: ["order=3", "up=10"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -529,6 +553,10 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede3]
+    # Último escalón: su dirección se la da por DHCP el router de su sede, así
+    # que arrancarla a la vez que su router es una carrera que pierde.
+    onboot: true
+    startup: ["order=3", "up=10"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -556,6 +584,10 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede3]
+    # Último escalón: su dirección se la da por DHCP el router de su sede, así
+    # que arrancarla a la vez que su router es una carrera que pierde.
+    onboot: true
+    startup: ["order=3", "up=10"]
     manage: true
     config:
       # Una workstation no tiene dirección estática: la pide por DHCP al router de
@@ -598,6 +630,10 @@ pve_containers:
   # ---------------------------------------------------------------------------
   - vmid: 143
     hostname: lab-bootstrap
+    # Primer escalón: es el salto SSH hacia las tres sedes, así que tiene que
+    # estar en pie antes de que la capa 2 llegue a nada que esté detrás de un router.
+    onboot: true
+    startup: ["order=1", "up=5"]
     cores: 1
     # 1 GiB, not 256 MiB: apt on Debian 13 gets OOM-killed below ~512 MiB, and
     # this guest exists to install dnsmasq once and then sit still.
@@ -693,6 +729,12 @@ pve_vm_defaults:
 # `chr: true`, so the vendor image, the boot order and the console live in one
 # block instead of seven copies.
 pve_chr_defaults:
+  # Los equipos de red van ANTES que las workstations: la petición DHCP de una
+  # workstation la contesta el router de su sede, así que arrancarlos juntos es una
+  # carrera que la workstation pierde. Y `onboot` es lo que hace que Proxmox
+  # respete el orden siquiera: sin él deja al invitado quieto en el arranque del nodo.
+  onboot: true
+  startup: ["order=2", "up=45"]
   # 1 core y 256 MiB por router: un CHR que conmuta y enruta sin hacer más no
   # necesita más, y son SIETE. 7 x 256 MiB = 1.75 GiB, que es lo que hace que el
   # lab entero quepa en los ~7.5 GiB libres del nodo.

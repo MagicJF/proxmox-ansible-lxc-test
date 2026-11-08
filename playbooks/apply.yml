@@ -41,6 +41,10 @@
       loop_var: ct
       index_var: idx
       label: "VMID {{ ct.vmid }}"
+    # How long the workstations get to hold their declared addresses before a cold
+    # start is called failed: thirty probes, ten seconds apart.
+    lab_address_retries: 30
+    lab_address_delay: 10
     # Observability: every run appends to a human log (ansible.cfg log_path) and
     # to a machine-readable journal of the real PVE API traffic.
     pve_log_dir: "{{ playbook_dir }}/../logs"
@@ -267,18 +271,40 @@
       no_log: true
       when: a.exists and ((a.to_set | length > 0) or (a.to_delete | length > 0))
 
-    - name: Converge the power state of every container
-      community.proxmox.proxmox:
-        <<: *pve_auth
-        node: "{{ pve_node }}"
-        vmid: "{{ ct.vmid }}"
-        timeout: 90
-        state: "{{ ct.status }}"
-      loop: "{{ pve_cts }}"
-      loop_control: *pve_loop
-      register: power_result
-      no_log: true
-      when: pve_plan[ct.vmid | string].power_drift
+    - name: Cut the declared power order into tiers
+      # As JSON on purpose: a `set_fact` whose template carries a `{% set %}`
+      # preamble renders to a STRING, and `loop` refuses anything that is not a
+      # real list. Emitting JSON and parsing it back is the unambiguous version.
+      ansible.builtin.set_fact:
+        pve_power_tiers_json: >-
+          {% set pares = [] %}
+          {% for c in pve_cts + pve_vm_specs %}
+          {% set o = (c.startup | default([], true) | select('match', '^order=')
+                      | map('regex_replace', '^order=', '') | list | first | default('0', true)) | int %}
+          {% set _ = pares.append({'order': o, 'vmid': c.vmid}) %}
+          {% endfor %}
+          {% set out = [] %}
+          {% for o in pares | map(attribute='order') | list | unique | sort %}
+          {% set vmids = pares | selectattr('order', 'equalto', o) | map(attribute='vmid') | list %}
+          {% set _ = out.append({'order': o,
+                                 'cts': pve_cts | selectattr('vmid', 'in', vmids) | list,
+                                 'vms': pve_vm_specs | selectattr('vmid', 'in', vmids) | list}) %}
+          {% endfor %}
+          {{ out | to_json }}
+
+    - name: Parse the tiers back into a real list
+      ansible.builtin.set_fact:
+        pve_power_tiers: "{{ pve_power_tiers_json | from_json }}"
+
+    - name: Report the start order this run will follow
+      ansible.builtin.debug:
+        msg: >-
+          tier {{ item.order }}:
+          {{ (item.cts | map(attribute='hostname') | list + item.vms | map(attribute='name') | list) | join(', ') }}
+      loop: "{{ pve_power_tiers }}"
+      loop_control:
+        label: "tier {{ item.order }}"
+
 
     # ---- the same for VMs -------------------------------------------------
     - name: Create the VMs that do not exist yet
@@ -363,18 +389,24 @@
       no_log: true
       when: a.exists and (a.to_set | length > 0)
 
-    - name: Converge the power state of every declared VM
-      community.proxmox.proxmox_kvm:
-        <<: *pve_auth
-        node: "{{ pve_node }}"
-        vmid: "{{ ct.vmid }}"
-        timeout: 300
-        state: "{{ ct.status }}"
-      loop: "{{ pve_vm_specs }}"
-      loop_control: *pve_loop
-      register: vm_power
-      no_log: true
-      when: pve_plan[ct.vmid | string].power_drift
+    # ---- power comes after every guest exists, and follows the declared order --
+    # Starting the workstations before the routers of their sites is the race that
+    # left three of them without an address: a workstation asks for its address
+    # while nothing is listening yet. The order is declared with PVE's own field
+    # (`startup: order=N`, see pve_chr_defaults and the workstations) and honoured
+    # here too, tier by tier, because PVE's own ordering only applies to the
+    # automatic start at node boot and waits a fixed time instead of for readiness.
+    - name: Converge the power state, one declared tier at a time
+      ansible.builtin.include_tasks: tasks/power.yml
+      loop: "{{ pve_power_tiers }}"
+      loop_control:
+        loop_var: tier
+        label: "tier {{ tier.order }} ({{ (tier.cts | length) + (tier.vms | length) }} guest(s))"
+
+    # ---- and a cold start must not end green with guests off the network ------
+    - name: Wait for the workstations to hold their declared addresses
+      ansible.builtin.include_tasks: tasks/lab_addresses.yml
+      when: (pve_cts | selectattr('site', 'defined') | list | length) > 0
 
     # ---- imported disks, once the VMs exist ------------------------------
     - name: Grow the imported disk images to their declared size

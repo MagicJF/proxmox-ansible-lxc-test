@@ -1,0 +1,89 @@
+---
+# ===========================================================================
+# lab-check — the topology check, run on every workstation at once.
+#
+# tools/lab-check.sh is the script that lives for the guests: it reads its own
+# address, works out which site it sits in, and compares the paths it can see
+# against the topology it was given. It used to be pasted into each console by
+# hand, one guest at a time, and the results read off the screen.
+#
+# Run from the repository root:
+#     ansible-playbook playbooks/tools/lab-check.yml
+#
+# The targets come from the declared state, not from a list kept in here, and the
+# path to them comes from the jump (tasks/ssh_path.yml writes the control node's
+# SSH config for the guests behind a router). ansible.cfg sets forks = 20, so the
+# eight run concurrently: one guest takes about eight seconds, and the whole lab
+# is checked in about the time one takes.
+#
+# The check is READ ONLY — pings and traceroutes, nothing written anywhere.
+# ===========================================================================
+- name: lab-check - build the workstation inventory from the declared state
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pve_ssh_user: root
+    pve_ssh_key_path: "/home/hermes/.hermes/profiles/hermione/secrets/pve-automation_ed25519"
+    l2_ssh_config_path: "{{ lookup('env', 'HOME') }}/.ssh/config"
+  tasks:
+    - name: Build the configuration targets
+      ansible.builtin.include_tasks: ../../configure/tasks/build_targets.yml
+
+    - name: Write the control node's SSH path to the guests behind a router
+      ansible.builtin.include_tasks: ../../configure/tasks/ssh_path.yml
+
+    # The check belongs on the workstations and nowhere else: it looks its own
+    # address up in the lab's map, and a guest that is not in the lab would only
+    # be told so. Layer 2's own list is wider than the lab.
+    - name: Put the workstations in their own group
+      ansible.builtin.add_host:
+        name: "{{ item.hostname }}"
+        groups: lab_workstations
+      loop: "{{ pve_containers | selectattr('site', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+      changed_when: false
+
+- name: lab-check - the topology check, on every workstation at once
+  hosts: lab_workstations
+  gather_facts: false
+  tasks:
+    - name: The check, run where it belongs
+      ansible.builtin.script: lab-check.sh
+      register: lab_check
+      # The script exits non-zero by design when something it EXPECTS to work does
+      # not, so a failure here is information for the report below, not a reason to
+      # abandon the other guests.
+      ignore_errors: true
+
+    - name: Hand back the block this script was written to produce
+      ansible.builtin.debug:
+        msg: "{{ (lab_check.stdout | default(lab_check.msg | default('no output')))
+                 .split('### PEGA ESTO ###')[-1].split('### FIN ###')[0] | trim }}"
+
+- name: lab-check - the whole lab on one screen
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Summarise every workstation
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }} -> {{ (hostvars[item].lab_check.stdout | default('sin salida'))
+             .splitlines() | select('match', '^(alcance|pc|rt|sw|boot)=') | join('  ') }}
+      loop: "{{ groups['lab_workstations'] | default([]) | sort }}"
+      loop_control:
+        label: "{{ item }}"
+      when: groups['lab_workstations'] | default([]) | length > 0
+
+    - name: Say plainly whether the lab is whole
+      ansible.builtin.debug:
+        msg: >-
+          {{ (groups['lab_workstations'] | default([])
+              | map('extract', hostvars, 'lab_check')
+              | map(attribute='stdout', default='')
+              | map('splitlines')
+              | map('select', 'match', '^alcance=15/15')
+              | map('list') | map('length') | sum) }}
+          of {{ groups['lab_workstations'] | default([]) | length }} workstation(s) reach all fifteen
+          destinations
+      when: groups['lab_workstations'] | default([]) | length > 0

@@ -8,6 +8,13 @@ Description=Restore the declared return routes to the site LANs ({{ bootstrap_ro
 # like a broken one — declared, but not durable. This unit is the durable half:
 # `ip route replace` on every boot, exactly as the offload unit does for its own
 # setting.
+# `After=network-online.target` is NOT enough here, and that was measured rather
+# than assumed: the unit ran twenty seconds into the container's boot, before eth0
+# carried its address, and `ip route` answered `Nexthop has invalid gateway` for
+# all three. The service failed, the routes were never restored, and the cold start
+# came up with no path into the sites — which also takes layer 2 down with it,
+# because this container is the SSH jump into them. Hence the retry loop: the
+# gateway has to exist before the routes can point at it, so the unit waits.
 After=network-online.target
 Before=dnsmasq.service
 Wants=network-online.target
@@ -15,7 +22,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c '{% for r in bootstrap_routes %}ip route replace {{ r }} via {{ bootstrap_route_gateway }}; {% endfor %}'
+# Retries for two minutes, because the address arrives when it arrives.
+ExecStart=/bin/sh -c 'for i in $(seq 1 60); do {% for r in bootstrap_routes %}ip route replace {{ r }} via {{ bootstrap_route_gateway }} || continue 2; {% endfor %}exit 0; sleep 2; done; echo "gave up waiting for the gateway {{ bootstrap_route_gateway }}"; exit 1'
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# A cold start must not end green with guests off the network.
+#
+# The failure this exists for: on a cold start the workstations of one site came
+# up with no address at all. The verb reported success, the lab looked converged,
+# and three guests were unreachable — which then broke layer 2, because a guest
+# with no address has no SSH. It was measured three independent ways before being
+# believed (the container's own interfaces, the router's ping to it, and the
+# router's ARP entry), and all three agreed.
+#
+# So the verb waits here until every workstation holds the address the declaration
+# gives it. A guest that never gets there makes this run fail loudly, with the
+# guest named, instead of passing and leaving the discovery to whoever comes next.
+# ---------------------------------------------------------------------------
+
+- name: Wait for every workstation to hold the address it declares
+  ansible.builtin.uri:
+    url: "{{ pve_api }}/nodes/{{ pve_node }}/lxc/{{ item.vmid }}/interfaces"
+    headers:
+      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+    ca_path: "{{ pve_api_ca_path }}"
+    validate_certs: true
+    return_content: true
+    timeout: 30
+  register: lab_address
+  until: >-
+    item.address | default('') | length > 0 and
+    item.address in (lab_address.json.data | default([])
+                     | map(attribute='ip-addresses', default=[]) | flatten
+                     | map(attribute='ip-address', default='') | list)
+  retries: "{{ lab_address_retries }}"
+  delay: "{{ lab_address_delay }}"
+  loop: "{{ pve_cts | selectattr('site', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.hostname }} wants {{ item.address }}"
+  when: item.status | default('started') == 'started'
+
+- name: Report the addresses the workstations ended up with
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.hostname }} holds {{ item.item.address }}
+      {{ '(straight away)' if item.attempts | default(1) == 1
+         else '(after ' ~ item.attempts ~ ' probes)' }}
+  loop: "{{ lab_address.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.hostname }}"
+  when: not (item.skipped | default(false))

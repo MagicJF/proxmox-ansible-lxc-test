@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# One tier of the declared power order. apply.yml cuts the tiers and calls this
+# once per tier, in ascending order.
+#
+# The order is not cosmetic. A workstation's address comes from its site's router
+# by DHCP, so starting the two together is a race the workstation loses: it asks
+# while nothing is listening yet. Proxmox has an order of its own (`startup`), but
+# it only applies to the automatic start at node boot and it waits a fixed number
+# of seconds rather than for anything to be ready — neither of which helps a verb
+# that starts guests itself.
+#
+# `power_drift` is what keeps this honest: a tier that is already in the declared
+# power state is left alone, so a converged lab still reports changed=0.
+# ---------------------------------------------------------------------------
+
+- name: Converge the power state of this tier's containers
+  community.proxmox.proxmox:
+    api_host: "{{ pve_api_host }}"
+    api_port: 8006
+    api_user: root@pam
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    ca_path: "{{ pve_api_ca_path }}"
+    validate_certs: true
+    api_timeout: 300
+    node: "{{ pve_node }}"
+    vmid: "{{ ct.vmid }}"
+    timeout: 90
+    state: "{{ ct.status }}"
+  loop: "{{ tier.cts }}"
+  loop_control:
+    loop_var: ct
+    label: "{{ ct.hostname | default(ct.name) }} (VMID {{ ct.vmid }})"
+  register: tier_ct_power
+  no_log: true
+  when: pve_plan[ct.vmid | string].power_drift
+
+- name: Converge the power state of this tier's VMs
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ pve_api_host }}"
+    api_port: 8006
+    api_user: root@pam
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    ca_path: "{{ pve_api_ca_path }}"
+    validate_certs: true
+    api_timeout: 300
+    node: "{{ pve_node }}"
+    vmid: "{{ ct.vmid }}"
+    timeout: 300
+    state: "{{ ct.status }}"
+  loop: "{{ tier.vms }}"
+  loop_control:
+    loop_var: ct
+    label: "{{ ct.name }} (VMID {{ ct.vmid }})"
+  register: tier_vm_power
+  no_log: true
+  when: pve_plan[ct.vmid | string].power_drift
