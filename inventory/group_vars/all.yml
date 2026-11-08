@@ -367,6 +367,19 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede1]
+    manage: true
+    config:
+      # Una workstation no tiene dirección estática: la pide por DHCP al router de
+      # su sede. Eso la dejaba fuera de capa 2 (el framework no puede alcanzar a un
+      # invitado sólo-DHCP) y, peor, hacía que un arranque en frío la dejara sin
+      # dirección: dhclient se rinde a los 60 s por defecto y el troncal
+      # sw1<->sw2 tarda más en converger, así que nadie reintentaba. Aquí se le da
+      # margen de sobra y se declara `manage: true` para que, si aun así no aparece,
+      # el fallo se oiga en vez de pasar desapercibido.
+      netlab:
+        dhcp:
+          timeout: 300
+          retry: 30
     description: "Workstation 1 (sede 1): una sola NIC en el cable hacia sw1. Sin pata de gestión, como un PC."
     netif:
       net0: "name=eth0,bridge=vmbr4,hwaddr=BC:24:11:00:50:01,ip=dhcp"
@@ -381,6 +394,19 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede1]
+    manage: true
+    config:
+      # Una workstation no tiene dirección estática: la pide por DHCP al router de
+      # su sede. Eso la dejaba fuera de capa 2 (el framework no puede alcanzar a un
+      # invitado sólo-DHCP) y, peor, hacía que un arranque en frío la dejara sin
+      # dirección: dhclient se rinde a los 60 s por defecto y el troncal
+      # sw1<->sw2 tarda más en converger, así que nadie reintentaba. Aquí se le da
+      # margen de sobra y se declara `manage: true` para que, si aun así no aparece,
+      # el fallo se oiga en vez de pasar desapercibido.
+      netlab:
+        dhcp:
+          timeout: 300
+          retry: 30
     description: "Workstation 2 (sede 1): una sola NIC en el cable hacia sw1."
     netif:
       net0: "name=eth0,bridge=vmbr5,hwaddr=BC:24:11:00:50:02,ip=dhcp"
@@ -395,6 +421,19 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede1]
+    manage: true
+    config:
+      # Una workstation no tiene dirección estática: la pide por DHCP al router de
+      # su sede. Eso la dejaba fuera de capa 2 (el framework no puede alcanzar a un
+      # invitado sólo-DHCP) y, peor, hacía que un arranque en frío la dejara sin
+      # dirección: dhclient se rinde a los 60 s por defecto y el troncal
+      # sw1<->sw2 tarda más en converger, así que nadie reintentaba. Aquí se le da
+      # margen de sobra y se declara `manage: true` para que, si aun así no aparece,
+      # el fallo se oiga en vez de pasar desapercibido.
+      netlab:
+        dhcp:
+          timeout: 300
+          retry: 30
     description: "Workstation 3 (sede 1): una sola NIC en el cable hacia sw2. Para llegar a ella hay que cruzar el troncal entre los dos switches."
     netif:
       net0: "name=eth0,bridge=vmbr6,hwaddr=BC:24:11:00:50:03,ip=dhcp"
@@ -409,6 +448,19 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede1]
+    manage: true
+    config:
+      # Una workstation no tiene dirección estática: la pide por DHCP al router de
+      # su sede. Eso la dejaba fuera de capa 2 (el framework no puede alcanzar a un
+      # invitado sólo-DHCP) y, peor, hacía que un arranque en frío la dejara sin
+      # dirección: dhclient se rinde a los 60 s por defecto y el troncal
+      # sw1<->sw2 tarda más en converger, así que nadie reintentaba. Aquí se le da
+      # margen de sobra y se declara `manage: true` para que, si aun así no aparece,
+      # el fallo se oiga en vez de pasar desapercibido.
+      netlab:
+        dhcp:
+          timeout: 300
+          retry: 30
     description: "Workstation 4 (sede 1): una sola NIC en el cable hacia sw2."
     netif:
       net0: "name=eth0,bridge=vmbr7,hwaddr=BC:24:11:00:50:04,ip=dhcp"
@@ -423,6 +475,19 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede2]
+    manage: true
+    config:
+      # Una workstation no tiene dirección estática: la pide por DHCP al router de
+      # su sede. Eso la dejaba fuera de capa 2 (el framework no puede alcanzar a un
+      # invitado sólo-DHCP) y, peor, hacía que un arranque en frío la dejara sin
+      # dirección: dhclient se rinde a los 60 s por defecto y el troncal
+      # sw1<->sw2 tarda más en converger, así que nadie reintentaba. Aquí se le da
+      # margen de sobra y se declara `manage: true` para que, si aun así no aparece,
+      # el fallo se oiga en vez de pasar desapercibido.
+      netlab:
+        dhcp:
+          timeout: 300
+          retry: 30
     description: "Workstation 5 (sede 2, delegación): en la red de rt2, al otro lado de la WAN 1."
     netif:
       net0: "name=eth0,bridge=vmbr10,hwaddr=BC:24:11:00:50:05,ip=dhcp"
@@ -437,6 +502,19 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede2]
+    manage: true
+    config:
+      # Una workstation no tiene dirección estática: la pide por DHCP al router de
+      # su sede. Eso la dejaba fuera de capa 2 (el framework no puede alcanzar a un
+      # invitado sólo-DHCP) y, peor, hacía que un arranque en frío la dejara sin
+      # dirección: dhclient se rinde a los 60 s por defecto y el troncal
+      # sw1<->sw2 tarda más en converger, así que nadie reintentaba. Aquí se le da
+      # margen de sobra y se declara `manage: true` para que, si aun así no aparece,
+      # el fallo se oiga en vez de pasar desapercibido.
+      netlab:
+        dhcp:
+          timeout: 300
+          retry: 30
     description: "Workstation 6 (sede 2, delegación): en la red de rt2."
     netif:
       net0: "name=eth0,bridge=vmbr11,hwaddr=BC:24:11:00:50:06,ip=dhcp"
@@ -451,6 +529,19 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede3]
+    manage: true
+    config:
+      # Una workstation no tiene dirección estática: la pide por DHCP al router de
+      # su sede. Eso la dejaba fuera de capa 2 (el framework no puede alcanzar a un
+      # invitado sólo-DHCP) y, peor, hacía que un arranque en frío la dejara sin
+      # dirección: dhclient se rinde a los 60 s por defecto y el troncal
+      # sw1<->sw2 tarda más en converger, así que nadie reintentaba. Aquí se le da
+      # margen de sobra y se declara `manage: true` para que, si aun así no aparece,
+      # el fallo se oiga en vez de pasar desapercibido.
+      netlab:
+        dhcp:
+          timeout: 300
+          retry: 30
     description: "Workstation 7 (sede 3, delegación): en la red de rt3, al otro lado de la WAN 2."
     netif:
       net0: "name=eth0,bridge=vmbr13,hwaddr=BC:24:11:00:50:07,ip=dhcp"
@@ -465,6 +556,19 @@ pve_containers:
     swap: 256
     status: started
     tags: [netlab, workstation, sede3]
+    manage: true
+    config:
+      # Una workstation no tiene dirección estática: la pide por DHCP al router de
+      # su sede. Eso la dejaba fuera de capa 2 (el framework no puede alcanzar a un
+      # invitado sólo-DHCP) y, peor, hacía que un arranque en frío la dejara sin
+      # dirección: dhclient se rinde a los 60 s por defecto y el troncal
+      # sw1<->sw2 tarda más en converger, así que nadie reintentaba. Aquí se le da
+      # margen de sobra y se declara `manage: true` para que, si aun así no aparece,
+      # el fallo se oiga en vez de pasar desapercibido.
+      netlab:
+        dhcp:
+          timeout: 300
+          retry: 30
     description: "Workstation 8 (sede 3, delegación): en la red de rt3."
     netif:
       net0: "name=eth0,bridge=vmbr14,hwaddr=BC:24:11:00:50:08,ip=dhcp"

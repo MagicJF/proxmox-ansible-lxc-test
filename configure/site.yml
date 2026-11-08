@@ -16,12 +16,23 @@
     # Overridden by playbooks/vars/secrets.yml (gitignored) when it exists.
     pve_ssh_user: root
     pve_ssh_key_path: "/home/hermes/.hermes/profiles/hermione/secrets/pve-automation_ed25519"
+    # Where the control node's path into the guests behind a router is written.
+    # Ansible's own ssh reads this file per connection, so the block written by
+    # tasks/ssh_path.yml applies to the guest play later in the same run.
+    l2_ssh_config_path: "{{ lookup('env', 'HOME') }}/.ssh/config"
   tasks:
     - name: Keep logs/ bounded (the policy in the declared state)
       ansible.builtin.include_tasks: ../playbooks/tasks/prune_logs.yml
 
     - name: Build the configuration targets
       ansible.builtin.include_tasks: tasks/build_targets.yml
+
+    # ---- the PATH layer 2 runs on (continued) ------------------------------
+    # Guests behind their site's router are not reachable from here directly, so
+    # the path goes through the one guest that already sits on the management
+    # network with routes into every site. Written from the declaration.
+    - name: Write the control node's SSH path to those guests
+      ansible.builtin.include_tasks: tasks/ssh_path.yml
 
     # ---- the PATH layer 2 runs on -----------------------------------------
     # Layer 2 is SSH. If this node is not on the guest LAN, every guest looks
@@ -142,6 +153,7 @@
       vars:
         netlab_routes: "{{ (l2_config.netlab | default({})).routes | default([]) }}"
         netlab_peers: "{{ (l2_config.netlab | default({})).peers | default([]) }}"
+        netlab_dhcp: "{{ (l2_config.netlab | default({})).dhcp | default({}) }}"
       when:
         - l2_manage | bool
         - l2_config.netlab is defined

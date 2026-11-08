@@ -45,6 +45,18 @@
     l2_vm_specs: >-
       {% set out = [] %}{% for i in pve_vms %}{% set _ = out.append(pve_vm_defaults | combine(pve_chr_defaults if (i.chr | default(false)) else {}) | combine(i)) %}{% endfor %}{{ out }}
 
+- name: Find the guest that is the layer 2 way into the site LANs
+  # A workstation sits on its site's LAN, behind that site's RouterOS router. The
+  # control node's tunnel reaches the management network and not those LANs — the
+  # note in configure/site.yml says so, and it was measured. The way in is the
+  # guest that hands out the first addresses: it is on the management network, and
+  # it is the only one that already holds routes into all three sites. Derived from
+  # its own declaration rather than repeated here.
+  ansible.builtin.set_fact:
+    l2_jump: >-
+      {% set hits = [] %}{% for c in pve_containers %}{% if ((c.config | default({})).bootstrap | default({})) | length > 0 %}{% set _ = hits.append(c) %}{% endif %}{% endfor %}
+      {{ ((hits | first).netif | pve_declared_ipv4) if (hits | length > 0) else '' }}
+
 - name: Assemble the configuration targets from the declared state
   ansible.builtin.set_fact:
     l2_targets: "{{ (l2_targets | default([])) + [entry] }}"
@@ -70,6 +82,10 @@
       address: "{{ derived if derived is not none else (src.address | default('')) }}"
       manage: "{{ src.manage | default(false) | bool }}"
       config: "{{ src.config | default({}) }}"
+      # A guest on one of the site LANs is reached THROUGH the jump (see
+      # `l2_jump` above): its declared address is real, but the control node has
+      # no route to it — only the management network is reachable directly.
+      jump: "{{ l2_jump if src.site is defined else '' }}"
       # A guest that speaks its own API (RouterOS) is not an SSH target: its
       # role runs on the control node and talks to the address directly.
       kind: "{{ 'api' if (src.config.routeros is defined) else 'ssh' }}"

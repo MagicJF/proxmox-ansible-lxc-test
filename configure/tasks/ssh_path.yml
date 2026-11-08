@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# The control node's SSH path into the guest LANs, written from the declaration.
+#
+# The tunnel reaches the management network and nothing behind it: a workstation
+# sits on its site's LAN, past that site's router, and no key can fix a missing
+# route. The way in is the guest that hands out the first addresses — it is on the
+# management network, it holds routes into all three sites, and it carries the
+# same automation key.
+#
+# `ProxyJump` needs the identity for BOTH hops, and ssh does not propagate `-i`
+# from the command line to the jump host: with `-i key` alone the jump is asked to
+# authenticate with nothing and refuses. A `Host` block per hop is what makes the
+# key reach the jump. That is why this is a file and not an option on the
+# command line.
+#
+# It is generated from `l2_targets` rather than hand-written, so the jump and the
+# identities come from the same declaration everything else does. Ansible reads
+# this file per connection, so the block is in place for the guest play that
+# follows in the same run.
+# ---------------------------------------------------------------------------
+
+- name: Say nothing to write when no target needs a jump
+  ansible.builtin.set_fact:
+    l2_jumped: "{{ l2_targets | selectattr('jump', 'defined') | selectattr('jump', 'ne', '') | list }}"
+
+- name: Give the control node its path to the guests behind a router
+  ansible.builtin.blockinfile:
+    path: "{{ l2_ssh_config_path }}"
+    create: true
+    mode: "0600"
+    marker: "# {mark} lab layer 2 path (managed: edits here are overwritten)"
+    block: |
+      # The jump itself: it needs the key too, or it is asked to log in to the
+      # guest with nothing. First block wins per option, so it is written alone.
+      Host {{ l2_jumped | map(attribute='jump') | unique | join(' ') }}
+        User {{ pve_ssh_user }}
+        IdentityFile {{ pve_ssh_key_path }}
+        StrictHostKeyChecking no
+
+      {% for t in l2_jumped %}
+      Host {{ t.address }}
+        User {{ pve_ssh_user }}
+        IdentityFile {{ pve_ssh_key_path }}
+        ProxyJump {{ t.jump }}
+        StrictHostKeyChecking no
+      {% endfor %}
+  when: l2_jumped | length > 0
+  # The file is the control node's, not the lab's: it is not a change to any
+  # guest and must not be counted as one.
+  changed_when: false
+
+- name: Report the path layer 2 will actually take
+  ansible.builtin.debug:
+    msg: >-
+      Layer 2 path written to {{ l2_ssh_config_path }}:
+      {{ l2_jumped | length }} guest(s) reached through {{ l2_jumped | map(attribute='jump') | unique | join(', ') | default('nobody', true) }}
+      {{ '-> ' ~ (l2_jumped | map(attribute='hostname') | join(', ')) if l2_jumped | length > 0 else '(every target answers directly)' }}
+  when: l2_jumped | length > 0

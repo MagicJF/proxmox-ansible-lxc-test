@@ -1,0 +1,21 @@
+[Unit]
+Description=Restore the declared return routes to the site LANs ({{ bootstrap_routes | join(', ') }})
+# A DHCP server on a real network knows how to reach the networks it serves. This
+# container does not: its default route points at the Proxmox host, and the host
+# does not route into the lab, so without these routes it receives a workstation's
+# ping and has no way to answer it. They used to be applied only by a converge
+# run, which meant a cold start came up without them and a working path looked
+# like a broken one — declared, but not durable. This unit is the durable half:
+# `ip route replace` on every boot, exactly as the offload unit does for its own
+# setting.
+After=network-online.target
+Before=dnsmasq.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '{% for r in bootstrap_routes %}ip route replace {{ r }} via {{ bootstrap_route_gateway }}; {% endfor %}'
+
+[Install]
+WantedBy=multi-user.target

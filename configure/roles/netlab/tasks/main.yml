@@ -21,6 +21,47 @@
     label: "{{ item.to | default('?') }}"
   when: netlab_routes | length > 0
 
+# --- the DHCP client's patience --------------------------------------------
+# A guest whose address comes from DHCP has a window it can miss: it boots, asks,
+# and if the network path to the server is not up yet the ask goes nowhere. The
+# Debian default is `timeout 60` — dhclient stops trying after one minute and the
+# guest stays address-less for the rest of its life, because nothing retries. On a
+# lab where a workstation sits behind a trunk that needs its own time to converge,
+# a minute is not enough. Declaring a longer timeout is the fix; the value is
+# declared per guest, not assumed here.
+- name: Refuse a DHCP setting that would not change anything
+  ansible.builtin.assert:
+    that:
+      - netlab_dhcp.timeout is defined or netlab_dhcp.retry is defined
+    fail_msg: >-
+      netlab.dhcp needs at least one of `timeout` or `retry` (got {{ netlab_dhcp | to_json }}).
+      They are dhclient.conf statements: `timeout` is how long it keeps trying and
+      `retry` how long it waits between attempts.
+  when: netlab_dhcp | length > 0
+
+- name: Give the DHCP client enough patience to outlast the network coming up
+  ansible.builtin.lineinfile:
+    path: "{{ netlab_dhclient_conf }}"
+    # Replaces the statement where it exists and appends it where it does not, so
+    # running this twice changes nothing the second time.
+    regexp: "^\\s*{{ item.key }}\\s"
+    line: "{{ item.key }} {{ item.value }};"
+    insertafter: EOF
+  loop: "{{ netlab_dhcp | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} {{ item.value }}"
+  when: netlab_dhcp | length > 0
+  register: netlab_dhcp_applied
+
+- name: Report the DHCP client's patience
+  ansible.builtin.debug:
+    msg: >-
+      {{ (netlab_dhcp | dict2items | map('join', ' ') | join(', '))
+         ~ ' in ' ~ netlab_dhclient_conf
+         ~ (' (changed)' if netlab_dhcp_applied.changed | default(false) else ' (already declared)') }}
+  when: netlab_dhcp | length > 0
+
+
 - name: Install the unit that applies the declared routes
   ansible.builtin.template:
     src: netlab-routes.service.j2

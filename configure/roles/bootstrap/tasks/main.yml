@@ -84,6 +84,25 @@
   register: bootstrap_live_routes
   changed_when: false
   when: bootstrap_routes | length > 0
+- name: Install the unit that restores the declared routes on every boot
+  # The same shape as the offload unit: without it these routes exist only until
+  # the container is restarted, and a cold start comes up with a path that looks
+  # broken for a reason no converge run would explain.
+  ansible.builtin.template:
+    src: bootstrap-routes.service.j2
+    dest: "/etc/systemd/system/{{ bootstrap_routes_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: bootstrap_routes_unit_file
+  when: bootstrap_routes | length > 0
+- name: Apply the declared routes now, and on every boot
+  ansible.builtin.systemd_service:
+    name: "{{ bootstrap_routes_unit }}"
+    enabled: true
+    state: "{{ 'restarted' if bootstrap_routes_unit_file.changed else 'started' }}"
+    daemon_reload: true
+  when: bootstrap_routes | length > 0
 
 - name: Route the declared networks back through the site router
   ansible.builtin.command: >-

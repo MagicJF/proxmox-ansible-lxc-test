@@ -13,5 +13,10 @@
 netlab_routes: []
 # Addresses that must answer from inside the guest once the routes are in place.
 netlab_peers: []
+# The DHCP client's patience, declared per guest: `timeout` is how long dhclient
+# keeps trying for an address and `retry` how long it waits between attempts. The
+# distro default is 60 seconds, which a guest behind a trunk can miss entirely.
+netlab_dhcp: {}
+netlab_dhclient_conf: /etc/dhcp/dhclient.conf
 # Where the unit lives.
 netlab_unit_name: netlab-routes.service

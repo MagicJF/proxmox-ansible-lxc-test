@@ -20,6 +20,7 @@ bootstrap_netmask: "255.255.255.0"
 bootstrap_lease_time: "1h"
 bootstrap_dnsmasq_conf: /etc/dnsmasq.d/bootstrap.conf
 bootstrap_offload_unit: bootstrap-tx-offload.service
+bootstrap_routes_unit: bootstrap-routes.service
 # How long to wait for the router to have its first address. Generous on
 # purpose: on a first run this competes with the router's own boot.
 bootstrap_answer_timeout: 240
