@@ -46,6 +46,9 @@ import yaml
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MANIFEST = os.path.join(REPO, "inventory/group_vars/all.yml")
 SECRETS = os.path.join(REPO, "playbooks/vars/secrets.yml")
+# La declaración de RouterOS vive en los valores por defecto del rol: la lista de
+# menús que el framework reclama como suyos es lo que da contra qué comparar.
+ROUTEROS_DEFAULTS = os.path.join(REPO, "configure/roles/routeros/defaults/main.yml")
 # Where this script's own runs log. They must not share logs/ansible.log: the
 # JSON callback is orders of magnitude larger than the human output, and mixing
 # the two is what made that file unreadable. See run_verb().
@@ -359,6 +362,140 @@ def agree():
     return 0
 
 
+# --- lo que la declaración no cubre -----------------------------------------
+# Los roles convergen lo que la declaración DICE y lo verifican releyéndolo. Eso
+# prueba la dirección de ida: lo declarado está. No prueba la de vuelta: si algo
+# apareció en el equipo que nadie declaró —un servicio que volvió a abrirse, un
+# usuario, un trabajo programado, un cliente DHCP—, el run sale verde igual.
+#
+# El export de RouterOS lo ve. `POST /rest/export` escribe en el equipo un fichero
+# con su configuración desplegada y `GET /rest/file/<f>` lo devuelve entero. Y hay
+# un detalle que lo hace especialmente útil: un export NO verboso sólo escribe lo
+# que NO es el valor de fábrica, así que es, en sí mismo, la lista de todo lo que
+# alguien cambió en ese equipo. Comparado por MENÚS contra los que la declaración
+# declara como suyos, señala exactamente lo que hay y nadie reclamó.
+#
+# Se compara por menús y no línea a línea a propósito: el export es un script
+# generado (por la API los `yes/no` salen como `true/false`), así que la línea no
+# es una unidad comparable; el menú sí.
+def _menu_counts(export):
+    """{'ip/address': 3, ...} — los menús del export y cuántas entradas llevan."""
+    out = {}
+    actual = None
+    for line in export.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("/"):
+            actual = line.lstrip("/").replace(" ", "/")
+            out.setdefault(actual, 0)
+        elif actual is not None:
+            out[actual] += 1
+    return {m: n for m, n in out.items() if n}
+
+
+def routeros_export():
+    say("== export: qué hay en los equipos de red que la declaración no menciona ==")
+    manifest = yaml.safe_load(open(MANIFEST)) or {}
+    defaults = yaml.safe_load(open(ROUTEROS_DEFAULTS)) or {}
+    creds = yaml.safe_load(open(SECRETS)) or {}
+
+    user = defaults.get("routeros_user", "admin")
+    password = creds.get("pve_routeros_password", "")
+    scheme = defaults.get("routeros_scheme", "http")
+    port = defaults.get("routeros_port", 80)
+    declared = {t["path"] for t in (defaults.get("routeros_tables") or [])}
+    allowed = {m for m in (defaults.get("routeros_undeclared_allowed") or [])}
+    forbidden = {m for m in (defaults.get("routeros_forbidden_menus") or [])}
+
+    # Los equipos y su dirección de gestión salen de la declaración: la PRIMERA
+    # entrada de `addresses` es la de administración (las demás van a interfaces de
+    # datos y pueden traer plantillas, que aquí no se pueden resolver).
+    devices = []
+    for v in (manifest.get("pve_vms") or []):
+        ros = ((v.get("config") or {}).get("routeros") or {})
+        addrs = ros.get("addresses") or []
+        if not addrs:
+            continue
+        host = str(addrs[0].get("address", "")).split("/")[0]
+        if not host or "{{" in host:
+            continue
+        devices.append((ros.get("identity") or v.get("name") or str(v.get("vmid")), host))
+    if not devices:
+        fail("la declaración no tiene ningún equipo RouterOS con dirección de gestión")
+
+    say(f"  {len(devices)} equipo(s) declarados, {len(declared)} menú(s) que la declaración reclama")
+    session = requests.Session()
+    session.auth = (user, password)
+    desconocidos = []
+    prohibidos = []
+
+    for name, host in devices:
+        base = f"{scheme}://{host}:{port}/rest"
+        nombre_fichero = "framework-check.rsc"
+        try:
+            r = session.post(f"{base}/export", json={"file": nombre_fichero}, timeout=30)
+            r.raise_for_status()
+            r = session.get(f"{base}/file/{nombre_fichero}", timeout=30)
+            r.raise_for_status()
+            # La respuesta NO es el texto del fichero: el REST de RouterOS lo
+            # devuelve como objeto JSON y el script viaja dentro de `contents`. Leer
+            # `.text` tal cual no encuentra ni un menú — y contar cero de cero da
+            # verde sin haber mirado nada, que es la peor forma de tener una
+            # comprobación. Comprobado contra un equipo real, no deducido.
+            try:
+                cuerpo = r.json()
+                export = cuerpo.get("contents", "") if isinstance(cuerpo, dict) else ""
+            except ValueError:
+                export = r.text
+            if not export.strip():
+                fail(f"{name} ({host}): el export volvió vacío, así que no hay nada que comparar")
+        except Exception as exc:
+            fail(f"{name} ({host}): no se pudo leer el export ({type(exc).__name__}: {exc})")
+        finally:
+            try:
+                session.post(f"{base}/file/remove", json={"numbers": nombre_fichero}, timeout=20)
+            except Exception:
+                pass
+
+        menus = _menu_counts(export)
+        if not menus:
+            # Una comprobación que no encuentra nada que comparar no ha comprobado
+            # nada: falla, en vez de dar verde.
+            fail(f"{name} ({host}): el export no tenía ni un menú con contenido")
+        say(f"\n  {name} ({host}): {len(menus)} menú(s) con contenido")
+        for m in sorted(menus):
+            if m in declared:
+                marca = "declarado"
+            elif m in allowed:
+                marca = "admitido"
+            elif m in forbidden:
+                marca = "PROHIBIDO"
+                prohibidos.append((name, m))
+            else:
+                marca = "NO DECLARADO"
+                desconocidos.append((name, m))
+            say(f"    {m:<36} {menus[m]:>3} entrada(s)   {marca}")
+
+    if prohibidos:
+        say("")
+        for name, m in prohibidos:
+            say(f"  PROHIBIDO y presente : {m:<30} en {name}")
+        fail("hay un menú que la declaración prohíbe y el equipo tiene")
+    if desconocidos:
+        say("")
+        for name, m in desconocidos:
+            say(f"  sin declarar : {m:<36} en {name}")
+        fail(
+            "hay menús con contenido que la declaración no reclama ni admite. O son "
+            "configuración que alguien puso fuera del framework, o son menús que la "
+            "declaración debería reclamar. Añádelos a `routeros_undeclared_allowed` "
+            "si son esperados, o investiga de dónde salieron."
+        )
+    say(f"\nPASS: los {len(devices)} equipos sólo tienen lo que la declaración declara o admite.")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     sub = parser.add_subparsers(dest="mode")
@@ -368,6 +505,7 @@ def main():
     drl.add_argument("--verb", default="playbooks/apply.yml")
     drl.add_argument("--preflight", default="playbooks/preflight.yml")
     sub.add_parser("agree", help="the check's own map must match the declaration")
+    sub.add_parser("export", help="los equipos de red sólo tienen lo que la declaración declara")
     args = parser.parse_args()
 
     if args.mode == "invariant":
@@ -376,6 +514,8 @@ def main():
         return drill(args.verb, args.preflight)
     if args.mode == "agree":
         return agree()
+    if args.mode == "export":
+        return routeros_export()
     parser.print_help()
     return 2
 

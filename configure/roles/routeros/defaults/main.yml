@@ -43,6 +43,34 @@ routeros_timeout: 20
 # routeros config; the role's assert refuses any list that contains `www`.
 routeros_disabled_services: [ssh, telnet, ftp, api, api-ssl]
 
+# Menús que el framework ADMITE sin reclamarlos como suyos: existen porque
+# RouterOS los trae puestos o porque algo declarado los necesita de paso. Un
+# export NO verboso sólo escribe lo que no es valor de fábrica, así que esta lista
+# es corta a propósito: lo que no esté aquí ni en `routeros_tables` es
+# configuración que nadie reclamó, y la comprobación `export` falla por ello.
+routeros_undeclared_allowed:
+  - system/clock       # zona horaria del equipo
+  - system/identity    # el nombre; el rol también lo verifica aparte
+  - user               # la cuenta `admin` y su contraseña, si se declaró una
+  - interface/ethernet # los puertos físicos y su velocidad negociada
+
+# Menús que, si aparecen con contenido en un equipo, no se admite ni se reclama:
+# son la forma que tienen un trabajo programado, un script, un servidor de más o
+# una nube a la que alguien apuntó el equipo. Ninguno hace falta para este
+# laboratorio, así que cualquiera de ellos presentes es una deriva que hay que
+# mirar, no una configuración que tolerar.
+routeros_forbidden_menus:
+  - system/scheduler
+  - system/script
+  - ip/dhcp-client
+  - tool/bandwidth-server
+  - tool/romon
+  - ip/cloud
+  - ip/proxy
+  - ip/socks
+  - ip/sniffer
+  - ip/smb
+
 # Every table the declaration can touch, in the order they are read. `key` is
 # the name the role refers to them by; `path` is the REST menu.
 routeros_tables:
