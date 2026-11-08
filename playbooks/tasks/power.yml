@@ -1,65 +1,45 @@
 ---
 # ---------------------------------------------------------------------------
-# Un escalón de energía: pedirlo, esperar a que Proxmox lo termine, y dar el
-# margen declarado ANTES de que empiece el siguiente.
+# Un escalón de energía, con el criterio de la casa: OPTIMISTA Y VERIFICADO.
 #
-# Las tres cosas van juntas, en el mismo fichero que se recorre escalón a escalón,
-# y eso no es estilo: con la llamada en una tarea con `loop` y el margen en otra,
-# Ansible recorre primero TODAS las llamadas y sólo después todos los márgenes —
-# es decir, pide los tres escalones seguidos y luego duerme. Eso deja a las
-# workstations arrancando a la vez que sus routers, que es justo el fallo que este
-# orden existe para evitar. Visto en el laboratorio, no deducido: un
-# `include_tasks` en un `loop` sí se recorre entero, iteración a iteración.
+# Se pide el lote ENTERO de golpe, sin limitar trabajadores —si el hipervisor
+# puede con todos a la vez, están arriba en un momento—, y a los pocos segundos se
+# comprueba quién quedó parado y se relanza SÓLO eso. Limitar los trabajadores
+# evita el problema de raíz, pero paga el precio de serializar siempre; el
+# reintento paga sólo cuando hace falta. Quién relanza, cómo y por qué está
+# contado en `playbooks/tools/pve_start_batch.py`.
+#
+# Entre escalones SÍ hay espera prudencial, porque hay una dependencia de verdad:
+# las estaciones necesitan la infraestructura de red, y la red necesita el
+# bootstrap. Y donde esa dependencia tiene una señal propia que consultar, se
+# consulta en vez de esperar a ciegas: la API de los equipos de red.
+#
+# Las tres cosas van en el mismo recorrido, y eso no es estilo: con la llamada en
+# una tarea con `loop` y el margen en otra, Ansible recorre primero TODAS las
+# llamadas y sólo después todos los márgenes, así que se piden los escalones
+# seguidos y luego se duerme. Visto en el laboratorio, no deducido.
 # ---------------------------------------------------------------------------
-- name: Arrancar este escalón en bloque
-  ansible.builtin.uri:
-    url: "{{ pve_api }}/nodes/{{ pve_node }}/startall"
-    method: POST
-    body_format: form-urlencoded
-    body:
-      vms: "{{ paso.vmids | join(',') }}"
-      # Los trabajadores los declara cada escalón. Los equipos de red van de uno
-      # en uno —son siete KVM con 4-5 discos y 3-5 interfaces cada uno, y a la
-      # vez cinco de los siete fallan con `qmstart ... got timeout`—, mientras
-      # que las workstations, que son contenedores simples y de nadie dependen,
-      # suben todas de golpe.
-      max-workers: "{{ paso.trabajadores }}"
-    headers:
-      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
-    ca_path: "{{ pve_api_ca_path }}"
-    validate_certs: true
-    status_code: [200]
-    timeout: 120
-  register: paso_start
-  # Proxmox responde con el UPID de una tarea y arranca por su cuenta.
+- name: Arrancar este escalón de golpe, y asegurar que levanta entero
+  ansible.builtin.command:
+    cmd: >-
+      python3 {{ pve_start_batch }}
+      --manifest {{ pve_manifest }} --secrets {{ pve_secrets }}
+      --timeout {{ pve_power_start_timeout }} --label "order={{ paso.order }}"
+      {{ paso.vmids | join(' ') }}
+  register: paso_arranque
   changed_when: true
+  # Si un invitado no acaba en marcha dentro del margen, la tarea FALLA con su
+  # vmid y su estado: no se sigue adelante con un escalón a medias.
 
-- name: Esperar a que Proxmox termine de arrancar este escalón
-  # El UPID vive en `.json.data`, NO en la raíz del resultado del módulo `uri`.
-  # Leerlo de la raíz devuelve indefinido, el bucle queda vacío y la espera no
-  # ocurre sin que nada lo diga — ya pasó una vez.
-  ansible.builtin.uri:
-    url: >-
-      {{ pve_api }}/nodes/{{ pve_node }}/tasks/{{
-         (paso_start.json | default({}, true)).get('data', '') | urlencode }}/status
-    headers:
-      Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
-    ca_path: "{{ pve_api_ca_path }}"
-    validate_certs: true
-    return_content: true
-    timeout: 30
-  register: paso_task
-  until: (paso_task.json.data.status | default('')) != 'running'
-  retries: 90
-  delay: 5
-  when: (paso_start.json | default({}, true)).get('data', '') | length > 0
+- name: Decir cómo fue el arranque de este escalón
+  ansible.builtin.debug:
+    msg: "{{ paso_arranque.stdout | default('') | trim }}"
 
-- name: Comprobar que este escalón ha levantado de verdad, no sólo que se ordenó
-  # La tarea de Proxmox acaba cuando ha DADO la orden de arranque, no cuando el
-  # invitado está listo. Para un escalón de equipos de red la prueba es su API:
-  # si contesta, el invitado está en pie Y sirviendo, que es justo lo que el
-  # escalón siguiente necesita para pedir su dirección por DHCP. Se espera en un
-  # solo proceso para todos, no con una tarea por equipo.
+- name: Esperar a que los equipos de red de este escalón estén LISTOS, no sólo pedidos
+  # La tarea de arranque acaba cuando Proxmox ha DADO la orden, no cuando el
+  # invitado está listo, y un CHR tarda decenas de segundos en levantar RouterOS —
+  # hasta entonces no sirve el DHCP del que depende el escalón siguiente. Se espera
+  # en un solo proceso para todos, no con una tarea por equipo.
   ansible.builtin.command:
     cmd: >-
       python3 {{ pve_routeros_wait }}
@@ -69,9 +49,9 @@
   when: paso.routeros | length > 0
 
 - name: Dar a este escalón, antes del siguiente, el margen que declara
-  # Un margen ciego que no comprueba nada es peor que una comprobación: el de los
-  # equipos de red se retiró porque su API ya dice cuándo están listos. Lo que
-  # queda es cortesía para lo que no tiene una señal propia que consultar.
+  # Sólo para lo que no tiene una señal propia que consultar: el escalón del
+  # bootstrap. Los equipos de red no lo necesitan, porque su API ya dice cuándo
+  # están listos, y las estaciones no tienen a nadie detrás esperándolas.
   ansible.builtin.pause:
     seconds: "{{ paso.espera }}"
   when: paso.espera | int > 0

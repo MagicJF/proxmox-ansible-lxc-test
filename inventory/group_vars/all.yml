@@ -1126,20 +1126,17 @@ pve_config_targets:
 # El archivo más reciente NUNCA se borra, diga lo que diga `keep_count`: es el
 # que alguien iría a mirar. Con los valores de abajo el techo es 10 × 8 MB.
 # ============================================================================
-# Cuántos invitados arranca Proxmox a la vez dentro de cada escalón, por su `order`.
-# Uno por defecto. Los equipos de red van de UNO EN UNO: son siete KVM con 4-5 discos
-# y 3-5 interfaces cada uno, y lanzados a la vez cinco de los siete fallan con
-# `qmstart ... start failed: got timeout`. Las workstations son contenedores simples
-# y de ellas no depende ninguna infraestructura, así que suben todas de golpe.
-pve_power_workers:
-  2: 1
-  3: 8
+# Cuánto se espera, como máximo, a que un escalón entero acabe en marcha. El lote se
+# pide de golpe y se relanza lo que quede parado, así que este margen cubre la
+# petición más un par de reintentos; agotarlo hace fallar la tarea diciendo qué vmid
+# no arrancó y en qué estado quedó.
+pve_power_start_timeout: 240
 
 # Margen de cortesía entre un escalón y el siguiente, en segundos. La clave es el
-# `order` del escalón que ACABA de arrancar. Es cortesía para lo que no tiene una
-# señal propia que consultar: el escalón de los equipos de red NO lo necesita, porque
-# `pve_power_ready_timeout` espera a que su API conteste de verdad, y un margen ciego
-# que no comprueba nada es peor que una comprobación.
+# `order` del escalón que ACABA de arrancar. Sólo lo usa lo que no tiene una señal
+# propia que consultar (el bootstrap): los equipos de red esperan a que su API
+# conteste de verdad, y un margen ciego que no comprueba nada es peor que una
+# comprobación.
 pve_power_gap_after:
   1: 10
 

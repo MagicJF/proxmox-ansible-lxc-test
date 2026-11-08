@@ -55,6 +55,7 @@
     # duplica y el fichero no aparece. Ya pasó, y el error decía
     # `playbooks/playbooks/tools/...`.
     pve_routeros_wait: "{{ playbook_dir }}/tools/routeros_wait.py"
+    pve_start_batch: "{{ playbook_dir }}/tools/pve_start_batch.py"
     pve_manifest: "{{ playbook_dir }}/../inventory/group_vars/all.yml"
     pve_secrets: "{{ playbook_dir }}/vars/secrets.yml"
     # The API base for the two things no module covers: node networking
@@ -371,7 +372,6 @@
                  'vmids': suyos | map(attribute='vmid') | list,
                  'nombres': suyos | map(attribute='nombre') | list,
                  'routeros': suyos | map(attribute='routeros') | select('ne', '') | list,
-                 'trabajadores': pve_power_workers.get(o, 1),
                  'espera': (pve_power_gap_after.get(o, 0) if not loop.last else 0)}) %}
           {% endfor %}
           {{ {'escalones': escalones, 'parar': parar} | to_json }}
