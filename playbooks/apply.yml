@@ -50,6 +50,11 @@
     pve_log_dir: "{{ playbook_dir }}/../logs"
     pve_journal: "{{ playbook_dir }}/../logs/pve-api.jsonl"
     pve_tool: "{{ playbook_dir }}/tools/pve_read.py"
+    # La ruta absoluta, no relativa: las acciones locales de Ansible corren desde el
+    # directorio del playbook, así que una ruta relativa a la raíz del repo se
+    # duplica y el fichero no aparece. Ya pasó, y el error decía
+    # `playbooks/playbooks/tools/...`.
+    pve_routeros_wait: "{{ playbook_dir }}/tools/routeros_wait.py"
     pve_manifest: "{{ playbook_dir }}/../inventory/group_vars/all.yml"
     pve_secrets: "{{ playbook_dir }}/vars/secrets.yml"
     # The API base for the two things no module covers: node networking
@@ -351,8 +356,11 @@
           {% set o = (c.startup | default([], true) | select('match', '^order=')
                       | map('regex_replace', '^order=', '') | list | first
                       | default('99', true)) | int %}
+          {% set direcciones = (((c.config | default({}, true)).routeros | default({}, true)).addresses | default([], true)) %}
+          {% set direccion = (direcciones | first | default({}, true)).address | default('') %}
           {% set _ = sueltos.append({'order': o, 'vmid': c.vmid,
-                                     'nombre': c.name | default(c.hostname)}) %}
+                                     'nombre': c.name | default(c.hostname),
+                                     'routeros': (direccion.split('/')[0] if direccion else '')}) %}
           {% endif %}
           {% endfor %}
           {% set escalones = [] %}
@@ -362,6 +370,8 @@
                  'order': o,
                  'vmids': suyos | map(attribute='vmid') | list,
                  'nombres': suyos | map(attribute='nombre') | list,
+                 'routeros': suyos | map(attribute='routeros') | select('ne', '') | list,
+                 'trabajadores': pve_power_workers.get(o, 1),
                  'espera': (pve_power_gap_after.get(o, 0) if not loop.last else 0)}) %}
           {% endfor %}
           {{ {'escalones': escalones, 'parar': parar} | to_json }}

@@ -1126,22 +1126,29 @@ pve_config_targets:
 # El archivo más reciente NUNCA se borra, diga lo que diga `keep_count`: es el
 # que alguien iría a mirar. Con los valores de abajo el techo es 10 × 8 MB.
 # ============================================================================
-# Margen entre escalones de arranque, en segundos. La clave es el `order` del
-# escalón que ACABA de arrancar: cuánto se espera antes de empezar el siguiente.
-#
-# No se usa `up=` en la declaración de cada invitado a propósito. `up` lo cuenta
-# Proxmox POR INVITADO, así que siete equipos de red con `up=45` son cinco minutos
-# de espera entre router y router — donde no hay ninguna dependencia. La
-# dependencia real es ENTRE escalones: las workstations piden su dirección en
-# cuanto arrancan y sus routers tienen que estar escuchando. Y ahí, el margen que
-# hace falta es uno, no siete.
-#
-# El escalón del bootstrap no lo necesita (los routers reintentan su DHCP solos,
-# no dependen de que nadie espere); el de los equipos de red sí, y es el que de
-# verdad importa. Un `order` que no aparezca aquí espera 0.
+# Cuántos invitados arranca Proxmox a la vez dentro de cada escalón, por su `order`.
+# Uno por defecto. Los equipos de red van de UNO EN UNO: son siete KVM con 4-5 discos
+# y 3-5 interfaces cada uno, y lanzados a la vez cinco de los siete fallan con
+# `qmstart ... start failed: got timeout`. Las workstations son contenedores simples
+# y de ellas no depende ninguna infraestructura, así que suben todas de golpe.
+pve_power_workers:
+  2: 1
+  3: 8
+
+# Margen de cortesía entre un escalón y el siguiente, en segundos. La clave es el
+# `order` del escalón que ACABA de arrancar. Es cortesía para lo que no tiene una
+# señal propia que consultar: el escalón de los equipos de red NO lo necesita, porque
+# `pve_power_ready_timeout` espera a que su API conteste de verdad, y un margen ciego
+# que no comprueba nada es peor que una comprobación.
 pve_power_gap_after:
   1: 10
-  2: 45
+
+# Cuánto se espera, como máximo, a que un escalón de RouterOS levante de verdad y
+# conteste su API (`playbooks/tools/routeros_wait.py`). La tarea de arranque de
+# Proxmox acaba cuando ha DADO la orden, no cuando el invitado está listo: un CHR
+# tarda decenas de segundos en levantar RouterOS, y hasta entonces no sirve el DHCP
+# del que depende el escalón siguiente.
+pve_power_ready_timeout: 180
 
 pve_log_retention:
   live_max_mb: 8

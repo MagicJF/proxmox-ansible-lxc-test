@@ -18,10 +18,12 @@
     body_format: form-urlencoded
     body:
       vms: "{{ paso.vmids | join(',') }}"
-      # Uno detrás de otro dentro del escalón. Sin esto se piden siete CHR a la
-      # vez —4-5 discos y 3-5 interfaces cada uno— y cinco de los siete fallan al
-      # arrancar con `qmstart ... start failed: got timeout`.
-      max-workers: 1
+      # Los trabajadores los declara cada escalón. Los equipos de red van de uno
+      # en uno —son siete KVM con 4-5 discos y 3-5 interfaces cada uno, y a la
+      # vez cinco de los siete fallan con `qmstart ... got timeout`—, mientras
+      # que las workstations, que son contenedores simples y de nadie dependen,
+      # suben todas de golpe.
+      max-workers: "{{ paso.trabajadores }}"
     headers:
       Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
     ca_path: "{{ pve_api_ca_path }}"
@@ -52,10 +54,24 @@
   delay: 5
   when: (paso_start.json | default({}, true)).get('data', '') | length > 0
 
+- name: Comprobar que este escalón ha levantado de verdad, no sólo que se ordenó
+  # La tarea de Proxmox acaba cuando ha DADO la orden de arranque, no cuando el
+  # invitado está listo. Para un escalón de equipos de red la prueba es su API:
+  # si contesta, el invitado está en pie Y sirviendo, que es justo lo que el
+  # escalón siguiente necesita para pedir su dirección por DHCP. Se espera en un
+  # solo proceso para todos, no con una tarea por equipo.
+  ansible.builtin.command:
+    cmd: >-
+      python3 {{ pve_routeros_wait }}
+      {{ pve_power_ready_timeout }} {{ paso.routeros | join(' ') }}
+  register: paso_espera
+  changed_when: false
+  when: paso.routeros | length > 0
+
 - name: Dar a este escalón, antes del siguiente, el margen que declara
-  # `up=` de Proxmox no sirve para esto: lo cuenta POR INVITADO, así que un escalón
-  # de siete equipos de red pagaría la espera siete veces. El margen se declara una
-  # vez por escalón, y el último no espera a nadie (lo decide el propio cálculo).
+  # Un margen ciego que no comprueba nada es peor que una comprobación: el de los
+  # equipos de red se retiró porque su API ya dice cuándo están listos. Lo que
+  # queda es cortesía para lo que no tiene una señal propia que consultar.
   ansible.builtin.pause:
     seconds: "{{ paso.espera }}"
   when: paso.espera | int > 0
