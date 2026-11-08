@@ -271,39 +271,45 @@
       no_log: true
       when: a.exists and ((a.to_set | length > 0) or (a.to_delete | length > 0))
 
-    - name: Cut the declared power order into tiers
-      # As JSON on purpose: a `set_fact` whose template carries a `{% set %}`
-      # preamble renders to a STRING, and `loop` refuses anything that is not a
-      # real list. Emitting JSON and parsing it back is the unambiguous version.
+    # ---- energía: la hace Proxmox, en bloque y en el orden declarado -----------
+    # `startall`/`stopall` recogen la lista de invitados ordenada por
+    # `startup: order=N` (el mismo campo que declara el manifiesto) y no pasan a un
+    # escalón superior hasta terminar el anterior: está en el código de Proxmox, y
+    # es exactamente lo que antes hacíamos a mano. Con `vms` se limitan a los
+    # invitados de esta declaración, que es la regla de la casa — uno ausente de la
+    # lista no se toca. Comprobado contra el laboratorio: con un vmid inexistente no
+    # arranca nada, y con `vms=156` arranca ese y sólo ese.
+    #
+    # Lo que NO hacen es comprobar que un invitado esté listo de verdad: esperan a
+    # que termine la orden de arranque y al retardo `up=` declarado. La puerta de
+    # direcciones de más abajo sigue siendo nuestra, y es la que destapó el fallo.
+    - name: Agrupar los invitados por la energía que declaran y lo que ha divergido
+      # En JSON a propósito: un `set_fact` cuyo template lleva un preámbulo
+      # `{% set %}` se renderiza como CADENA, y `loop` no acepta nada que no sea una
+      # lista de verdad. Ese error ya nos costó una ejecución.
       ansible.builtin.set_fact:
-        pve_power_tiers_json: >-
-          {% set pares = [] %}
+        pve_power_json: >-
+          {% set arrancar = [] %}{% set parar = [] %}
           {% for c in pve_cts + pve_vm_specs %}
-          {% set o = (c.startup | default([], true) | select('match', '^order=')
-                      | map('regex_replace', '^order=', '') | list | first | default('0', true)) | int %}
-          {% set _ = pares.append({'order': o, 'vmid': c.vmid}) %}
+          {% if pve_plan[c.vmid | string].power_drift %}
+          {% if (c.status | default('started')) == 'started' %}
+          {% set _ = arrancar.append(c.vmid) %}
+          {% else %}
+          {% set _ = parar.append(c.vmid) %}
+          {% endif %}
+          {% endif %}
           {% endfor %}
-          {% set out = [] %}
-          {% for o in pares | map(attribute='order') | list | unique | sort %}
-          {% set vmids = pares | selectattr('order', 'equalto', o) | map(attribute='vmid') | list %}
-          {% set _ = out.append({'order': o,
-                                 'cts': pve_cts | selectattr('vmid', 'in', vmids) | list,
-                                 'vms': pve_vm_specs | selectattr('vmid', 'in', vmids) | list}) %}
-          {% endfor %}
-          {{ out | to_json }}
+          {{ {'arrancar': arrancar, 'parar': parar} | to_json }}
 
-    - name: Parse the tiers back into a real list
+    - name: Leerlos como lista de verdad
       ansible.builtin.set_fact:
-        pve_power_tiers: "{{ pve_power_tiers_json | from_json }}"
+        pve_power: "{{ pve_power_json | from_json }}"
 
-    - name: Report the start order this run will follow
+    - name: Decir qué invitados cambian de energía en esta ejecución
       ansible.builtin.debug:
         msg: >-
-          tier {{ item.order }}:
-          {{ (item.cts | map(attribute='hostname') | list + item.vms | map(attribute='name') | list) | join(', ') }}
-      loop: "{{ pve_power_tiers }}"
-      loop_control:
-        label: "tier {{ item.order }}"
+          arrancar: {{ pve_power.arrancar | join(', ') if pve_power.arrancar | length else 'nada' }}
+          | parar: {{ pve_power.parar | join(', ') if pve_power.parar | length else 'nada' }}
 
 
     # ---- the same for VMs -------------------------------------------------
@@ -389,19 +395,74 @@
       no_log: true
       when: a.exists and (a.to_set | length > 0)
 
-    # ---- power comes after every guest exists, and follows the declared order --
-    # Starting the workstations before the routers of their sites is the race that
-    # left three of them without an address: a workstation asks for its address
-    # while nothing is listening yet. The order is declared with PVE's own field
-    # (`startup: order=N`, see pve_chr_defaults and the workstations) and honoured
-    # here too, tier by tier, because PVE's own ordering only applies to the
-    # automatic start at node boot and waits a fixed time instead of for readiness.
-    - name: Converge the power state, one declared tier at a time
-      ansible.builtin.include_tasks: tasks/power.yml
-      loop: "{{ pve_power_tiers }}"
+    # ---- la energía, ya con todos los invitados creados ------------------------
+    # Va después de crear ambos tipos porque la llamada en bloque es de Proxmox y
+    # necesita que existan. Y va en bloque precisamente por el orden: es él quien
+    # respeta `startup: order=N`, y quien evita que una workstation pida su
+    # dirección antes de que su router esté escuchando.
+    - name: Arrancar en bloque lo que la declaración quiere en marcha
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/startall"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          vms: "{{ pve_power.arrancar | join(',') }}"
+        headers:
+          Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+        ca_path: "{{ pve_api_ca_path }}"
+        validate_certs: true
+        status_code: [200]
+        timeout: 120
+      register: pve_startall
+      when: pve_power.arrancar | length > 0
+      # Proxmox responde con el UPID de una tarea: la energía la aplica él, con su
+      # propio orden, y aquí sólo se declara que algo ha cambiado.
+      changed_when: true
+
+    - name: Parar en bloque lo que la declaración quiere parado
+      # `stopall` invierte el orden por su cuenta, que es justo lo que se quiere al
+      # apagar: primero las estaciones y al final la infraestructura.
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/stopall"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          vms: "{{ pve_power.parar | join(',') }}"
+        headers:
+          Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+        ca_path: "{{ pve_api_ca_path }}"
+        validate_certs: true
+        status_code: [200]
+        timeout: 120
+      register: pve_stopall
+      when: pve_power.parar | length > 0
+      changed_when: true
+
+    - name: Reunir las tareas en bloque que hay que esperar
+      ansible.builtin.set_fact:
+        pve_power_upids: >-
+          {{ [pve_startall.upid | default(''), pve_stopall.upid | default('')]
+             | select('ne', '') | list }}
+
+    - name: Esperar a que Proxmox termine la energía en bloque
+      # La llamada es asíncrona: devuelve un UPID al instante. Sin esperar aquí, la
+      # puerta de direcciones de abajo preguntaría antes de que nada se hubiera
+      # arrancado y daría por bueno un laboratorio que aún está apagándose.
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/tasks/{{ item | urlencode }}/status"
+        headers:
+          Authorization: "PVEAPIToken={{ pve_api_token_id }}={{ pve_api_token_secret }}"
+        ca_path: "{{ pve_api_ca_path }}"
+        validate_certs: true
+        return_content: true
+        timeout: 30
+      register: pve_power_task
+      until: (pve_power_task.json.data.status | default('')) != 'running'
+      retries: 90
+      delay: 5
+      loop: "{{ pve_power_upids }}"
       loop_control:
-        loop_var: tier
-        label: "tier {{ tier.order }} ({{ (tier.cts | length) + (tier.vms | length) }} guest(s))"
+        label: "tarea en bloque de energía"
 
     # ---- and a cold start must not end green with guests off the network ------
     - name: Wait for the workstations to hold their declared addresses
