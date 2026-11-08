@@ -127,7 +127,7 @@ suspect drift, not as a routine step — see [Performance and how to iterate fas
 | 131 | `wiki-tiddly` | 1 | 1024 MiB | 512 MiB | 6 GiB | started | the worked TiddlyWiki example below |
 | 141 | `ws1` | 1 | 512 MiB | 256 MiB | 6 GiB | started | workstation 1 of the connectivity lab |
 | 142 | `ws2` | 1 | 512 MiB | 256 MiB | 6 GiB | started | workstation 2 of the connectivity lab |
-| 143 | `lab-bootstrap` | 1 | 1024 MiB | 256 MiB | 4 GiB | started | the router's first address |
+| 143 | `lab-bootstrap` | 1 | 1024 MiB | 256 MiB | 4 GiB | started | the routers' first address, and the SSH path into the sites |
 
 `pve_config_targets` is a separate, shorter list: guests whose **shape** this repository does not manage but whose **inside** it does. `101` (`caddy`, `10.10.10.2`) sits there with `manage: false`, so layer 2 inspects it and changes nothing. A guest belongs in one list or the other and never both — the state validator refuses an entry that is in the two.
 

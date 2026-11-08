@@ -247,6 +247,20 @@ despliegue — y sin una sola anomalía de camino.
   que trae los switches: existe sólo para dar a cada RouterOS su primera
   dirección, en la única ocasión en que no tiene ninguna. Tiene su propia ruta
   de vuelta hacia las sedes para poder contestar si se le pregunta.
+  - **Hace dos trabajos, y por eso no se puede quitar.** El primero es repartir esa
+    primera dirección, y para eso **tiene que estar dentro del segmento**: la
+    petición de un RouterOS recién nacido es una difusión, y una difusión no cruza
+    el enlace del nodo de control, que es punto a punto y enruta. El segundo es ser
+    el **camino SSH hacia las sedes**, porque los routers tienen el suyo cerrado a
+    propósito y al interior de una sede no se llega sin pasar por aquí.
+  - **Y es un contenedor porque es la única forma de colocarlo.** De todos los tipos
+    de invitado, sólo la dirección de un contenedor la puede fijar la API al crearlo
+    —la de una VM vive dentro de su propio sistema—. No es una máquina especial: es
+    la manera que tiene la API de poner algo en esa red.
+  - **Para una topología nueva con más equipos no hacen falta más**: reparte por
+    reservas derivadas de la declaración, así que cincuenta equipos siguen siendo
+    una máquina. Y en cuanto un laboratorio tiene su primer router, el DHCP de
+    gestión puede pasar a un router y el contenedor quedar para el salto.
 
 ---
 
