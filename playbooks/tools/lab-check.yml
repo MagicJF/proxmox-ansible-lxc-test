@@ -51,6 +51,8 @@
     - name: The check, run where it belongs
       ansible.builtin.script: lab-check.sh
       register: lab_check
+      # Pings and traceroutes: this reports on the lab, it does not touch it.
+      changed_when: false
       # The script exits non-zero by design when something it EXPECTS to work does
       # not, so a failure here is information for the report below, not a reason to
       # abandon the other guests.

@@ -16,14 +16,22 @@ Description=Restore the declared return routes to the site LANs ({{ bootstrap_ro
 # because this container is the SSH jump into them. Hence the retry loop: the
 # gateway has to exist before the routes can point at it, so the unit waits.
 After=network-online.target
-Before=dnsmasq.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# Retries for two minutes, because the address arrives when it arrives.
-ExecStart=/bin/sh -c 'for i in $(seq 1 60); do {% for r in bootstrap_routes %}ip route replace {{ r }} via {{ bootstrap_route_gateway }} || continue 2; {% endfor %}exit 0; sleep 2; done; echo "gave up waiting for the gateway {{ bootstrap_route_gateway }}"; exit 1'
+# Waiting indefinitely is the point, so systemd must not time the unit out before
+# the gateway shows up.
+TimeoutStartSec=0
+# Retries until the routes stick: they point at a router that starts in a LATER
+# tier (see the startup order in the manifest), so at this container's own boot the
+# gateway does not exist yet. The first version of this loop used `continue 2`,
+# which is not valid with a single loop level in `sh`: the container's own log
+# shows it booting at 15:59:59 and giving up at 16:00:16 — seventeen seconds
+# instead of the two minutes it was supposed to keep trying. `until` is the POSIX
+# way to say it.
+ExecStart=/bin/sh -c 'until {% for r in bootstrap_routes %}ip route replace {{ r }} via {{ bootstrap_route_gateway }} && {% endfor %}true; do sleep 2; done'
 
 [Install]
 WantedBy=multi-user.target
