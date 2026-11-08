@@ -627,6 +627,14 @@ pve_containers:
   #
   # Dirección estática a propósito: es infraestructura, no una workstation, y
   # layer 2 tiene que poder entrar a configurarla antes de que el lab exista.
+  #
+  # MEDIDO: es la sala de partos, no una dependencia de funcionamiento. Arrancando
+  # el laboratorio con este contenedor APAGADO y confirmado apagado durante toda la
+  # prueba, los siete equipos de red contestaron su API en 20 s con su
+  # `10.10.10.16x/24` y cero clientes DHCP, y las ocho estaciones obtuvieron su
+  # dirección de sus routers. Su trabajo de DHCP es de UNA vez por equipo, y sus
+  # direcciones se quedan en el disco del CHR. Lo que sí sostiene es el salto SSH
+  # hacia las sedes, y por eso sigue siendo el primer escalón.
   # ---------------------------------------------------------------------------
   - vmid: 143
     hostname: lab-bootstrap
