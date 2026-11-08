@@ -382,6 +382,17 @@
           {{ ct.serial if ((ct.serial | default({}, true)).keys() | list | intersect(a.to_set) | length > 0) else omit }}
         boot: "{{ ct.boot if 'boot' in a.to_set else omit }}"
         onboot: "{{ (ct.onboot | bool) if 'onboot' in a.to_set else omit }}"
+        # El orden de arranque viaja igual que en los contenedores. Faltaba aquí, y
+        # el hueco era silencioso: el plan SÍ detectaba la diferencia, la tarea se
+        # ejecutaba (por eso `to_set` no estaba vacío), pero como el módulo no lo
+        # recibía no cambiaba nada y el recuento salía `changed=0`. Los siete
+        # routers se quedaron sin `order` y Proxmox arranca los invitados sin orden
+        # DESPUÉS de los que lo tienen: las workstations salían antes que sus
+        # routers y se quedaban sin dirección.
+        # `proxmox_kvm` quiere `startup` como cadena ("order=2,up=45"); el módulo de
+        # contenedores une la lista por su cuenta y éste no. Se declara igual en el
+        # manifiesto (lista, que es la forma de PVE) y se une aquí.
+        startup: "{{ ct.startup | join(',') if 'startup' in a.to_set else omit }}"
         description: "{{ ct.description if 'description' in a.to_set else omit }}"
         tags: "{{ ct.tags if 'tags' in a.to_set else omit }}"
         update: true

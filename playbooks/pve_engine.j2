@@ -118,6 +118,11 @@
 {% endmacro %}
 
 {#- ---------------------------------------------------------------- VM ---- #}
+{#- `startup` se compara aquí igual que en los contenedores. Faltaba, y con él
+    faltaba todo: el plan no veía la diferencia, la convergencia no tenía nada que
+    aplicar, y el recuento salía `changed=0` con los routers sin `order`. Proxmox
+    arranca los invitados SIN orden DESPUÉS de los que lo tienen, así que las
+    workstations salían antes que sus routers y se quedaban sin dirección. #}
 {% macro vm(guest, live, live_status) %}
 {%- set with_cloudinit = guest.cloudinit | default(false) | bool -%}
 {%- set declared_norm = {
@@ -134,6 +139,7 @@
       'keyboard': guest.keyboard | default('', true) | string,
       'onboot': (1 if guest.onboot | bool else 0) | string,
       'boot': guest.boot | default('', true) | string,
+      'startup': guest.startup | default([], true) | sort | join(','),
       'description': guest.description | default('', true) | trim,
       'tags': guest.tags | default([], true) | sort | join(';'),
     } | combine((guest.net | default({}, true)) | combine(guest.scsi | default({}, true))
@@ -155,6 +161,7 @@
       'keyboard': live.keyboard | default('') | string,
       'onboot': live.onboot | default('') | string,
       'boot': live.boot | default('') | string,
+      'startup': live.startup | default('') | split(',') | sort | join(','),
       'description': live.description | default('') | trim,
       'tags': live.tags | default('') | split(';') | sort | join(';'),
     } | combine(live | pve_attachments | pve_canon_attachments)
