@@ -12,6 +12,10 @@
     that:
       - l2_config.routeros.identity is defined
       - (l2_config.routeros.addresses | default([])) | length > 0
+      # `www` is the road this role itself travels (REST over HTTP): a
+      # declaration that closed it would lock the framework out of the device it
+      # is converging, with no way back in over the network.
+      - "'www' not in (l2_config.routeros.services | default(routeros_disabled_services, true))"
     fail_msg: >-
       config.routeros needs an `identity` and at least one `addresses` entry
       ({address, interface}). The addresses are what make the router reachable

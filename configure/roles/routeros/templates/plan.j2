@@ -75,6 +75,27 @@
 {%-   endif -%}
 {%- endfor -%}
 
+{#- ---------- services: what the device listens on ---------- -#}
+{#- Closing these is what turns "we only manage RouterOS over REST" from a rule
+    into a property of the device: with ssh, telnet, ftp and the binary API shut,
+    nobody can reach it by any other road even by accident. `www` is never in the
+    list and the guard below refuses to disable it — it is the road this role
+    itself travels, so closing it would lock the framework out of its own lab.
+    RouterOS also publishes dynamic entries of its own (a second `www` shows up
+    with dynamic=true); they are skipped, or the comparison would report drift
+    for something no declaration ever asked for. -#}
+{%- set decl_services = cfg.services | default(routeros_disabled_services, true) -%}
+{%- for svc in decl_services -%}
+{%-   set found = ros.services | default([]) | selectattr('name', 'equalto', svc)
+                 | rejectattr('dynamic', 'equalto', 'true') | list -%}
+{%-   for live in found -%}
+{%-     if (live.disabled | default('false') | string | lower) != 'true' -%}
+{%-       set _ = ops.append({'method': 'PATCH', 'path': 'ip/service/' ~ live['.id'],
+                              'body': {'disabled': 'true'}}) -%}
+{%-     endif -%}
+{%-   endfor -%}
+{%- endfor -%}
+
 {#- ---------- pools, DHCP networks, servers and reservations ---------- -#}
 {%- set decl_servers = cfg.dhcp_servers | default([]) -%}
 {%- for s in decl_servers -%}

@@ -34,10 +34,20 @@ routeros_port: 80
 routeros_base: "{{ routeros_scheme }}://{{ ansible_host }}:{{ routeros_port }}/rest"
 routeros_timeout: 20
 
+# The services this role shuts on every RouterOS guest. `www` is deliberately
+# absent — REST over HTTP lives there, so closing it would lock the framework out
+# of the device it is converging, with no road back in. ssh, telnet, ftp and both
+# binary APIs are the doors our rule forbids and nothing here uses, so shutting
+# them turns "RouterOS is managed only over REST" from a promise into a property
+# of the device. A device may override the list with `services:` inside its
+# routeros config; the role's assert refuses any list that contains `www`.
+routeros_disabled_services: [ssh, telnet, ftp, api, api-ssl]
+
 # Every table the declaration can touch, in the order they are read. `key` is
 # the name the role refers to them by; `path` is the REST menu.
 routeros_tables:
   - {key: identity, path: system/identity}
+  - {key: services, path: ip/service}
   - {key: bridges, path: interface/bridge}
   - {key: bridge_ports, path: interface/bridge/port}
   - {key: addresses, path: ip/address}
